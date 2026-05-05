@@ -1,0 +1,33 @@
+app = 'lake-fish-api'
+primary_region = 'ord'   # Chicago — central for SD/MN/ND/IA/NE
+
+[build]
+
+[env]
+  NODE_ENV = 'production'
+
+[http_service]
+  internal_port = 3100
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1   # keep one machine warm; avoids cold-start on first request
+
+  [[http_service.checks]]
+    grace_period = '30s'
+    interval = '30s'
+    method = 'GET'
+    path = '/healthz'
+    timeout = '10s'
+
+# Persistent volume for all state databases and NE PDFs.
+# Upload/update databases here without rebuilding the Docker image.
+# Add new states: upload the .db file and set a new *_DB_PATH env var.
+[[mounts]]
+  source = 'lake_fish_data'
+  destination = '/data'
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1

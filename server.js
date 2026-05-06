@@ -209,6 +209,15 @@ function computeLakeStockingMetrics(state, areaAcres, stockingRows) {
   return { metrics, metrics_by_year };
 }
 
+// ── MI: synthetic "mixed gear" category ───────────────────────────────────────
+// MI's normalized-CPUE pipeline writes survey-level summary rows with gear =
+// 'All Gear Combined', 'Mixed Gear', 'Survey', or NULL/empty (no per-gear catch
+// breakdown — only total_catch + effort). Group them under a single chip so the
+// gear filter behaves predictably.
+const MI_MIXED_GEAR_LABELS = ['All Gear Combined', 'Mixed Gear', 'Survey'];
+const MI_MIXED_GEAR_KEY = 'Mixed Gear Normalized';
+const MI_MIXED_SQL_OR = `(fc.gear IS NULL OR fc.gear = '' OR fc.gear IN (${MI_MIXED_GEAR_LABELS.map(() => '?').join(',')}))`;
+
 // ── SD: avg length estimate from PSD size-class counts ────────────────────────
 // SD's fish_catch carries n_sq/n_qp/n_pm/n_m (counts in S–Q, Q–P, P–M, M–T length
 // bins) but no measured average. The mobile scatter plot estimates a mean length
@@ -421,48 +430,57 @@ app.get('/api/:state/filters', (req, res) => {
       ? db.prepare('SELECT MIN(survey_year) as min, MAX(survey_year) as max FROM surveys').get()
       : { min: null, max: null };
 
+    // Optional species filter: when set, gear counts/default reflect that species only.
+    const speciesParam = req.query.species ? String(req.query.species) : null;
+
     // Iowa: derive gear types from station presence columns
     let gearTypes = [];
     let gearTypeCounts = undefined;
     let defaultGear = undefined;
     if (state === 'ia' && hasCatch) {
-      const row = db.prepare(`
-        SELECT
-          MAX(CASE WHEN s.ef_stations > 0 THEN 1 ELSE 0 END) as has_ef,
-          MAX(CASE WHEN s.fn_stations > 0 THEN 1 ELSE 0 END) as has_fn,
-          MAX(CASE WHEN s.hn_stations > 0 THEN 1 ELSE 0 END) as has_hn
-        FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id
-      `).get();
-      if (row.has_ef) gearTypes.push('EF');
-      if (row.has_fn) gearTypes.push('FN');
-      if (row.has_hn) gearTypes.push('HN');
-      // Which passive gear is more common?
-      const prow = db.prepare(`
-        SELECT SUM(CASE WHEN fn_stations > 0 THEN 1 ELSE 0 END) AS fn_count,
-               SUM(CASE WHEN hn_stations > 0 THEN 1 ELSE 0 END) AS hn_count
-        FROM surveys
-      `).get();
-      if (prow && (prow.fn_count || prow.hn_count)) {
-        defaultGear = prow.fn_count >= prow.hn_count ? 'FN' : 'HN';
-        gearTypeCounts = {};
-        if (row.has_ef) gearTypeCounts['EF'] = db.prepare(`SELECT SUM(CASE WHEN ef_stations > 0 THEN 1 ELSE 0 END) as n FROM surveys`).get().n || 0;
-        if (row.has_fn) gearTypeCounts['FN'] = prow.fn_count || 0;
-        if (row.has_hn) gearTypeCounts['HN'] = prow.hn_count || 0;
+      const filterClause = speciesParam ? 'AND fc.species = ?' : '';
+      const args = speciesParam ? [speciesParam] : [];
+      const efN = db.prepare(`SELECT COUNT(DISTINCT s.id) AS n FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id WHERE s.ef_stations > 0 ${filterClause}`).get(...args).n;
+      const fnN = db.prepare(`SELECT COUNT(DISTINCT s.id) AS n FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id WHERE s.fn_stations > 0 ${filterClause}`).get(...args).n;
+      const hnN = db.prepare(`SELECT COUNT(DISTINCT s.id) AS n FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id WHERE s.hn_stations > 0 ${filterClause}`).get(...args).n;
+      if (efN) gearTypes.push('EF');
+      if (fnN) gearTypes.push('FN');
+      if (hnN) gearTypes.push('HN');
+      if (gearTypes.length) {
+        gearTypeCounts = { EF: efN, FN: fnN, HN: hnN };
+        if (speciesParam) {
+          // Species-aware: pick the gear with the most surveys catching this species
+          defaultGear = gearTypes.slice().sort((a, b) => gearTypeCounts[b] - gearTypeCounts[a])[0];
+        } else {
+          // Unfiltered IA default biases toward passive gear (FN/HN) over EF
+          defaultGear = fnN >= hnN && fnN > 0 ? 'FN' : hnN > 0 ? 'HN' : 'EF';
+        }
       }
-    } else if (state === 'mi' && hasCatch) {
-      const gearRows = db.prepare(`
-        SELECT gear, COUNT(*) as n FROM surveys
-        WHERE gear IS NOT NULL GROUP BY gear ORDER BY n DESC
-      `).all();
-      gearTypes = gearRows.map(r => r.gear);
-      gearTypeCounts = Object.fromEntries(gearRows.map(r => [r.gear, r.n]));
     } else if (hasCatch) {
-      const gearRows = db.prepare(`
-        SELECT gear, COUNT(*) as n FROM fish_catch
-        WHERE gear IS NOT NULL GROUP BY gear ORDER BY n DESC
-      `).all();
+      const sql = speciesParam
+        ? `SELECT gear, COUNT(*) AS n FROM fish_catch WHERE gear IS NOT NULL AND species = ? GROUP BY gear ORDER BY n DESC`
+        : `SELECT gear, COUNT(*) AS n FROM fish_catch WHERE gear IS NOT NULL GROUP BY gear ORDER BY n DESC`;
+      const gearRows = speciesParam ? db.prepare(sql).all(speciesParam) : db.prepare(sql).all();
       gearTypes = gearRows.map(r => r.gear);
       gearTypeCounts = Object.fromEntries(gearRows.map(r => [r.gear, r.n]));
+
+      // MI: hide the underlying mixed-gear labels and replace them with a single
+      // "Mixed Gear Normalized" chip aggregating survey-level summary rows.
+      if (state === 'mi') {
+        gearTypes = gearTypes.filter(g => !MI_MIXED_GEAR_LABELS.includes(g));
+        for (const k of MI_MIXED_GEAR_LABELS) delete gearTypeCounts[k];
+
+        const mixedSql = `SELECT COUNT(*) AS n FROM fish_catch fc WHERE ${MI_MIXED_SQL_OR}${speciesParam ? ' AND fc.species = ?' : ''}`;
+        const mixedArgs = speciesParam ? [...MI_MIXED_GEAR_LABELS, speciesParam] : [...MI_MIXED_GEAR_LABELS];
+        const mixedN = db.prepare(mixedSql).get(...mixedArgs).n;
+        if (mixedN > 0) {
+          gearTypeCounts[MI_MIXED_GEAR_KEY] = mixedN;
+          // Insert by count-desc to keep ordering consistent with the rest of the list
+          const ordered = [...gearTypes, MI_MIXED_GEAR_KEY]
+            .sort((a, b) => (gearTypeCounts[b] || 0) - (gearTypeCounts[a] || 0));
+          gearTypes = ordered;
+        }
+      }
     }
 
     const result = { species, gearTypes, gearTypeCounts, counties, yearRange };
@@ -505,6 +523,8 @@ app.get('/api/:state/results', (req, res) => {
       minWeight, maxWeight,
       minCatch, maxCatch,
       minGearCount, maxGearCount,
+      // MI-only
+      cpueNormalized,
       sortBy = 'cpue',
       sortDir = 'desc',
       limit = '100',
@@ -514,6 +534,12 @@ app.get('/api/:state/results', (req, res) => {
     // Validate and clamp numeric query params
     const limitNum = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
     const offsetNum = Math.max(parseInt(offset, 10) || 0, 0);
+
+    // MI: when the client opts into the gear-normalized CPUE, every reference to
+    // fc.cpue (filter, sort, display) is redirected to fc.cpue_normalized, and
+    // we drop rows where it isn't available.
+    const useNormalizedCpue = state === 'mi' && cpueNormalized === 'true';
+    const cpueCol = useNormalizedCpue ? 'fc.cpue_normalized' : 'fc.cpue';
 
     const conditions = [];
     const params = [];
@@ -533,16 +559,29 @@ app.get('/api/:state/results', (req, res) => {
         }).filter(Boolean);
         if (conds.length) conditions.push(`(${conds.join(' OR ')})`);
       } else if (state === 'mi' && gears.length) {
-        conditions.push(`fc.gear IN (${gears.map(() => '?').join(',')})`);
-        params.push(...gears);
+        // Split user's gear chips into the synthetic "Mixed Gear Normalized" key
+        // and the real per-gear labels, then OR them.
+        const includesMixed = gears.includes(MI_MIXED_GEAR_KEY);
+        const realGears = gears.filter(g => g !== MI_MIXED_GEAR_KEY);
+        const orParts = [];
+        if (realGears.length) {
+          orParts.push(`fc.gear IN (${realGears.map(() => '?').join(',')})`);
+          params.push(...realGears);
+        }
+        if (includesMixed) {
+          orParts.push(MI_MIXED_SQL_OR);
+          params.push(...MI_MIXED_GEAR_LABELS);
+        }
+        if (orParts.length) conditions.push(`(${orParts.join(' OR ')})`);
       } else if (gears.length) {
         conditions.push(`fc.gear IN (${gears.map(() => '?').join(',')})`);
         params.push(...gears);
       }
     }
 
-    if (minCpue !== undefined && minCpue !== '') { conditions.push('fc.cpue >= ?'); params.push(parseFloat(minCpue)); }
-    if (maxCpue !== undefined && maxCpue !== '') { conditions.push('fc.cpue <= ?'); params.push(parseFloat(maxCpue)); }
+    if (useNormalizedCpue) conditions.push(`${cpueCol} IS NOT NULL`);
+    if (minCpue !== undefined && minCpue !== '') { conditions.push(`${cpueCol} >= ?`); params.push(parseFloat(minCpue)); }
+    if (maxCpue !== undefined && maxCpue !== '') { conditions.push(`${cpueCol} <= ?`); params.push(parseFloat(maxCpue)); }
     if (minYear !== undefined && minYear !== '') { conditions.push('s.survey_year >= ?'); params.push(parseInt(minYear, 10)); }
     if (maxYear !== undefined && maxYear !== '') { conditions.push('s.survey_year <= ?'); params.push(parseInt(maxYear, 10)); }
 
@@ -596,6 +635,19 @@ app.get('/api/:state/results', (req, res) => {
             g === 'HN' ? 's2.hn_stations > 0' : null
           ).filter(Boolean);
           if (gconds.length) subConds.push(`(${gconds.join(' OR ')})`);
+        } else if (state === 'mi' && gears.length) {
+          const includesMixed = gears.includes(MI_MIXED_GEAR_KEY);
+          const realGears = gears.filter(g => g !== MI_MIXED_GEAR_KEY);
+          const orParts = [];
+          if (realGears.length) {
+            orParts.push(`fc2.gear IN (${realGears.map(() => '?').join(',')})`);
+            cteParams.push(...realGears);
+          }
+          if (includesMixed) {
+            orParts.push(`(fc2.gear IS NULL OR fc2.gear = '' OR fc2.gear IN (${MI_MIXED_GEAR_LABELS.map(() => '?').join(',')}))`);
+            cteParams.push(...MI_MIXED_GEAR_LABELS);
+          }
+          if (orParts.length) subConds.push(`(${orParts.join(' OR ')})`);
         } else if (gears.length) {
           subConds.push(`fc2.gear IN (${gears.map(() => '?').join(',')})`);
           cteParams.push(...gears);
@@ -700,7 +752,7 @@ app.get('/api/:state/results', (req, res) => {
         l.id AS lake_id, l.name AS lake_name, l.county, l.area_acres, l.max_depth_feet,
         l.latitude, l.longitude,
         s.id AS survey_id, s.survey_year,
-        fc.species, fc.gear, fc.total_catch, fc.cpue, fc.avg_length, fc.weight_lbs`;
+        fc.species, fc.gear, fc.total_catch, ${cpueCol} AS cpue, fc.avg_length, fc.weight_lbs`;
       extraJoins = '';
     } else { // ne
       selectCols = `
@@ -713,7 +765,7 @@ app.get('/api/:state/results', (req, res) => {
     // ── Sort column map ───────────────────────────────────────────────────────
 
     const SORT_COLS = {
-      cpue: state === 'mi' ? 'COALESCE(fc.cpue, 0)' : 'fc.cpue',
+      cpue: state === 'mi' ? `COALESCE(${cpueCol}, 0)` : 'fc.cpue',
       lake: 'l.name', acres: 'l.area_acres', year: 's.survey_year',
       // ND/NE/WI/MI compute stocked_per_100ac in JS after the query — sorting by it in SQL isn't
       // possible there, so fall back to fc.cpue (NE has no fc.total_catch column at all).

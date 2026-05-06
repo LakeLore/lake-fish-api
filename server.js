@@ -209,6 +209,43 @@ function computeLakeStockingMetrics(state, areaAcres, stockingRows) {
   return { metrics, metrics_by_year };
 }
 
+// ── SD: avg length estimate from PSD size-class counts ────────────────────────
+// SD's fish_catch carries n_sq/n_qp/n_pm/n_m (counts in S–Q, Q–P, P–M, M–T length
+// bins) but no measured average. The mobile scatter plot estimates a mean length
+// by weighting each bin's midpoint — duplicate the formula here so the list view
+// can show and sort by the same number. Keep PSD_LENGTHS_MM in sync with
+// lake-fish-mobile/src/components/ScatterPlot.tsx.
+const SD_PSD_LENGTHS_MM = {
+  WAE:[250,380,510,635,760], NOP:[350,530,710,890,1070],
+  LMB:[200,300,380,510,630], SMB:[180,280,350,430,510],
+  BLG:[80,150,200,250,300],  YEP:[130,200,250,300,400],
+  BLC:[130,200,250,300,380], WHC:[150,200,250,300,380],
+  MUE:[500,750,900,1070,1200], SAU:[230,330,460,580,710],
+  SAR:[230,330,460,580,710], RBT:[150,300,410,510,610],
+  BNT:[150,300,410,510,610], STH:[300,400,510,610,710],
+  WHB:[190,250,300,360,400], CCF:[280,380,510,610,710],
+};
+const SD_NAME_TO_PSD_CODE = {
+  'Walleye':'WAE','Northern Pike':'NOP','Largemouth Bass':'LMB','Smallmouth Bass':'SMB',
+  'Muskellunge':'MUE','Yellow Perch':'YEP','Black Crappie':'BLC','White Crappie':'WHC',
+  'Bluegill':'BLG','Saugeye':'SAU','Sauger':'SAR','Brook Trout':'BKT',
+  'Rainbow Trout':'RBT','Brown Trout':'BNT','White Bass':'WHB',
+  'Striped Bass Hybrid (Wiper)':'STH','Channel Catfish':'CCF',
+};
+const SD_AVG_LENGTH_EXPR = (() => {
+  const cases = [];
+  for (const [name, code] of Object.entries(SD_NAME_TO_PSD_CODE)) {
+    const L = SD_PSD_LENGTHS_MM[code];
+    if (!L) continue;
+    const [S, Q, P, M, T] = L;
+    const mids = [(S+Q)/2, (Q+P)/2, (P+M)/2, (M+T)/2];
+    const numer = `(${mids[0]}*COALESCE(fc.n_sq,0)+${mids[1]}*COALESCE(fc.n_qp,0)+${mids[2]}*COALESCE(fc.n_pm,0)+${mids[3]}*COALESCE(fc.n_m,0))`;
+    const denom = `NULLIF(COALESCE(fc.n_sq,0)+COALESCE(fc.n_qp,0)+COALESCE(fc.n_pm,0)+COALESCE(fc.n_m,0),0)`;
+    cases.push(`WHEN '${name.replace(/'/g, "''")}' THEN ${numer}/${denom}/25.4`);
+  }
+  return `ROUND(CASE fc.species ${cases.join(' ')} ELSE NULL END, 1)`;
+})();
+
 // ── SD: run schema migrations on the SD database ──────────────────────────────
 
 function migrateSd(db) {
@@ -619,6 +656,7 @@ app.get('/api/:state/results', (req, res) => {
         fc.species, fc.gear, fc.sample_n, fc.cpue, fc.cpue_ci,
         fc.psd, fc.psd_p, fc.wr, fc.wr_sq, fc.wr_qp, fc.wr_pm, fc.wr_m,
         fc.n_sq, fc.n_qp, fc.n_pm, fc.n_m,
+        ${SD_AVG_LENGTH_EXPR} AS average_length,
         lsm.adults_per_100ac AS stocked_per_100ac`;
       extraJoins = 'LEFT JOIN lake_stocking_metrics lsm ON lsm.lake_id = fc.lake_id AND lsm.species = fc.species';
     } else if (state === 'nd') {
@@ -684,11 +722,12 @@ app.get('/api/:state/results', (req, res) => {
       weight: 'fc.average_weight', catch: 'fc.total_catch',
       date: state === 'ia' ? "COALESCE(s.survey_date, CAST(s.survey_year AS TEXT) || '-12-31')" : 's.survey_date',
       depth: 'l.max_depth_feet',
-      // ND, IA, NE
-      length: state === 'ia'
-        ? ((() => { try { return !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='ia_size_classes'").get(); } catch { return false; } })()
-           ? 'CASE WHEN s.survey_date IS NULL THEN COALESCE(fc.average_length, sc.avg_length_est) ELSE fc.average_length END' : 'fc.average_length')
-        : 'fc.average_length',
+      // ND, IA, NE — measured average_length column. SD uses the PSD-derived expression.
+      length: state === 'sd' ? SD_AVG_LENGTH_EXPR
+        : state === 'ia'
+          ? ((() => { try { return !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='ia_size_classes'").get(); } catch { return false; } })()
+             ? 'CASE WHEN s.survey_date IS NULL THEN COALESCE(fc.average_length, sc.avg_length_est) ELSE fc.average_length END' : 'fc.average_length')
+          : 'fc.average_length',
       // SD
       psd: 'fc.psd', psd_p: 'fc.psd_p', wr: 'fc.wr',
       wr_sq: 'fc.wr_sq', wr_qp: 'fc.wr_qp', wr_pm: 'fc.wr_pm', wr_m: 'fc.wr_m',

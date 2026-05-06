@@ -677,9 +677,9 @@ app.get('/api/:state/results', (req, res) => {
     const SORT_COLS = {
       cpue: state === 'mi' ? 'COALESCE(fc.cpue, 0)' : 'fc.cpue',
       lake: 'l.name', acres: 'l.area_acres', year: 's.survey_year',
-      // ND and NE compute stocked_per_100ac in JS after the query — sorting by it in SQL isn't possible.
-      // Fall back to cpue for those states; the UI only shows stocked as a sort option where it works.
-      stocked: state === 'mn' || state === 'sd' ? 'lsm.adults_per_100ac' : state === 'ia' ? 'lsm.adults_per_100ac' : 'fc.total_catch',
+      // ND/NE/WI/MI compute stocked_per_100ac in JS after the query — sorting by it in SQL isn't
+      // possible there, so fall back to fc.cpue (NE has no fc.total_catch column at all).
+      stocked: ['mn', 'sd', 'ia'].includes(state) ? 'lsm.adults_per_100ac' : 'fc.cpue',
       // MN
       weight: 'fc.average_weight', catch: 'fc.total_catch',
       date: state === 'ia' ? "COALESCE(s.survey_date, CAST(s.survey_year AS TEXT) || '-12-31')" : 's.survey_date',

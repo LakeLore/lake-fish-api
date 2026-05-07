@@ -11,6 +11,7 @@ WORKDIR /srv
 
 COPY --from=builder /srv/lake-fish-mobile-server/node_modules ./lake-fish-mobile-server/node_modules
 COPY lake-fish-mobile-server/server.js                         ./lake-fish-mobile-server/server.js
+COPY lake-fish-mobile-server/entitlement.js                    ./lake-fish-mobile-server/entitlement.js
 
 # Survival modules are required at runtime via relative paths (../state/survival)
 COPY mn-lake-fish/survival.js ./mn-lake-fish/survival.js

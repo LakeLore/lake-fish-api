@@ -3,6 +3,7 @@
 **
 
 !lake-fish-mobile-server/server.js
+!lake-fish-mobile-server/entitlement.js
 !lake-fish-mobile-server/package.json
 !lake-fish-mobile-server/package-lock.json
 

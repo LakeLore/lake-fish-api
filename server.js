@@ -1,5 +1,20 @@
 'use strict';
 
+// Sentry must be initialized BEFORE other requires so it can patch the
+// modules they pull in (express, http, etc.) for auto-instrumentation.
+// Quietly skips init if SENTRY_DSN is unset — local dev keeps working
+// without it; production deploys set it as a Fly secret.
+const Sentry = require('@sentry/node');
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: process.env.NODE_ENV || 'development',
+    tracesSampleRate: 0.1,
+  });
+} else if (process.env.NODE_ENV === 'production') {
+  console.warn('[sentry] SENTRY_DSN not set in production — error reporting disabled');
+}
+
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -1078,6 +1093,13 @@ app.get('/api/ne/pdf/:name', (req, res) => {
   res.setHeader('Content-Disposition', `inline; filename="${name}"`);
   fs.createReadStream(filePath).pipe(res);
 });
+
+// ── Sentry Express error handler ───────────────────────────────────────────────
+// Must be registered AFTER all routes. No-ops if Sentry wasn't initialized.
+
+if (process.env.SENTRY_DSN) {
+  Sentry.setupExpressErrorHandler(app);
+}
 
 // ── Startup ────────────────────────────────────────────────────────────────────
 

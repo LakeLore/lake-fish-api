@@ -6,6 +6,7 @@ const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
 const rateLimit = require('express-rate-limit');
+const { gateByState, checkEntitlement, invalidateCache } = require('./entitlement');
 
 const PORT = process.env.PORT || 3100;
 const STOCKING_CUTOFF_YEAR = new Date().getFullYear() - 10;
@@ -56,6 +57,59 @@ if (process.env.NODE_ENV === 'production') {
     message: { error: 'Too many requests, please try again later.' },
   }));
 }
+
+// Subscription gate — applied to /api/{paid-state}/* routes. Free state
+// (MN) passes through; paid states require the `LakeLore All-States`
+// entitlement on the user identified by X-User-Id. Skips POST /reload
+// (admin endpoint, already token-protected) and /api/me/* (the
+// entitlement-status endpoint itself).
+app.use(gateByState);
+
+// ── /api/me/entitlement ────────────────────────────────────────────────────
+// Mobile app calls this on launch to know whether to render gated state UI.
+// The server is the authoritative source — RC SDK on-device is the same
+// data, but a hostile client could tamper with that, so the server checks
+// independently against RevenueCat.
+
+app.get('/api/me/entitlement', async (req, res) => {
+  const userId = req.get('x-user-id');
+  if (!userId) return res.status(400).json({ error: 'missing_x_user_id' });
+  try {
+    const result = await checkEntitlement(userId);
+    res.json({
+      hasAllStates: result.hasAllStates,
+      expiresAt: result.expiresAt,
+      source: result.source,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /webhooks/revenuecat ──────────────────────────────────────────────
+// RevenueCat pushes purchase events here. We use them to invalidate the
+// cache so subsequent /api/me/entitlement calls see the new state without
+// waiting for the 5-min cache TTL. Verification: RC sends a configurable
+// Authorization header value, which we compare to REVENUECAT_WEBHOOK_AUTH.
+
+app.post('/webhooks/revenuecat', (req, res) => {
+  const expected = process.env.REVENUECAT_WEBHOOK_AUTH;
+  if (expected) {
+    if (req.get('authorization') !== expected) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+  } else {
+    console.warn('[webhook] REVENUECAT_WEBHOOK_AUTH not set — accepting unsigned events');
+  }
+  const userId = req.body?.event?.app_user_id;
+  if (userId) {
+    invalidateCache(userId);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[webhook] cache invalidated for ${userId} (event: ${req.body?.event?.type})`);
+    }
+  }
+  res.json({ ok: true });
+});
 
 // /reload guard — if RELOAD_TOKEN is set in the environment, callers must
 // present it as `Authorization: Bearer <token>`. Local dev (no token set)
@@ -860,14 +914,21 @@ app.get('/api/:state/lake/:id', (req, res) => {
       `).all(id);
     } else if (state === 'ne') {
       surveys = hasCatch ? db.prepare(`
-        SELECT s.id, s.survey_year, s.survey_date, s.gear, s.source_pdf,
+        SELECT s.id, s.survey_year, s.survey_date, s.gear, s.source_pdf, s.source_url,
                COUNT(fc.id) as species_count, GROUP_CONCAT(DISTINCT fc.species) as species_list
         FROM surveys s LEFT JOIN fish_catch fc ON fc.survey_id = s.id
         WHERE s.lake_id = ? GROUP BY s.id ORDER BY s.survey_year DESC
       `).all(id) : [];
     } else if (state === 'mi') {
       surveys = hasCatch ? db.prepare(`
-        SELECT s.id, s.survey_year, s.gear,
+        SELECT s.id, s.survey_year, s.gear, s.source_pdf,
+               COUNT(fc.id) as species_count, GROUP_CONCAT(DISTINCT fc.species) as species_list
+        FROM surveys s LEFT JOIN fish_catch fc ON fc.survey_id = s.id
+        WHERE s.lake_id = ? GROUP BY s.id ORDER BY s.survey_year DESC
+      `).all(id) : [];
+    } else if (state === 'wi') {
+      surveys = hasCatch ? db.prepare(`
+        SELECT s.id, s.survey_year, s.survey_date, s.gear, s.source_pdf, s.source_url,
                COUNT(fc.id) as species_count, GROUP_CONCAT(DISTINCT fc.species) as species_list
         FROM surveys s LEFT JOIN fish_catch fc ON fc.survey_id = s.id
         WHERE s.lake_id = ? GROUP BY s.id ORDER BY s.survey_year DESC

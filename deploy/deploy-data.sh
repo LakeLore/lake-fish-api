@@ -17,6 +17,13 @@ upload() {
   local src="$1" dest="$2" state="$3"
   if [[ "$STATE_ARG" == "all" ]] || [[ " $STATE_ARG " == *" $state "* ]]; then
     if [ -f "$src" ]; then
+      # Merge any pending WAL into the .db file before uploading. Without this
+      # the upload may ship a stale snapshot that lacks recent writes still
+      # sitting in lakes.db-wal — burned us once on the MI county backfill.
+      sqlite3 "$src" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null
+      # fly sftp put refuses to overwrite, so clear the destination first
+      # (along with any sibling -shm/-wal files left from the previous deploy).
+      "$FLY" ssh console --app "$APP" -C "rm -f $dest ${dest}-shm ${dest}-wal" >/dev/null 2>&1 || true
       echo "→ uploading $state: $src"
       "$FLY" sftp put "$src" "$dest" --app "$APP"
     else

@@ -19,7 +19,7 @@
 const ALL_STATES_ENTITLEMENT = 'LakeLore All-States';
 const FREE_STATES = new Set(['mn']);
 const CACHE_TTL_MS = 5 * 60 * 1000;
-const RC_API_BASE = 'https://api.revenuecat.com/v1';
+const RC_API_BASE = 'https://api.revenuecat.com/v2';
 
 // Match only the *data-bearing* endpoints. /status and /filters are public
 // metadata (lake counts, species lists, county lists) — they're shown on
@@ -41,11 +41,12 @@ function isPaidState(state) {
 
 async function fetchEntitlementFromRevenueCat(userId) {
   const key = process.env.REVENUECAT_SECRET_KEY;
-  if (!key) {
+  const projectId = process.env.REVENUECAT_PROJECT_ID;
+  if (!key || !projectId) {
     if (!_warnedNoKey) {
       const failOpen = process.env.NODE_ENV !== 'production';
       console.warn(
-        `[entitlement] REVENUECAT_SECRET_KEY not set — `
+        `[entitlement] REVENUECAT_SECRET_KEY or REVENUECAT_PROJECT_ID not set — `
         + (failOpen ? 'fail-OPEN (development)' : 'fail-CLOSED (production)')
       );
       _warnedNoKey = true;
@@ -58,12 +59,13 @@ async function fetchEntitlementFromRevenueCat(userId) {
   }
 
   try {
-    const url = `${RC_API_BASE}/subscribers/${encodeURIComponent(userId)}`;
+    // RC v2 API: list a customer's active entitlements. The endpoint returns
+    // a paginated list of entitlement objects keyed by `lookup_key`. We match
+    // on lookup_key (the human-friendly identifier) rather than the internal
+    // `id` (entl_xxx) so the code stays portable across RC projects.
+    const url = `${RC_API_BASE}/projects/${projectId}/customers/${encodeURIComponent(userId)}/active_entitlements`;
     const res = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${key}`,
-        'X-Platform': 'server',
-      },
+      headers: { Authorization: `Bearer ${key}` },
     });
     if (res.status === 404) {
       // RC returns 404 for users it has never seen — they haven't subscribed.
@@ -73,15 +75,17 @@ async function fetchEntitlementFromRevenueCat(userId) {
       throw new Error(`RC HTTP ${res.status}`);
     }
     const data = await res.json();
-    const ent = data?.subscriber?.entitlements?.[ALL_STATES_ENTITLEMENT];
+    const items = Array.isArray(data?.items) ? data.items : [];
+    const ent = items.find(e => e?.lookup_key === ALL_STATES_ENTITLEMENT);
     if (!ent) {
       return { hasAllStates: false, expiresAt: null, source: 'rc' };
     }
-    // expires_date is null for lifetime entitlements; an ISO string otherwise.
-    const expiresIso = ent.expires_date ?? null;
-    const expiresAt = expiresIso ? new Date(expiresIso).getTime() : null;
-    const active = expiresAt === null || expiresAt > Date.now();
-    return { hasAllStates: active, expiresAt: expiresIso, source: 'rc' };
+    // RC's "active_entitlements" endpoint already filters out expired ones,
+    // so any entry here is currently active. expires_at is a Unix-ms epoch
+    // when present (null = lifetime / non-expiring).
+    const expiresAt = typeof ent.expires_at === 'number' ? ent.expires_at : null;
+    const expiresIso = expiresAt ? new Date(expiresAt).toISOString() : null;
+    return { hasAllStates: true, expiresAt: expiresIso, source: 'rc' };
   } catch (err) {
     console.warn(`[entitlement] RC fetch failed for ${userId}: ${err.message}`);
     // Upstream blip — don't lock paying customers out for it. Cached

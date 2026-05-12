@@ -67,3 +67,15 @@ This server reads `*.db` files; it does not write them. Fresh state data comes f
 3. `~/APP_OPS.md` — broader vendor and identifier reference.
 4. `~/RUNBOOK.md` if something is broken.
 5. `~/DATA_PIPELINES.md` if working on state data ingestion.
+
+## Self-check before ending a server task
+
+Full trigger table in `~/CLAUDE.md` "Documentation discipline". Server-specific:
+
+- [ ] If I added/removed/renamed an endpoint — `./README.md` endpoint table updated.
+- [ ] If I changed the entitlement gate (which states are gated, response shape) — `entitlement.js`, this file's architecture section, and `~/lake-fish-mobile/CLAUDE.md` paywall section all describe the same thing.
+- [ ] If I added a Fly secret — `~/APP_OPS.md` Fly secrets table + this file's secrets table + (if rotation procedure new) `~/RUNBOOK.md`.
+- [ ] If I changed the Dockerfile or fly.toml — verified `~/.fly/bin/flyctl deploy` from `~/` still works.
+- [ ] If I changed how state DBs are read/located — `~/DATA_PIPELINES.md` and `~/APP_OPS.md` are still right.
+- [ ] If a deploy failed and I learned a new failure mode — `~/RUNBOOK.md` has the recipe.
+- [ ] If I bumped a dependency that affects runtime — verified production still healthy (`curl /healthz` and a sample state-data call).

@@ -23,6 +23,15 @@ esac
 echo "▶ fetching $STATE data..."
 cd "$DIR" && node fetcher.js
 
+# MN and ND have a separate stocking pipeline that builds the `stocking`,
+# `stocking_progress`, and `lake_stocking_metrics` tables. Skipping this step
+# ships a DB missing those tables and causes /results to 500 in production.
+if [ -f "$DIR/stock-fetcher.js" ]; then
+  echo ""
+  echo "▶ fetching $STATE stocking data..."
+  node stock-fetcher.js
+fi
+
 echo ""
 echo "▶ reloading local server..."
 RESULT=$(curl -sf -X POST "http://localhost:3100/api/$STATE/reload" 2>/dev/null) && \

@@ -297,8 +297,14 @@ function computeLakeStockingMetrics(state, areaAcres, stockingRows) {
   const byKey = new Map(); // `${species}|${year}` -> total surviving adults
 
   for (let y = firstYear; y <= currentYear; y++) {
-    const asOf = new Date(today.getTime());
-    if (y !== currentYear) asOf.setFullYear(y);
+    // For past years, anchor at year-end (Dec 31) so the "adults in year Y"
+    // metric captures fish that matured at any point during Y — not just
+    // those mature by today's calendar date within Y. Without this, a fry
+    // stocked in summer Y-3 wouldn't appear as an adult until Y+1 if the
+    // chart is viewed before July of Y, since July → July is 3 full years.
+    // Current year stays anchored to today so the headline matches what's
+    // alive right now.
+    const asOf = y === currentYear ? new Date(today.getTime()) : new Date(`${y}-12-31`);
     for (const r of recent) {
       if (r.stock_year > y) continue;
       const adults = survivingAdults(r._code, r.life_stage, r.stock_year, r.quantity, asOf);

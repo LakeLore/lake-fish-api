@@ -23,7 +23,13 @@ deploy/
   fly.toml                — single machine in ord, 512 MB, /healthz check
   .dockerignore           — strict allow-list
   fetch.sh                — local: scrape one state and POST /reload to dev server
-  deploy-data.sh          — production: sftp state DBs to Fly volume + restart
+  deploy-data.sh          — production: drift-check, sftp state DBs to Fly
+                            volume, restart machine
+  _drift_check.py         — pre-upload safety: diffs local vs prod row counts
+                            for lakes/surveys/fish_catch/stocking, aborts the
+                            deploy if local is BEHIND prod (suggesting a
+                            stale snapshot). Invoked by deploy-data.sh, or run
+                            standalone via `./deploy-data.sh --check`.
 ```
 
 All five deploy artifacts are symlinked from `~/` so existing commands (`flyctl deploy`, `~/fetch.sh`, `~/deploy-data.sh`) still work after the move into `deploy/`.
@@ -34,6 +40,7 @@ All five deploy artifacts are symlinked from `~/` so existing commands (`flyctl 
 - Survival modules required per state via `../{state}-lake-fish/survival.js` at runtime — these compute "adults per 100 acres" from stocking records on the fly per lake.
 - Entitlement gate via `entitlement.js` middleware: paid-state `/results`, `/lake/:id`, `/pdf` return 402 without entitlement. `/status` and `/filters` stay public. MN is the free state.
 - 5-min per-user entitlement cache (in-memory). Invalidated by RC webhook events at `POST /webhooks/revenuecat`.
+- **Important — RC v2 active_entitlements gotcha:** the `/v2/projects/{id}/customers/{user_id}/active_entitlements` endpoint returns items that carry only `entitlement_id` (`entl_xxx`), never `lookup_key`. We resolve `LakeLore All-States` → its `entl_xxx` ID once at process startup (`_resolveAllStatesEntitlementId`) and match on the internal ID. If the entitlement is ever recreated in the RC dashboard, restart the server to pick up the new ID.
 - Rate limit 600 req / 15 min per IP via `express-rate-limit`. `app.set('trust proxy', 1)` for real client IP behind Fly's edge.
 
 ## Deploy
@@ -58,7 +65,7 @@ Audit current: `~/.fly/bin/flyctl secrets list --app lake-fish-api`.
 
 ## Source-of-truth note on data
 
-This server reads `*.db` files; it does not write them. Fresh state data comes from the per-state scrapers (`~/{state}-lake-fish/fetcher.js`) → `~/deploy-data.sh` to upload to the Fly volume → either `fly app restart` or `POST /reload` with the bearer token to reload caches without restart. See `~/DATA_PIPELINES.md` for the full story.
+This server reads `*.db` files; it does not write them. Fresh state data comes from running `~/fetch.sh <state>` (which chains `fetcher.js` and any sibling steps — MN and ND also require `stock-fetcher.js` to build `stocking` / `lake_stocking_metrics`; skipping it ships a DB that 500s on `/results`) → `~/deploy-data.sh` to upload to the Fly volume → either `fly app restart` or `POST /reload` with the bearer token to reload caches without restart. **Always consult `~/DATA_PIPELINES.md` for the state-specific pipeline before refreshing** — pipelines differ per state.
 
 ## Reading order for a fresh Claude session
 

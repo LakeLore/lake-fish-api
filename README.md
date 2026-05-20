@@ -77,6 +77,8 @@ echo "$NEW" > ~/.lakelore_reload_token && chmod 600 ~/.lakelore_reload_token
 | `GET /api/:state/lake/:id` | Lake detail with surveys, catches, stocking, computed metrics | |
 | `POST /api/:state/reload` | Hot-reload the state's DB cache | Requires `RELOAD_TOKEN` in production |
 | `GET /api/ne/pdf/:name` | Stream Nebraska survey PDFs | Path-traversal protected |
+| `GET /api/me/entitlement` | Server-authoritative entitlement check | `X-User-Id` required; returns `{hasAllStates,expiresAt,source}` |
+| `POST /api/feedback` | Capture in-app feedback | Appends one JSON line per submission to `/data/feedback.jsonl` on the volume. `message` 1–2000 chars, all other fields optional. |
 
 ## Hardening summary (2026-05-05)
 

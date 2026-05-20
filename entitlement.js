@@ -30,10 +30,64 @@ const RC_API_BASE = 'https://api.revenuecat.com/v2';
 //   /api/{state}/results      — search results (the actual data)
 //   /api/{state}/lake/:id     — lake detail page (catches, stocking)
 //   /api/{state}/pdf/:name    — Nebraska survey PDFs (NE-specific)
-const GATED_PATH_RE = /^\/api\/(mn|sd|nd|ia|ne|wi|mi)\/(results|lake|pdf)(?:\/|\?|$)/;
+//
+// Only ACTIVE states appear here. Inactive states (wi, mi for v1) fall through
+// to route validation, which returns 400 (not 402). That keeps the client's
+// SubscriptionRequiredError → paywall flow from firing on states the user can't
+// reach in the first place. Re-add wi|mi when reactivating those states.
+const GATED_PATH_RE = /^\/api\/(mn|sd|nd|ia|ne)\/(results|lake|pdf)(?:\/|\?|$)/;
 
 const _cache = new Map();
 let _warnedNoKey = false;
+
+// Lazy cache of the internal RC entitlement ID (entl_xxx) corresponding to
+// our human-friendly ALL_STATES_ENTITLEMENT lookup_key. RC's v2
+// `/customers/{id}/active_entitlements` endpoint returns objects with only
+// `entitlement_id` — `lookup_key` is NOT included — so we resolve the lookup
+// key to the internal ID once at startup and match against it on every
+// per-user request thereafter.
+//
+// If the entitlement is ever deleted + recreated in the RC dashboard, the
+// internal ID changes; restart the server to pick up the new mapping (or
+// call `_resetAllStatesEntitlementId()` from a test).
+let _allStatesEntitlementIdPromise = null;
+
+function _resetAllStatesEntitlementId() {
+  _allStatesEntitlementIdPromise = null;
+}
+
+async function _resolveAllStatesEntitlementId() {
+  if (_allStatesEntitlementIdPromise) return _allStatesEntitlementIdPromise;
+  const key = process.env.REVENUECAT_SECRET_KEY;
+  const projectId = process.env.REVENUECAT_PROJECT_ID;
+  if (!key || !projectId) return null;
+  _allStatesEntitlementIdPromise = (async () => {
+    try {
+      const url = `${RC_API_BASE}/projects/${projectId}/entitlements?limit=100`;
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${key}` } });
+      if (!res.ok) throw new Error(`RC entitlements list HTTP ${res.status}`);
+      const data = await res.json();
+      const items = Array.isArray(data?.items) ? data.items : [];
+      const match = items.find(e => e?.lookup_key === ALL_STATES_ENTITLEMENT);
+      if (!match?.id) {
+        console.warn(
+          `[entitlement] no entitlement found in RC with lookup_key=${ALL_STATES_ENTITLEMENT}`
+        );
+        return null;
+      }
+      console.log(
+        `[entitlement] resolved lookup_key=${ALL_STATES_ENTITLEMENT} -> ${match.id}`
+      );
+      return match.id;
+    } catch (err) {
+      console.warn(`[entitlement] failed to resolve all-states entitlement id: ${err.message}`);
+      // Surface the failure so the next call retries instead of caching null.
+      _allStatesEntitlementIdPromise = null;
+      return null;
+    }
+  })();
+  return _allStatesEntitlementIdPromise;
+}
 
 function isPaidState(state) {
   return !FREE_STATES.has(state);
@@ -59,10 +113,10 @@ async function fetchEntitlementFromRevenueCat(userId) {
   }
 
   try {
-    // RC v2 API: list a customer's active entitlements. The endpoint returns
-    // a paginated list of entitlement objects keyed by `lookup_key`. We match
-    // on lookup_key (the human-friendly identifier) rather than the internal
-    // `id` (entl_xxx) so the code stays portable across RC projects.
+    // RC v2 returns active_entitlements objects with only `entitlement_id`
+    // (internal `entl_xxx`) — no `lookup_key`. Resolve the lookup_key to the
+    // internal ID up front, then match on that.
+    const targetId = await _resolveAllStatesEntitlementId();
     const url = `${RC_API_BASE}/projects/${projectId}/customers/${encodeURIComponent(userId)}/active_entitlements`;
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${key}` },
@@ -76,7 +130,13 @@ async function fetchEntitlementFromRevenueCat(userId) {
     }
     const data = await res.json();
     const items = Array.isArray(data?.items) ? data.items : [];
-    const ent = items.find(e => e?.lookup_key === ALL_STATES_ENTITLEMENT);
+    // Primary match path: by resolved internal entitlement id. Fallback path
+    // matches on `lookup_key` in case RC ever populates it on this endpoint
+    // — keeps the code resilient to a future API shape change.
+    const ent = items.find(e =>
+      (targetId && e?.entitlement_id === targetId)
+      || e?.lookup_key === ALL_STATES_ENTITLEMENT
+    );
     if (!ent) {
       return { hasAllStates: false, expiresAt: null, source: 'rc' };
     }
@@ -173,4 +233,5 @@ module.exports = {
   checkEntitlement,
   invalidateCache,
   gateByState,
+  _resetAllStatesEntitlementId,
 };

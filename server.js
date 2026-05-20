@@ -718,11 +718,12 @@ app.get('/api/:state/results', (req, res) => {
       minYear, maxYear,
       county, minAcres, maxAcres,
       minStocked, maxStocked,
+      minLength, maxLength,
+      minCatch, maxCatch,
       mostRecentOnly,
       // MN-only
-      surveyType, cpueVsNormal,
+      surveyType,
       minWeight, maxWeight,
-      minCatch, maxCatch,
       minGearCount, maxGearCount,
       sortBy = 'cpue',
       sortDir = 'desc',
@@ -790,6 +791,27 @@ app.get('/api/:state/results', (req, res) => {
     if (minAcres !== undefined && minAcres !== '') { conditions.push('l.area_acres >= ?'); params.push(parseFloat(minAcres)); }
     if (maxAcres !== undefined && maxAcres !== '') { conditions.push('l.area_acres <= ?'); params.push(parseFloat(maxAcres)); }
 
+    // Total Catch range — applies wherever fc.total_catch is populated
+    // (MN, ND, IA, WI, MI). SD uses sample_n + size-class counts (different
+    // metric); NE doesn't have the column at all.
+    if (state === 'mn' || state === 'nd' || state === 'ia' || state === 'wi' || state === 'mi') {
+      if (minCatch !== undefined && minCatch !== '') { conditions.push('fc.total_catch >= ?'); params.push(parseInt(minCatch, 10)); }
+      if (maxCatch !== undefined && maxCatch !== '') { conditions.push('fc.total_catch <= ?'); params.push(parseInt(maxCatch, 10)); }
+    }
+
+    // Avg Length range — every state except MN reports length. MI's column
+    // is named avg_length on disk (not average_length); SD's "length" is the
+    // PSD-derived CASE expression already computed in SELECT — repeat the
+    // expression here so the filter compares against the same value the user
+    // sees in the row.
+    if (state !== 'mn') {
+      const lengthCol = state === 'sd' ? SD_AVG_LENGTH_EXPR
+                      : state === 'mi' ? 'fc.avg_length'
+                      : 'fc.average_length';
+      if (minLength !== undefined && minLength !== '') { conditions.push(`${lengthCol} >= ?`); params.push(parseFloat(minLength)); }
+      if (maxLength !== undefined && maxLength !== '') { conditions.push(`${lengthCol} <= ?`); params.push(parseFloat(maxLength)); }
+    }
+
     // MN-specific filters
     if (state === 'mn') {
       if (surveyType) {
@@ -798,18 +820,8 @@ app.get('/api/:state/results', (req, res) => {
       }
       if (minWeight !== undefined && minWeight !== '') { conditions.push('fc.average_weight >= ?'); params.push(parseFloat(minWeight)); }
       if (maxWeight !== undefined && maxWeight !== '') { conditions.push('fc.average_weight <= ?'); params.push(parseFloat(maxWeight)); }
-      if (minCatch  !== undefined && minCatch  !== '') { conditions.push('fc.total_catch >= ?');    params.push(parseInt(minCatch, 10)); }
-      if (maxCatch  !== undefined && maxCatch  !== '') { conditions.push('fc.total_catch <= ?');    params.push(parseInt(maxCatch, 10)); }
       if (minGearCount !== undefined && minGearCount !== '') { conditions.push('fc.gear_count >= ?'); params.push(parseInt(minGearCount, 10)); }
       if (maxGearCount !== undefined && maxGearCount !== '') { conditions.push('fc.gear_count <= ?'); params.push(parseInt(maxGearCount, 10)); }
-      if (cpueVsNormal === 'above') {
-        conditions.push('fc.quartile_count_high IS NOT NULL AND fc.cpue > fc.quartile_count_high');
-      } else if (cpueVsNormal === 'below') {
-        conditions.push('fc.quartile_count_low IS NOT NULL AND fc.cpue < fc.quartile_count_low');
-      } else if (cpueVsNormal === 'within') {
-        conditions.push('fc.cpue IS NOT NULL AND fc.quartile_count_low IS NOT NULL AND fc.quartile_count_high IS NOT NULL');
-        conditions.push('fc.cpue >= fc.quartile_count_low AND fc.cpue <= fc.quartile_count_high');
-      }
     }
 
     // ── mostRecentOnly CTE (state-specific date expression) ──────────────────
@@ -922,15 +934,17 @@ app.get('/api/:state/results', (req, res) => {
         ? 'CASE WHEN s.survey_date IS NULL THEN COALESCE(fc.average_length, sc.avg_length_est) ELSE fc.average_length END'
         : 'fc.average_length';
       const hasLSM = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='lake_stocking_metrics'").get();
+      // ef_stations / hn_stations / fn_stations stay — the gear filter at
+      // line ~750 uses them to scope rows by station presence. The per-gear
+      // cpue split-outs (ef_cpue/hn_cpue/fn_cpue) were removed: IA now sorts
+      // and filters on the unified fc.cpue like every other state.
       selectCols = `
         l.id AS lake_id, l.name AS lake_name, l.county, l.area_acres,
         s.id AS survey_id, s.survey_year, s.survey_date, s.gear AS survey_gear,
         fc.species, fc.gear, fc.total_catch, fc.cpue,
         ${avgLen} AS average_length,
         fc.n_measured, fc.min_length, fc.max_length,
-        CASE WHEN s.gear = 'EF' THEN fc.cpue ELSE NULL END AS ef_cpue, s.ef_stations,
-        CASE WHEN s.gear = 'HN' THEN fc.cpue ELSE NULL END AS hn_cpue, s.hn_stations,
-        CASE WHEN s.gear = 'FN' THEN fc.cpue ELSE NULL END AS fn_cpue, s.fn_stations,
+        s.ef_stations, s.hn_stations, s.fn_stations,
         ${hasLSM ? 'lsm.adults_per_100ac' : 'NULL'} AS stocked_per_100ac`;
       extraJoins = [
         hasSizeClasses ? 'LEFT JOIN ia_size_classes sc ON sc.species = fc.species AND sc.lake_name = l.name' : '',
@@ -980,10 +994,6 @@ app.get('/api/:state/results', (req, res) => {
       // SD
       psd: 'fc.psd', psd_p: 'fc.psd_p', wr: 'fc.wr',
       wr_sq: 'fc.wr_sq', wr_qp: 'fc.wr_qp', wr_pm: 'fc.wr_pm', wr_m: 'fc.wr_m',
-      // IA gear-specific
-      ef_cpue: "CASE WHEN s.gear = 'EF' THEN fc.cpue ELSE NULL END",
-      hn_cpue: "CASE WHEN s.gear = 'HN' THEN fc.cpue ELSE NULL END",
-      fn_cpue: "CASE WHEN s.gear = 'FN' THEN fc.cpue ELSE NULL END",
     };
     const sortCol = SORT_COLS[sortBy] ?? 'fc.cpue';
     const dir = sortDir === 'asc' ? 'ASC' : 'DESC';
@@ -1152,9 +1162,7 @@ app.get('/api/:state/lake/:id', (req, res) => {
         SELECT fc.species, fc.gear, fc.survey_id, s.survey_year, s.survey_date, s.gear AS survey_gear,
                fc.cpue, fc.total_catch, ${avgLen} AS average_length,
                fc.n_measured, fc.min_length, fc.max_length,
-               CASE WHEN s.gear = 'EF' THEN fc.cpue ELSE NULL END AS ef_cpue, s.ef_stations,
-               CASE WHEN s.gear = 'HN' THEN fc.cpue ELSE NULL END AS hn_cpue, s.hn_stations,
-               CASE WHEN s.gear = 'FN' THEN fc.cpue ELSE NULL END AS fn_cpue, s.fn_stations
+               s.ef_stations, s.hn_stations, s.fn_stations
         FROM fish_catch fc JOIN surveys s ON s.id = fc.survey_id
         JOIN lakes l ON l.id = fc.lake_id
         ${scJoin}

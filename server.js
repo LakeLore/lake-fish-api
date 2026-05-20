@@ -296,15 +296,15 @@ function computeLakeStockingMetrics(state, areaAcres, stockingRows) {
   const firstYear = Math.min(...recent.map(r => r.stock_year));
   const byKey = new Map(); // `${species}|${year}` -> total surviving adults
 
+  // Chart points: anchor every year at Dec 31 so each year's value is
+  // "adults by end of Y". Consistent anchoring means each year of elapsed
+  // time multiplies survival once — the year-over-year decline matches the
+  // model's annual adult survival rate. (Earlier this anchored past years
+  // at Dec 31 but current year at today, which produced identical 2025/2026
+  // values when viewed before July: 2025-12-31 and 2026-05-20 both round
+  // down to the same `completeYears` count.)
   for (let y = firstYear; y <= currentYear; y++) {
-    // For past years, anchor at year-end (Dec 31) so the "adults in year Y"
-    // metric captures fish that matured at any point during Y — not just
-    // those mature by today's calendar date within Y. Without this, a fry
-    // stocked in summer Y-3 wouldn't appear as an adult until Y+1 if the
-    // chart is viewed before July of Y, since July → July is 3 full years.
-    // Current year stays anchored to today so the headline matches what's
-    // alive right now.
-    const asOf = y === currentYear ? new Date(today.getTime()) : new Date(`${y}-12-31`);
+    const asOf = new Date(`${y}-12-31`);
     for (const r of recent) {
       if (r.stock_year > y) continue;
       const adults = survivingAdults(r._code, r.life_stage, r.stock_year, r.quantity, asOf);
@@ -312,6 +312,15 @@ function computeLakeStockingMetrics(state, areaAcres, stockingRows) {
       const k = `${r.species}|${y}`;
       byKey.set(k, (byKey.get(k) || 0) + adults);
     }
+  }
+
+  // Headline: "adults alive right now". Computed separately at today's date
+  // so the stat pill reflects the live population, not a year-end projection.
+  const headlineBySpecies = new Map();
+  for (const r of recent) {
+    const adults = survivingAdults(r._code, r.life_stage, r.stock_year, r.quantity, today);
+    if (adults <= 0) continue;
+    headlineBySpecies.set(r.species, (headlineBySpecies.get(r.species) || 0) + adults);
   }
 
   const metrics_by_year = [];
@@ -322,7 +331,10 @@ function computeLakeStockingMetrics(state, areaAcres, stockingRows) {
     const val = Math.round((totalAdults / acres100) * 10) / 10;
     if (val <= 0) continue;
     metrics_by_year.push({ species, year, adults_per_100ac: val });
-    if (year === currentYear) currentBySpecies.set(species, val);
+  }
+  for (const [species, totalAdults] of headlineBySpecies) {
+    const val = Math.round((totalAdults / acres100) * 10) / 10;
+    if (val > 0) currentBySpecies.set(species, val);
   }
   metrics_by_year.sort((a, b) =>
     a.species === b.species ? a.year - b.year : a.species.localeCompare(b.species));

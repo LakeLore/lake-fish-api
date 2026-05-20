@@ -101,6 +101,51 @@ app.get('/api/me/entitlement', async (req, res) => {
   }
 });
 
+// ── POST /api/feedback ─────────────────────────────────────────────────────
+// In-app feedback form. Mobile app posts a user-typed message plus context
+// (lake, state, species, tab, app version). We append one JSON line per
+// submission to /data/feedback.jsonl on the Fly volume. Triage by reading
+// the file (cat / grep / jq).
+//
+// No auth: anyone with the app can submit. Rate limit is the global 600/
+// 15-min from express-rate-limit, applied to /api. Body size is capped at
+// 4 KB so abuse can't fill the volume.
+//
+// Future upgrade path: pipe submissions to email via Resend or Postmark, or
+// surface them inside a dashboard. For v1 we just collect.
+const FEEDBACK_LOG_PATH = process.env.FEEDBACK_LOG_PATH
+  || path.join('/data', 'feedback.jsonl');
+
+app.post('/api/feedback', (req, res) => {
+  const userId = req.get('x-user-id') || null;
+  const { message, lakeId, lakeName, state, species, tab, version, build } = req.body || {};
+  if (typeof message !== 'string' || message.trim().length === 0) {
+    return res.status(400).json({ error: 'message_required' });
+  }
+  if (message.length > 2000) {
+    return res.status(400).json({ error: 'message_too_long' });
+  }
+  const entry = {
+    ts: new Date().toISOString(),
+    userId,
+    state: state ?? null,
+    lakeId: lakeId ?? null,
+    lakeName: lakeName ?? null,
+    species: species ?? null,
+    tab: tab ?? null,
+    version: version ?? null,
+    build: build ?? null,
+    message: message.trim(),
+  };
+  fs.promises.mkdir(path.dirname(FEEDBACK_LOG_PATH), { recursive: true })
+    .then(() => fs.promises.appendFile(FEEDBACK_LOG_PATH, JSON.stringify(entry) + '\n'))
+    .then(() => res.json({ ok: true }))
+    .catch(err => {
+      console.warn('[feedback] write failed:', err.message);
+      res.status(500).json({ error: 'write_failed' });
+    });
+});
+
 // ── POST /webhooks/revenuecat ──────────────────────────────────────────────
 // RevenueCat pushes purchase events here. We use them to invalidate the
 // cache so subsequent /api/me/entitlement calls see the new state without
@@ -155,7 +200,12 @@ const STATE_DB_PATHS = {
 const NE_PDF_DIR = process.env.NE_PDF_DIR ||
   path.join(__dirname, '..', 'ne-lake-fish', 'data', 'pdfs');
 
-const VALID_STATES = new Set(['mn', 'sd', 'nd', 'ia', 'ne', 'wi', 'mi']);
+// All states with code paths, DBs, and survival modules wired up. Includes
+// inactive states so reads still work in dev, but VALID_STATES filters to
+// ACTIVE_STATES at request time so inactive states return 404.
+const ALL_STATES = new Set(['mn', 'sd', 'nd', 'ia', 'ne', 'wi', 'mi']);
+const ACTIVE_STATES = new Set(['mn', 'sd', 'nd', 'ia', 'ne']);
+const VALID_STATES = ACTIVE_STATES;
 
 // ── Species code maps for survival model (IA and NE use full English names) ────
 
@@ -289,10 +339,10 @@ const MI_CPUE_EXPR = 'COALESCE(fc.cpue, fc.cpue_normalized)';
 
 // ── SD: avg length estimate from PSD size-class counts ────────────────────────
 // SD's fish_catch carries n_sq/n_qp/n_pm/n_m (counts in S–Q, Q–P, P–M, M–T length
-// bins) but no measured average. The mobile scatter plot estimates a mean length
-// by weighting each bin's midpoint — duplicate the formula here so the list view
-// can show and sort by the same number. Keep PSD_LENGTHS_MM in sync with
-// lake-fish-mobile/src/components/ScatterPlot.tsx.
+// bins) but no measured average. We derive an average length by weighting each
+// bin's midpoint with the published Gabelhouse/AFS S-Q-P-M-T length thresholds
+// (Anderson & Neumann 1996). Only species listed here get a derived length;
+// unmapped species return NULL.
 const SD_PSD_LENGTHS_MM = {
   WAE:[250,380,510,635,760], NOP:[350,530,710,890,1070],
   LMB:[200,300,380,510,630], SMB:[180,280,350,430,510],
@@ -302,6 +352,8 @@ const SD_PSD_LENGTHS_MM = {
   SAR:[230,330,460,580,710], RBT:[150,300,410,510,610],
   BNT:[150,300,410,510,610], STH:[300,400,510,610,710],
   WHB:[190,250,300,360,400], CCF:[280,380,510,610,710],
+  BLB:[150,230,300,380,460], CCP:[280,410,530,660,840],
+  WTS:[250,380,510,640,760], LAT:[300,500,650,800,1000],
 };
 const SD_NAME_TO_PSD_CODE = {
   'Walleye':'WAE','Northern Pike':'NOP','Largemouth Bass':'LMB','Smallmouth Bass':'SMB',
@@ -309,6 +361,7 @@ const SD_NAME_TO_PSD_CODE = {
   'Bluegill':'BLG','Saugeye':'SAU','Sauger':'SAR','Brook Trout':'BKT',
   'Rainbow Trout':'RBT','Brown Trout':'BNT','White Bass':'WHB',
   'Striped Bass Hybrid (Wiper)':'STH','Channel Catfish':'CCF',
+  'Black Bullhead':'BLB','Common Carp':'CCP','White Sucker':'WTS','Lake Trout':'LAT',
 };
 const SD_AVG_LENGTH_EXPR = (() => {
   const cases = [];
@@ -486,10 +539,32 @@ app.get('/api/:state/filters', (req, res) => {
   try {
     const hasCatch = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='fish_catch'").get();
 
-    const species = hasCatch ? db.prepare(`
-      SELECT fc.species, COUNT(DISTINCT fc.lake_id) as lake_count
-      FROM fish_catch fc GROUP BY fc.species ORDER BY lake_count DESC
-    `).all() : [];
+    // Optional county scope: when present, restrict the species lake_count
+    // to lakes in those counties so the picker reflects what's reachable
+    // under the user's current county selection.
+    const countyParam = req.query.county ? String(req.query.county) : '';
+    const countyList = countyParam
+      ? countyParam.split(',').map(c => c.trim()).filter(Boolean)
+      : [];
+
+    let species = [];
+    if (hasCatch) {
+      if (countyList.length > 0) {
+        const placeholders = countyList.map(() => '?').join(',');
+        species = db.prepare(`
+          SELECT fc.species, COUNT(DISTINCT fc.lake_id) as lake_count
+          FROM fish_catch fc
+          JOIN lakes l ON l.id = fc.lake_id
+          WHERE l.county IN (${placeholders})
+          GROUP BY fc.species ORDER BY lake_count DESC
+        `).all(...countyList);
+      } else {
+        species = db.prepare(`
+          SELECT fc.species, COUNT(DISTINCT fc.lake_id) as lake_count
+          FROM fish_catch fc GROUP BY fc.species ORDER BY lake_count DESC
+        `).all();
+      }
+    }
 
     const counties = db.prepare(`
       SELECT DISTINCT county FROM lakes WHERE county IS NOT NULL ORDER BY county
@@ -502,24 +577,52 @@ app.get('/api/:state/filters', (req, res) => {
     // Optional species filter: when set, gear counts/default reflect that species only.
     const speciesParam = req.query.species ? String(req.query.species) : null;
 
+    // Compose optional species + county filter clauses for the gear queries.
+    // Counties are joined via lakes(id) → fish_catch(lake_id). Both filters
+    // are optional and independently applied. Callers should pass `countyList`
+    // (already parsed above from req.query.county) and `speciesParam` here.
+    const speciesAnd = speciesParam ? 'AND fc.species = ?' : '';
+    const countyJoin = countyList.length > 0
+      ? `JOIN lakes l ON l.id = fc.lake_id`
+      : '';
+    const countyAnd = countyList.length > 0
+      ? `AND l.county IN (${countyList.map(() => '?').join(',')})`
+      : '';
+    const gearArgs = [
+      ...(speciesParam ? [speciesParam] : []),
+      ...countyList,
+    ];
+
     // Iowa: derive gear types from station presence columns
     let gearTypes = [];
     let gearTypeCounts = undefined;
     let defaultGear = undefined;
     if (state === 'ia' && hasCatch) {
-      const filterClause = speciesParam ? 'AND fc.species = ?' : '';
-      const args = speciesParam ? [speciesParam] : [];
-      const efN = db.prepare(`SELECT COUNT(DISTINCT s.id) AS n FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id WHERE s.ef_stations > 0 ${filterClause}`).get(...args).n;
-      const fnN = db.prepare(`SELECT COUNT(DISTINCT s.id) AS n FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id WHERE s.fn_stations > 0 ${filterClause}`).get(...args).n;
-      const hnN = db.prepare(`SELECT COUNT(DISTINCT s.id) AS n FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id WHERE s.hn_stations > 0 ${filterClause}`).get(...args).n;
+      // Iowa station-presence counts need lakes-join only when county scope
+      // is on. Surveys are already joined for the COUNT(DISTINCT s.id).
+      const iaCountyJoin = countyList.length > 0
+        ? `JOIN lakes l ON l.id = fc.lake_id`
+        : '';
+      const iaArgs = gearArgs;
+      const efN = db.prepare(`SELECT COUNT(DISTINCT s.id) AS n FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id ${iaCountyJoin} WHERE s.ef_stations > 0 ${speciesAnd} ${countyAnd}`).get(...iaArgs).n;
+      const fnN = db.prepare(`SELECT COUNT(DISTINCT s.id) AS n FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id ${iaCountyJoin} WHERE s.fn_stations > 0 ${speciesAnd} ${countyAnd}`).get(...iaArgs).n;
+      const hnN = db.prepare(`SELECT COUNT(DISTINCT s.id) AS n FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id ${iaCountyJoin} WHERE s.hn_stations > 0 ${speciesAnd} ${countyAnd}`).get(...iaArgs).n;
+      const compN = db.prepare(`SELECT COUNT(DISTINCT s.id) AS n FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id ${iaCountyJoin} WHERE s.gear = 'Comprehensive' ${speciesAnd} ${countyAnd}`).get(...iaArgs).n;
       if (efN) gearTypes.push('EF');
       if (fnN) gearTypes.push('FN');
       if (hnN) gearTypes.push('HN');
+      if (compN) gearTypes.push('Comprehensive');
       if (gearTypes.length) {
-        gearTypeCounts = { EF: efN, FN: fnN, HN: hnN };
-        if (speciesParam) {
-          // Species-aware: pick the gear with the most surveys catching this species
-          defaultGear = gearTypes.slice().sort((a, b) => gearTypeCounts[b] - gearTypeCounts[a])[0];
+        gearTypeCounts = { EF: efN, FN: fnN, HN: hnN, Comprehensive: compN };
+        // Comprehensive rollups bundle multiple gear types — they're useful as
+        // an explicit opt-in but should never be the default selection unless
+        // it's literally the only data available for this species/county.
+        const stationGears = gearTypes.filter(g => g !== 'Comprehensive');
+        if (stationGears.length === 0) {
+          defaultGear = 'Comprehensive';
+        } else if (speciesParam || countyList.length > 0) {
+          // Species- or county-aware: pick the station-based gear with the most matching surveys
+          defaultGear = stationGears.slice().sort((a, b) => gearTypeCounts[b] - gearTypeCounts[a])[0];
         } else {
           // Unfiltered IA default biases toward passive gear (FN/HN) over EF
           defaultGear = fnN >= hnN && fnN > 0 ? 'FN' : hnN > 0 ? 'HN' : 'EF';
@@ -529,27 +632,36 @@ app.get('/api/:state/filters', (req, res) => {
       // MI gear chips: real-gear chips count rows where the row has a natural
       // per-gear CPUE (fc.cpue IS NOT NULL). Rows without are folded into a
       // single "Mixed Gear Normalized" chip regardless of gear label.
-      const realSql = speciesParam
-        ? `SELECT gear, COUNT(*) AS n FROM fish_catch WHERE gear IS NOT NULL AND gear != '' AND cpue IS NOT NULL AND species = ? GROUP BY gear ORDER BY n DESC`
-        : `SELECT gear, COUNT(*) AS n FROM fish_catch WHERE gear IS NOT NULL AND gear != '' AND cpue IS NOT NULL GROUP BY gear ORDER BY n DESC`;
-      const realRows = speciesParam ? db.prepare(realSql).all(speciesParam) : db.prepare(realSql).all();
+      const realSql = `
+        SELECT fc.gear, COUNT(*) AS n
+        FROM fish_catch fc ${countyJoin}
+        WHERE fc.gear IS NOT NULL AND fc.gear != '' AND fc.cpue IS NOT NULL
+        ${speciesAnd} ${countyAnd}
+        GROUP BY fc.gear ORDER BY n DESC
+      `;
+      const realRows = db.prepare(realSql).all(...gearArgs);
       gearTypes = realRows.map(r => r.gear);
       gearTypeCounts = Object.fromEntries(realRows.map(r => [r.gear, r.n]));
 
-      const mixedSql = speciesParam
-        ? `SELECT COUNT(*) AS n FROM fish_catch WHERE cpue IS NULL AND species = ?`
-        : `SELECT COUNT(*) AS n FROM fish_catch WHERE cpue IS NULL`;
-      const mixedN = (speciesParam ? db.prepare(mixedSql).get(speciesParam) : db.prepare(mixedSql).get()).n;
+      const mixedSql = `
+        SELECT COUNT(*) AS n
+        FROM fish_catch fc ${countyJoin}
+        WHERE fc.cpue IS NULL ${speciesAnd} ${countyAnd}
+      `;
+      const mixedN = db.prepare(mixedSql).get(...gearArgs).n;
       if (mixedN > 0) {
         gearTypeCounts[MI_MIXED_GEAR_KEY] = mixedN;
         gearTypes = [...gearTypes, MI_MIXED_GEAR_KEY]
           .sort((a, b) => (gearTypeCounts[b] || 0) - (gearTypeCounts[a] || 0));
       }
     } else if (hasCatch) {
-      const sql = speciesParam
-        ? `SELECT gear, COUNT(*) AS n FROM fish_catch WHERE gear IS NOT NULL AND species = ? GROUP BY gear ORDER BY n DESC`
-        : `SELECT gear, COUNT(*) AS n FROM fish_catch WHERE gear IS NOT NULL GROUP BY gear ORDER BY n DESC`;
-      const gearRows = speciesParam ? db.prepare(sql).all(speciesParam) : db.prepare(sql).all();
+      const sql = `
+        SELECT fc.gear, COUNT(*) AS n
+        FROM fish_catch fc ${countyJoin}
+        WHERE fc.gear IS NOT NULL ${speciesAnd} ${countyAnd}
+        GROUP BY fc.gear ORDER BY n DESC
+      `;
+      const gearRows = db.prepare(sql).all(...gearArgs);
       gearTypes = gearRows.map(r => r.gear);
       gearTypeCounts = Object.fromEntries(gearRows.map(r => [r.gear, r.n]));
     }
@@ -777,7 +889,8 @@ app.get('/api/:state/results', (req, res) => {
       extraJoins = 'LEFT JOIN lake_stocking_metrics lsm ON lsm.lake_id = fc.lake_id AND lsm.species = fc.species';
     } else if (state === 'nd') {
       selectCols = `
-        l.id AS lake_id, l.name AS lake_name, l.county, l.area_acres,
+        l.id AS lake_id, l.name AS lake_name, l.county, l.area_acres, l.max_depth_feet,
+        l.latitude, l.longitude,
         s.id AS survey_id, s.survey_year, s.survey_date,
         fc.species, fc.species_name, fc.gear, fc.total_catch, fc.cpue, fc.average_length`;
       extraJoins = '';
@@ -831,8 +944,8 @@ app.get('/api/:state/results', (req, res) => {
     const SORT_COLS = {
       cpue: state === 'mi' ? `COALESCE(${cpueCol}, 0)` : 'fc.cpue',
       lake: 'l.name', acres: 'l.area_acres', year: 's.survey_year',
-      // ND/NE/WI/MI compute stocked_per_100ac in JS after the query — sorting by it in SQL isn't
-      // possible there, so fall back to fc.cpue (NE has no fc.total_catch column at all).
+      // ND/NE/WI/MI compute stocked_per_100ac in JS — see js-sort branch below for those states.
+      // The SQL value here is only reached for MN/SD/IA, which JOIN lake_stocking_metrics.
       stocked: ['mn', 'sd', 'ia'].includes(state) ? 'lsm.adults_per_100ac' : 'fc.cpue',
       // MN
       weight: 'fc.average_weight', catch: 'fc.total_catch',
@@ -869,16 +982,38 @@ app.get('/api/:state/results', (req, res) => {
     const allParams = [...cteParams, ...params];
     const total = db.prepare(`${ctePrefix} SELECT COUNT(*) as n ${joinsSql}`).get(allParams).n;
 
-    let rows = db.prepare(`
-      ${ctePrefix}
-      SELECT ${selectCols} ${joinsSql}
-      ORDER BY ${sortCol} ${dir} NULLS LAST
-      LIMIT ? OFFSET ?
-    `).all([...allParams, limitNum, offsetNum]);
+    // ND/NE/WI/MI compute stocked_per_100ac in JS via attachStockingMetrics.
+    // SQL can't sort or filter on it, so when the user sorts/filters by
+    // stocked we fetch unpaginated, enrich, then sort+filter+slice in JS.
+    const stockedSortInJs = sortBy === 'stocked' && ['nd', 'ne', 'wi', 'mi'].includes(state);
 
-    // ND, NE, WI, MI: attach stocked_per_100ac from in-memory metrics
-    if (state === 'nd' || state === 'ne' || state === 'wi' || state === 'mi') {
-      rows = attachStockingMetrics(rows, state);
+    let rows;
+    if (stockedSortInJs) {
+      const allRows = db.prepare(`
+        ${ctePrefix}
+        SELECT ${selectCols} ${joinsSql}
+      `).all(allParams);
+      let enriched = attachStockingMetrics(allRows, state);
+      enriched.sort((a, b) => {
+        const av = a.stocked_per_100ac, bv = b.stocked_per_100ac;
+        if (av == null && bv == null) return 0;
+        if (av == null) return 1;   // NULLS LAST regardless of direction
+        if (bv == null) return -1;
+        return dir === 'ASC' ? av - bv : bv - av;
+      });
+      rows = enriched.slice(offsetNum, offsetNum + limitNum);
+    } else {
+      rows = db.prepare(`
+        ${ctePrefix}
+        SELECT ${selectCols} ${joinsSql}
+        ORDER BY ${sortCol} ${dir} NULLS LAST
+        LIMIT ? OFFSET ?
+      `).all([...allParams, limitNum, offsetNum]);
+
+      // ND, NE, WI, MI: attach stocked_per_100ac from in-memory metrics
+      if (state === 'nd' || state === 'ne' || state === 'wi' || state === 'mi') {
+        rows = attachStockingMetrics(rows, state);
+      }
     }
 
     // SD: handle stocked filter post-query (stocked_per_100ac comes from SQL JOIN)
@@ -928,6 +1063,11 @@ app.get('/api/:state/lake/:id', (req, res) => {
         WHERE s.lake_id = ? GROUP BY s.id ORDER BY s.survey_year DESC
       `).all(id);
     } else if (state === 'ne') {
+      // source_url is populated by ~/ne-lake-fish/backfill_source_url.js
+      // (one-shot Playwright scrape of Nebraska Game & Parks' fish-sampling-
+      // reports page, matched to surveys.source_pdf by filename). If the
+      // production DB is ever rolled back to a pre-backfill snapshot,
+      // this query will SqliteError — re-run the backfill + deploy-data.sh.
       surveys = hasCatch ? db.prepare(`
         SELECT s.id, s.survey_year, s.survey_date, s.gear, s.source_pdf, s.source_url,
                COUNT(fc.id) as species_count, GROUP_CONCAT(DISTINCT fc.species) as species_list
@@ -935,8 +1075,12 @@ app.get('/api/:state/lake/:id', (req, res) => {
         WHERE s.lake_id = ? GROUP BY s.id ORDER BY s.survey_year DESC
       `).all(id) : [];
     } else if (state === 'mi') {
+      // MI surveys table has neither source_pdf nor survey_date columns.
+      // Emit NULL placeholders so the response shape stays consistent with
+      // states that do have them; the mobile defensively reads source_pdf
+      // off the latest survey and skips the link when null.
       surveys = hasCatch ? db.prepare(`
-        SELECT s.id, s.survey_year, s.gear, s.source_pdf,
+        SELECT s.id, s.survey_year, NULL AS survey_date, s.gear, NULL AS source_pdf,
                COUNT(fc.id) as species_count, GROUP_CONCAT(DISTINCT fc.species) as species_list
         FROM surveys s LEFT JOIN fish_catch fc ON fc.survey_id = s.id
         WHERE s.lake_id = ? GROUP BY s.id ORDER BY s.survey_year DESC
@@ -1041,7 +1185,24 @@ app.get('/api/:state/lake/:id', (req, res) => {
     // ── Stocking metrics (computed on the fly so headline matches per-year chart) ─
     const { metrics, metrics_by_year } = computeLakeStockingMetrics(state, lake.area_acres, stocking);
 
-    res.json({ lake, surveys, catches, stocking, metrics, metrics_by_year });
+    // SD only: SD GFP doesn't include a stocking section in every report PDF.
+    // Surface the most recent survey that actually contributed stocking rows
+    // so the Stocking-tab link lands on a PDF that has the data.
+    let latest_stocking_report_id = null;
+    if (state === 'sd') {
+      try {
+        const row = db.prepare(`
+          SELECT s.report_id
+          FROM surveys s JOIN stocking st ON st.survey_id = s.id
+          WHERE s.lake_id = ?
+          ORDER BY s.survey_year DESC, s.id DESC
+          LIMIT 1
+        `).get(id);
+        latest_stocking_report_id = row?.report_id ?? null;
+      } catch { /* stocking table may not exist */ }
+    }
+
+    res.json({ lake, surveys, catches, stocking, metrics, metrics_by_year, latest_stocking_report_id });
   } catch (err) {
     console.error(`[${state}] /lake/${id} error:`, err);
     res.status(500).json({ error: err.message });
@@ -1105,7 +1266,7 @@ if (process.env.SENTRY_DSN) {
 
 app.listen(PORT, () => {
   console.log(`Lake Fish mobile server running on port ${PORT}`);
-  console.log('Routes: /api/{mn|sd|nd|ia|ne|wi|mi}/{status|filters|results|lake/:id}');
+  console.log(`Routes: /api/{${[...ACTIVE_STATES].join('|')}}/{status|filters|results|lake/:id}`);
 
   // Pre-warm all available databases and stocking metrics
   for (const state of VALID_STATES) {

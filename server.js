@@ -920,7 +920,7 @@ app.get('/api/:state/results', (req, res) => {
       ].filter(Boolean).join('\n');
     } else if (state === 'wi') {
       selectCols = `
-        l.id AS lake_id, l.name AS lake_name, l.county, l.area_acres,
+        l.id AS lake_id, l.name AS lake_name, l.county, l.area_acres, l.max_depth_feet,
         s.id AS survey_id, s.survey_year, s.survey_date,
         fc.species, fc.species_name, fc.gear, fc.total_catch, fc.cpue, fc.average_length`;
       extraJoins = '';

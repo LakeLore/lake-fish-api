@@ -128,6 +128,19 @@ function mapOrder(spec) {
   }).join(', ');
 }
 
+// ── Wire id type coercion ────────────────────────────────────────────────────
+// Registry idWireType=integer states (SD, NE) store native integer ids in the
+// canonical TEXT id columns; the shipped app expects JSON numbers, so cast the
+// id-bearing wire fields back to numbers (123, not "123"). report_id is already
+// an INTEGER column and is left untouched.
+const INTEGER_ID_FIELDS = ['id', 'lake_id', 'survey_id'];
+function coerceWireIds(entry, row) {
+  if (!row || (entry.idWireType || 'text') !== 'integer') return;
+  for (const k of INTEGER_ID_FIELDS) {
+    if (typeof row[k] === 'string' && row[k] !== '') row[k] = Number(row[k]);
+  }
+}
+
 // ── Query-plan pinning ─────────────────────────────────────────────────────
 // The canonical artifacts carry ANALYZE stats plus indexes the legacy DBs
 // don't have (idx_fc_gearcat, the fish_catch UNIQUE autoindex), so SQLite
@@ -226,9 +239,15 @@ function filters(req, res, ctx) {
     let gearTypeCounts = undefined;
     if (hasCatch) {
       // Plan pin (see header comment): reproduce the legacy planner's driver.
+      // Unfiltered case: states whose legacy DB had a gear index (SD) emitted the
+      // gear list in gear (alphabetical) order — reproduced by driving
+      // idx_fc_gearcat under features.gearListSorted. States without one (MN, ND)
+      // full-scanned, giving arrival order — reproduced by NOT INDEXED.
+      // Species/county cases keep their own driving index, whose arrival order the
+      // legacy planner reproduced without a secondary sort.
       const fcPin = countyList.length > 0 ? 'INDEXED BY idx_fc_lake'
         : speciesParam ? 'INDEXED BY idx_fc_species'
-        : 'NOT INDEXED';
+        : (f.gearListSorted ? 'INDEXED BY idx_fc_gearcat' : 'NOT INDEXED');
       const gearRows = db.prepare(`
         SELECT fc.gear_category AS gear, COUNT(*) AS n
         FROM fish_catch fc ${fcPin} ${countyJoin}
@@ -416,7 +435,10 @@ function results(req, res, ctx) {
       CROSS JOIN surveys s ON fc.survey_id = s.id
       CROSS JOIN lakes l ON fc.lake_id = l.id`;
     } else if (county) {
-      pinnedFrom = `FROM lakes l
+      // Drive lakes via idx_lakes_county so the scan visits lakes in county
+      // order — matches the legacy planner's covering-index choice and keeps the
+      // arrival order (hence tie order among equal sort keys) identical.
+      pinnedFrom = `FROM lakes l INDEXED BY idx_lakes_county
       CROSS JOIN fish_catch fc INDEXED BY idx_fc_lake ON fc.lake_id = l.id
       CROSS JOIN surveys s ON fc.survey_id = s.id`;
     } else {
@@ -450,6 +472,7 @@ function results(req, res, ctx) {
       rows = rows.filter(r => r.stocked_per_100ac != null && r.stocked_per_100ac <= parseFloat(maxStocked));
     }
 
+    for (const r of rows) coerceWireIds(entry, r);
     res.json({ total, results: rows });
   } catch (err) {
     console.error(`[${state}] /results (canonical) error:`, err);
@@ -467,6 +490,7 @@ function lakeDetail(req, res, ctx) {
 
   try {
     const entry = ctx.getStateEntry(state);
+    const f = entry.features || {};
     const wire = entry.wire;
     if (!wire || !wire.lakeSurveys || !wire.lakeCatches) {
       throw new Error(`registry wire lake lists missing for canonical state ${state}`);
@@ -483,11 +507,23 @@ function lakeDetail(req, res, ctx) {
     // INDEXED BY idx_fc_survey pin: without it the planner covers the join
     // from the fish_catch UNIQUE autoindex, which feeds species into
     // GROUP_CONCAT(DISTINCT ...) alphabetically instead of in legacy rowid order.
-    const surveyCols = projectCols(wire.lakeSurveys, LAKE_SURVEYS_SRC, 'lakeSurveys');
+    // species_list: some states' legacy DBs fed GROUP_CONCAT(DISTINCT) from a
+    // (survey_id, species, …) covering index, so the list came out in species
+    // order (features.speciesListSorted); others got rowid order via idx_fc_survey.
+    // Reproduce each explicitly (ORDER BY inside the aggregate vs. the idx pin).
+    const surveysSrc = f.speciesListSorted
+      ? { ...LAKE_SURVEYS_SRC, species_list: 'GROUP_CONCAT(DISTINCT fc.species_native ORDER BY fc.species_native) as species_list' }
+      : LAKE_SURVEYS_SRC;
+    const surveyCols = projectCols(wire.lakeSurveys, surveysSrc, 'lakeSurveys');
+    // Deterministic tie-break for surveys sharing the primary sort key. Legacy
+    // broke ties by native survey id; for idWireType=integer states that is a
+    // NUMERIC order, so cast the stringified canonical id back.
+    let surveysOrder = mapOrder(wire.lakeSurveysOrder);
+    if ((entry.idWireType || 'text') === 'integer') surveysOrder += ', CAST(s.id AS INTEGER)';
     const surveys = db.prepare(`
       SELECT ${surveyCols}
       FROM surveys s LEFT JOIN fish_catch fc INDEXED BY idx_fc_survey ON fc.survey_id = s.id
-      WHERE s.lake_id = ? GROUP BY s.id ORDER BY ${mapOrder(wire.lakeSurveysOrder)}
+      WHERE s.lake_id = ? GROUP BY s.id ORDER BY ${surveysOrder}
     `).all(id);
 
     // ── Catches ───────────────────────────────────────────────────────────────
@@ -516,10 +552,28 @@ function lakeDetail(req, res, ctx) {
     // ── Stocking metrics — same on-the-fly compute path as legacy ────────────
     const { metrics, metrics_by_year } = ctx.computeLakeStockingMetrics(state, lake.area_acres, stocking);
 
-    // Registry-gated report link (SD only today; SD is not canonical yet).
-    // Legacy returns null for non-SD states, so canonical states emit null
-    // until a `features.stockingReportId` flag exists in the registry.
-    const latest_stocking_report_id = null;
+    // Registry-gated report link (SD): surface the most recent survey that
+    // actually contributed stocking rows, so the Stocking-tab link lands on a
+    // PDF that has the data. Mirrors legacy server.js SD /lake behavior. For
+    // states without the flag this stays null (legacy returns null too).
+    let latest_stocking_report_id = null;
+    if (f.stockingReportId) {
+      try {
+        const orderId = (entry.idWireType || 'text') === 'integer' ? 'CAST(s.id AS INTEGER)' : 's.id';
+        const row = db.prepare(`
+          SELECT s.report_id
+          FROM surveys s JOIN stocking st ON st.survey_id = s.id
+          WHERE s.lake_id = ?
+          ORDER BY s.survey_year DESC, ${orderId} DESC
+          LIMIT 1
+        `).get(id);
+        latest_stocking_report_id = row?.report_id ?? null;
+      } catch { /* stocking table may not exist */ }
+    }
+
+    coerceWireIds(entry, lake);
+    for (const r of surveys) coerceWireIds(entry, r);
+    for (const r of catches) coerceWireIds(entry, r);
 
     res.json({ lake, surveys, catches, stocking, metrics, metrics_by_year, latest_stocking_report_id });
   } catch (err) {

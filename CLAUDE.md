@@ -12,7 +12,11 @@ Express + better-sqlite3 API behind LakeLore. Hosted on Fly.io (`lake-fish-api`,
 ## File map
 
 ```
-server.js                 — Express app + all routes (~1100 lines)
+server.js                 — Express app + all routes; thin dispatch to canonical
+                            handlers for registry-canonical states
+server/canonical.js       — generic registry-driven filters/results/lake handlers
+                            (wire projection per registry wire lists; query plans
+                            pinned for tie-order parity — see PARITY_NOTES)
 entitlement.js            — RC v2 entitlement gate + cache
 package.json              — express, cors, better-sqlite3, express-rate-limit,
                             @sentry/node
@@ -37,6 +41,7 @@ All five deploy artifacts are symlinked from `~/` so existing commands (`flyctl 
 ## Architecture in 30 seconds
 
 - One Fly machine, one Express process, 7 SQLite connections (one per state, read-only WAL, lazily opened).
+- **Canonical vs legacy state serving (2026-07):** states flagged `canonical: true` in `~/lakelore-data/registry/states.json` are served by generic registry-driven handlers (`server/canonical.js`) against a canonical-schema DB built by `lakelore-data`'s `normalize.js`; other states keep the legacy per-state branches in `server.js`. MN is canonical since 2026-07-07 (parity-proven: 352-request exact-diff harness, `~/lakelore-data/bin/parity.js`). Canonical states get startup schema validation (mismatch → that state 503s `state unhealthy`, others unaffected) and `GET /healthz?deep=1` reports per-state `{ok, schemaOk, lakes, generatedAt, ageDays}`. Emergency override: `CANONICAL_STATES` env var (complete authoritative list; `none` forces all-legacy).
 - Survival modules required per state via `../{state}-lake-fish/survival.js` at runtime — these compute "adults per 100 acres" from stocking records on the fly per lake.
 - Entitlement gate via `entitlement.js` middleware: paid-state `/results`, `/lake/:id`, `/pdf` return 402 without entitlement. `/status` and `/filters` stay public. MN is the free state.
 - 5-min per-user entitlement cache (in-memory). Invalidated by RC webhook events at `POST /webhooks/revenuecat`.
@@ -59,13 +64,14 @@ The Dockerfile's COPY directives reference both this folder (`lake-fish-mobile-s
 | `RELOAD_TOKEN` | Bearer auth for `POST /api/:state/reload` in prod |
 | `REVENUECAT_SECRET_KEY` | v2 secret key (scoped Customers/Subscriptions/Entitlements: Read) |
 | `REVENUECAT_PROJECT_ID` | RC project short ID (`5155d3e4`) |
+| `REVENUECAT_WEBHOOK_AUTH` | Compared byte-for-byte to the `Authorization` header on `POST /webhooks/revenuecat`. When unset the handler accepts unsigned events (warning log only). Local copy at `~/.lakelore_rc_webhook_auth`. |
 | `SENTRY_DSN` | Server-side Sentry error reporting |
 
 Audit current: `~/.fly/bin/flyctl secrets list --app lake-fish-api`.
 
 ## Source-of-truth note on data
 
-This server reads `*.db` files; it does not write them. Fresh state data comes from running `~/fetch.sh <state>` (which chains `fetcher.js` and any sibling steps — MN and ND also require `stock-fetcher.js` to build `stocking` / `lake_stocking_metrics`; skipping it ships a DB that 500s on `/results`) → `~/deploy-data.sh` to upload to the Fly volume → either `fly app restart` or `POST /reload` with the bearer token to reload caches without restart. **Always consult `~/DATA_PIPELINES.md` for the state-specific pipeline before refreshing** — pipelines differ per state.
+This server reads `*.db` files; it does not write them. Fresh state data comes from running `~/fetch.sh <state>` (which chains `fetcher.js` and any sibling steps — MN and ND also require `stock-fetcher.js` to build `stocking` / `lake_stocking_metrics`; skipping it ships a DB that 500s on `/results`) → `~/deploy-data.sh` to upload to the Fly volume → either `fly app restart` or `POST /reload` with the bearer token to reload caches without restart. **Always consult `~/DATA_PIPELINES.md` for the state-specific pipeline before refreshing** — pipelines differ per state. For canonical states, prefer `~/lakelore-data/bin/refresh.sh <state> [--deploy]` — it chains fetch → normalize (validation gates BLOCK bad data) → B2 backup → deploy. `deploy-data.sh` and `_drift_check.py` are registry-aware: canonical states ship `~/lakelore-data/out/<state>.db`, legacy states ship the raw scraper DB.
 
 ## Reading order for a fresh Claude session
 

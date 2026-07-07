@@ -92,13 +92,30 @@ upload() {
   fi
 }
 
-upload "mn-lake-fish/data/lakes.db"      "/data/mn.db" "mn"
-upload "sd-lake-fish/data/sd_lakes.db"   "/data/sd.db" "sd"
-upload "nd-lake-fish/data/lakes.db"      "/data/nd.db" "nd"
-upload "ia-lake-fish/data/lakes.db"      "/data/ia.db" "ia"
-upload "ne-lake-fish/data/lakes.db"      "/data/ne.db" "ne"
-upload "wi-lake-fish/data/lakes.db"      "/data/wi.db" "wi"
-upload "mi-lake-fish/data/lakes.db"      "/data/mi.db" "mi"
+# Source selection: states flagged canonical in the lakelore-data registry
+# upload their canonical artifact (lakelore-data/out/<state>.db — built by
+# normalize.js behind validation gates); everything else uploads the legacy
+# raw scraper DB. _drift_check.py uses the same rule, so the drift comparison
+# always matches what actually ships.
+src_for() {
+  local state="$1" legacy="$2"
+  local canon="$HOME/lakelore-data/out/${state}.db"
+  local reg="$HOME/lakelore-data/registry/states.json"
+  if [ -f "$canon" ] && [ -f "$reg" ] && \
+     python3 -c "import json,sys; sys.exit(0 if json.load(open('$reg'))['states'].get('$state',{}).get('canonical') else 1)"; then
+    echo "$canon"
+  else
+    echo "$legacy"
+  fi
+}
+
+upload "$(src_for mn mn-lake-fish/data/lakes.db)"    "/data/mn.db" "mn"
+upload "$(src_for sd sd-lake-fish/data/sd_lakes.db)" "/data/sd.db" "sd"
+upload "$(src_for nd nd-lake-fish/data/lakes.db)"    "/data/nd.db" "nd"
+upload "$(src_for ia ia-lake-fish/data/lakes.db)"    "/data/ia.db" "ia"
+upload "$(src_for ne ne-lake-fish/data/lakes.db)"    "/data/ne.db" "ne"
+upload "$(src_for wi wi-lake-fish/data/lakes.db)"    "/data/wi.db" "wi"
+upload "$(src_for mi mi-lake-fish/data/lakes.db)"    "/data/mi.db" "mi"
 
 echo ""
 echo "Restarting app to load new databases..."

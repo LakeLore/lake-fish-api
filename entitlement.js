@@ -34,8 +34,36 @@ const RC_API_BASE = 'https://api.revenuecat.com/v2';
 // Only ACTIVE states appear here. Inactive states (wi, mi for v1) fall through
 // to route validation, which returns 400 (not 402). That keeps the client's
 // SubscriptionRequiredError → paywall flow from firing on states the user can't
-// reach in the first place. Re-add wi|mi when reactivating those states.
-const GATED_PATH_RE = /^\/api\/(mn|sd|nd|ia|ne)\/(results|lake|pdf)(?:\/|\?|$)/;
+// reach in the first place.
+//
+// The state list is generated from lakelore-data/registry/states.json (all
+// `active` states — including free MN, which matches and then passes through
+// inside gateByState via FREE_STATES, exactly like the historical literal).
+// When the registry is unavailable (e.g. Docker image without lakelore-data),
+// we fall back to the legacy literal. A startup assertion cross-checks the
+// generated source against the literal and logs loudly on drift — it never
+// crashes the server.
+const LEGACY_GATED_SOURCE = '^\\/api\\/(mn|sd|nd|ia|ne)\\/(results|lake|pdf)(?:\\/|\\?|$)';
+const GATED_PATH_RE = (() => {
+  const fallback = new RegExp(LEGACY_GATED_SOURCE);
+  try {
+    const { loadRegistry } = require('../lakelore-data');
+    const reg = loadRegistry();
+    const active = Object.keys(reg.states).filter(s => reg.states[s].active === true);
+    if (!active.length) throw new Error('registry lists no active states');
+    const generated = `^\\/api\\/(${active.join('|')})\\/(results|lake|pdf)(?:\\/|\\?|$)`;
+    if (generated !== LEGACY_GATED_SOURCE) {
+      console.error(
+        '[entitlement] registry-generated gate regex DIFFERS from the legacy literal — '
+        + `verify registry active flags are intentional.\n  generated: ${generated}\n  legacy:    ${LEGACY_GATED_SOURCE}`
+      );
+    }
+    return new RegExp(generated);
+  } catch (err) {
+    console.error(`[entitlement] registry unavailable — using legacy gated-path literal: ${err.message}`);
+    return fallback;
+  }
+})();
 
 const _cache = new Map();
 let _warnedNoKey = false;

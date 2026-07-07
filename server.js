@@ -23,6 +23,54 @@ const Database = require('better-sqlite3');
 const rateLimit = require('express-rate-limit');
 const { gateByState, checkEntitlement, invalidateCache } = require('./entitlement');
 
+// ── Canonical data layer (lakelore-data) ───────────────────────────────────────
+// States flagged `canonical: true` in lakelore-data/registry/states.json (or
+// forced via the CANONICAL_STATES env var) are served from the canonical
+// artifacts in lakelore-data/out/{state}.db through generic registry-driven
+// handlers (server/canonical.js). Everything else keeps the legacy per-state
+// code paths below, byte-identical.
+//
+// lakelore-data may be absent (e.g. the Docker image until its Dockerfile
+// ships it) — fall back to legacy behavior for ALL states with a loud error.
+let lakeloreData = null;
+let assertCanonicalSchema = null;
+let canonical = null;
+try {
+  lakeloreData = require('../lakelore-data');
+  lakeloreData.loadRegistry();
+  assertCanonicalSchema = require('../lakelore-data/schema/assert-schema').assertSchema;
+  canonical = require('./server/canonical');
+} catch (e) {
+  console.error(`[canonical] lakelore-data unavailable — legacy behavior for all states: ${e.message}`);
+  lakeloreData = null;
+}
+
+// CANONICAL_STATES env override: when set it is the complete authoritative
+// list (comma-separated). "mn" forces mn on; "none" (or "-mn" entries) force
+// off. When unset, the registry `canonical` flag decides.
+const CANONICAL_STATES_ENV = process.env.CANONICAL_STATES;
+
+function isCanonical(state) {
+  if (!lakeloreData || !canonical) return false;
+  if (CANONICAL_STATES_ENV !== undefined) {
+    const list = CANONICAL_STATES_ENV.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    if (list.includes('none') || list.includes(`-${state}`)) return false;
+    return list.includes(state);
+  }
+  try { return lakeloreData.getState(state).canonical === true; } catch { return false; }
+}
+
+// DB path for canonical states: {STATE}_DB_PATH env wins, else the
+// lakelore-data artifact. (Legacy states resolve via STATE_DB_PATHS below.)
+function canonicalDbPath(state) {
+  return process.env[`${state.toUpperCase()}_DB_PATH`]
+    || path.join(__dirname, '..', 'lakelore-data', 'out', `${state}.db`);
+}
+
+// States whose canonical DB failed startup schema validation. Their routes
+// return 503 until a /reload re-validates successfully.
+const _canonicalUnhealthy = new Set();
+
 const PORT = process.env.PORT || 3100;
 const STOCKING_CUTOFF_YEAR = new Date().getFullYear() - 10;
 
@@ -57,8 +105,35 @@ app.use(cors({
 app.use(express.json());
 
 // Healthcheck — independent of any state DB, used by the Fly healthcheck.
-// Kept outside /api so it bypasses rate limiting.
-app.get('/healthz', (req, res) => res.json({ ok: true }));
+// Kept outside /api so it bypasses rate limiting. Default shape is unchanged;
+// ?deep=1 adds per-state freshness/health details.
+app.get('/healthz', (req, res) => {
+  if (req.query.deep !== '1') return res.json({ ok: true });
+  const states = {};
+  for (const state of ACTIVE_STATES) {
+    const entry = { ok: false, lakes: null, generatedAt: null, ageDays: null };
+    if (isCanonical(state)) entry.schemaOk = null;
+    try {
+      const db = getDb(state);
+      if (isCanonical(state)) entry.schemaOk = !_canonicalUnhealthy.has(state);
+      if (db) {
+        entry.lakes = db.prepare('SELECT COUNT(*) as n FROM lakes').get().n;
+        entry.ok = true;
+        if (isCanonical(state)) {
+          const g = db.prepare("SELECT value FROM meta WHERE key = 'generated_at'").get();
+          if (g?.value) {
+            entry.generatedAt = g.value;
+            entry.ageDays = Math.round((Date.now() - Date.parse(g.value)) / 86400000 * 10) / 10;
+          }
+        }
+      }
+    } catch (e) {
+      entry.error = e.message;
+    }
+    states[state] = entry;
+  }
+  res.json({ ok: true, states });
+});
 
 // Rate limiting — 600 req per 15 min per IP in production.
 // One typical session uses ~10–15 requests; 600 covers ~40 sessions per
@@ -246,6 +321,22 @@ const NE_SPECIES_CODE_MAP = {
 const _survival = {};
 function getSurvival(state) {
   if (_survival[state]) return _survival[state];
+  // Canonical states use the shared lakelore-data survival model (equivalence-
+  // proven against every legacy per-state module), bound to the state's
+  // life-stage normalization rules.
+  if (isCanonical(state)) {
+    try {
+      const shared = require('../lakelore-data/survival');
+      _survival[state] = {
+        survivingAdults: (species, lifeStage, stockYear, quantity, asOfDate) =>
+          shared.survivingAdults(species, lifeStage, stockYear, quantity, asOfDate, state),
+      };
+      return _survival[state];
+    } catch (e) {
+      console.error(`[${state}] Could not load shared survival module: ${e.message}`);
+      return (_survival[state] = { survivingAdults: () => 0, SPECIES_TO_CODE: {} });
+    }
+  }
   try {
     switch (state) {
       case 'mn': _survival[state] = require('../mn-lake-fish/survival'); break;
@@ -263,8 +354,16 @@ function getSurvival(state) {
   return _survival[state];
 }
 
+const _canonicalSpeciesResolvers = {};
 function resolveSpeciesCode(state, rawSpecies) {
   if (!rawSpecies) return null;
+  // Canonical states: species_native -> canonical code via the registry
+  // species map (lakelore-data/registry/species.json).
+  if (isCanonical(state) && lakeloreData) {
+    const resolver = _canonicalSpeciesResolvers[state]
+      || (_canonicalSpeciesResolvers[state] = lakeloreData.speciesResolver(state));
+    return resolver(rawSpecies).code;
+  }
   if (state === 'ia') return IA_SPECIES_CODE_MAP[rawSpecies.toLowerCase()] ?? null;
   if (state === 'ne') return NE_SPECIES_CODE_MAP[rawSpecies.toLowerCase()] ?? null;
   if (state === 'mi') return MI_SPECIES_CODE_MAP[rawSpecies.toLowerCase()] ?? null;
@@ -451,8 +550,40 @@ function computeSdStockingMetrics(db) {
 // ── Database connections (one per state, lazy with SD migration) ───────────────
 
 const _dbs = {};
+
+// Canonical states: open the lakelore-data artifact read-only and validate its
+// schema on first open. On mismatch: mark unhealthy, log loudly, do NOT crash —
+// that state's routes return 503 until /reload re-validates.
+function getCanonicalDb(state) {
+  const dbPath = canonicalDbPath(state);
+  if (!fs.existsSync(dbPath)) return null;
+  // No journal_mode pragma here: canonical artifacts are immutable snapshots
+  // (built with journal_mode=OFF), and changing the mode on a readonly handle
+  // would attempt a write.
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    const problems = assertCanonicalSchema(db);
+    if (problems.length) {
+      _canonicalUnhealthy.add(state);
+      console.error(`[${state}] canonical schema mismatch (${problems.length} problem${problems.length === 1 ? '' : 's'}) at ${dbPath}:`);
+      for (const p of problems.slice(0, 10)) console.error(`  - ${p}`);
+      db.close();
+      return null;
+    }
+  } catch (e) {
+    _canonicalUnhealthy.add(state);
+    console.error(`[${state}] canonical schema validation failed at ${dbPath}: ${e.message}`);
+    try { db.close(); } catch {}
+    return null;
+  }
+  _canonicalUnhealthy.delete(state);
+  _dbs[state] = db;
+  return db;
+}
+
 function getDb(state) {
   if (_dbs[state]) return _dbs[state];
+  if (isCanonical(state)) return getCanonicalDb(state);
   const dbPath = STATE_DB_PATHS[state];
   if (!fs.existsSync(dbPath)) return null;
 
@@ -526,12 +657,23 @@ function validateState(req, res) {
   return true;
 }
 
+// Context handed to the generic canonical handlers (server/canonical.js).
+const canonicalCtx = {
+  getDb,
+  isUnhealthy: (state) => _canonicalUnhealthy.has(state),
+  getStateEntry: (state) => lakeloreData.getState(state),
+  computeLakeStockingMetrics,
+};
+
 // ── /api/:state/status ─────────────────────────────────────────────────────────
 
 app.get('/api/:state/status', (req, res) => {
   if (!validateState(req, res)) return;
   const { state } = req.params;
   const db = getDb(state);
+  if (isCanonical(state) && _canonicalUnhealthy.has(state)) {
+    return res.status(503).json({ error: 'state unhealthy: schema mismatch' });
+  }
   if (!db) return res.json({ ready: false, message: 'Database not found' });
 
   try {
@@ -550,6 +692,7 @@ app.get('/api/:state/status', (req, res) => {
 
 app.get('/api/:state/filters', (req, res) => {
   if (!validateState(req, res)) return;
+  if (isCanonical(req.params.state)) return canonical.filters(req, res, canonicalCtx);
   const { state } = req.params;
   const db = getDb(state);
   if (!db) return res.status(503).json({ error: 'Database not ready' });
@@ -704,6 +847,7 @@ app.get('/api/:state/filters', (req, res) => {
 
 app.get('/api/:state/results', (req, res) => {
   if (!validateState(req, res)) return;
+  if (isCanonical(req.params.state)) return canonical.results(req, res, canonicalCtx);
   const { state } = req.params;
   const db = getDb(state);
   if (!db) return res.status(503).json({ error: 'Database not ready' });
@@ -1063,6 +1207,7 @@ app.get('/api/:state/results', (req, res) => {
 
 app.get('/api/:state/lake/:id', (req, res) => {
   if (!validateState(req, res)) return;
+  if (isCanonical(req.params.state)) return canonical.lakeDetail(req, res, canonicalCtx);
   const { state, id } = req.params;
   if (!/^[\w-]+$/.test(id)) return res.status(400).json({ error: 'Invalid lake id' });
   const db = getDb(state);
@@ -1253,12 +1398,26 @@ app.post('/api/:state/reload', requireReloadToken, (req, res) => {
   // Evict cached in-memory stocking metrics
   delete _stockingMetrics[state];
 
-  // Re-open (runs SD migrations + stocking metrics recomputation if needed)
-  const db = getDb(state);
-  if (!db) return res.status(503).json({ error: `Database not found at ${STATE_DB_PATHS[state]}` });
+  // Canonical states: clear the unhealthy flag so the reopen re-validates the
+  // (possibly replaced) artifact's schema from scratch.
+  if (isCanonical(state)) _canonicalUnhealthy.delete(state);
 
-  // Pre-warm in-memory metrics for non-SD/MN states
-  if (!['mn', 'sd'].includes(state)) getInMemoryStockingMetrics(state);
+  // Re-open (runs SD migrations + stocking metrics recomputation if needed;
+  // canonical states re-run schema validation)
+  const db = getDb(state);
+  if (!db) {
+    if (isCanonical(state)) {
+      if (_canonicalUnhealthy.has(state)) {
+        return res.status(503).json({ error: 'state unhealthy: schema mismatch' });
+      }
+      return res.status(503).json({ error: `Database not found at ${canonicalDbPath(state)}` });
+    }
+    return res.status(503).json({ error: `Database not found at ${STATE_DB_PATHS[state]}` });
+  }
+
+  // Pre-warm in-memory metrics for non-SD/MN states (canonical states carry
+  // precomputed lake_stocking_metrics in the artifact — nothing to warm)
+  if (!isCanonical(state) && !['mn', 'sd'].includes(state)) getInMemoryStockingMetrics(state);
 
   try {
     const lakes = db.prepare('SELECT COUNT(*) as n FROM lakes').get().n;
@@ -1300,11 +1459,13 @@ app.listen(PORT, () => {
     if (db) {
       try {
         const n = db.prepare('SELECT COUNT(*) as n FROM lakes').get().n;
-        console.log(`  [${state}] ready — ${n} lakes`);
-        if (!['mn', 'sd'].includes(state)) getInMemoryStockingMetrics(state);
+        console.log(`  [${state}] ready — ${n} lakes${isCanonical(state) ? ' (canonical)' : ''}`);
+        if (!isCanonical(state) && !['mn', 'sd'].includes(state)) getInMemoryStockingMetrics(state);
       } catch (e) {
         console.warn(`  [${state}] startup warning: ${e.message}`);
       }
+    } else if (isCanonical(state) && _canonicalUnhealthy.has(state)) {
+      console.error(`  [${state}] UNHEALTHY — canonical schema mismatch, routes will 503`);
     } else {
       console.log(`  [${state}] database not found — skipping`);
     }

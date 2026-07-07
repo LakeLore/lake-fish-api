@@ -1,0 +1,531 @@
+'use strict';
+
+// ── Canonical (registry-driven) route handlers ────────────────────────────────
+// Generic handlers for states flipped onto the canonical data path
+// (lakelore-data/out/{state}.db, schema per lakelore-data/schema/canonical.sql).
+// Used ONLY when server.js isCanonical(state) is true; legacy branches in
+// server.js remain byte-identical for every other state.
+//
+// Wire compatibility is the contract: output field lists come from
+// lakelore-data/registry/states.json `wire` entries (copied verbatim from the
+// legacy per-state SELECTs) and are enforced by lakelore-data/bin/parity.js.
+//
+// Each handler receives (req, res, ctx) where ctx is built by server.js:
+//   ctx.getDb(state)                    — opens the canonical DB (validated)
+//   ctx.isUnhealthy(state)              — schema-mismatch flag
+//   ctx.getStateEntry(state)            — registry entry (features, wire)
+//   ctx.computeLakeStockingMetrics(...) — server.js shared metrics compute
+
+// Map wire field name -> SQL source expression for /results.
+// species maps to species_native (registry speciesWire=native): the exact
+// legacy string the shipped app expects.
+const RESULTS_SRC = {
+  lake_id: 'l.id AS lake_id',
+  lake_name: 'l.name AS lake_name',
+  county: 'l.county',
+  area_acres: 'l.area_acres',
+  max_depth_feet: 'l.max_depth_feet',
+  latitude: 'l.latitude',
+  longitude: 'l.longitude',
+  survey_id: 's.id AS survey_id',
+  survey_date: 's.survey_date',
+  survey_year: 's.survey_year',
+  survey_type: 's.survey_type',
+  survey_sub_type: 's.survey_sub_type',
+  survey_gear: 's.gear AS survey_gear',
+  report_id: 's.report_id',
+  species: 'fc.species_native AS species',
+  species_name: 'fc.species_name',
+  gear: 'fc.gear',
+  gear_count: 'fc.gear_count',
+  total_catch: 'fc.total_catch',
+  sample_n: 'fc.sample_n',
+  average_weight: 'fc.average_weight',
+  weight_lbs: 'fc.weight_lbs',
+  cpue: 'fc.cpue',
+  cpue_ci: 'fc.cpue_ci',
+  average_length: 'fc.average_length',
+  min_length: 'fc.min_length',
+  max_length: 'fc.max_length',
+  n_measured: 'fc.n_measured',
+  quartile_count_low: 'fc.quartile_count_low',
+  quartile_count_high: 'fc.quartile_count_high',
+  psd: 'fc.psd', psd_p: 'fc.psd_p', wr: 'fc.wr',
+  wr_sq: 'fc.wr_sq', wr_qp: 'fc.wr_qp', wr_pm: 'fc.wr_pm', wr_m: 'fc.wr_m',
+  n_sq: 'fc.n_sq', n_qp: 'fc.n_qp', n_pm: 'fc.n_pm', n_m: 'fc.n_m',
+  ef_stations: 's.ef_stations', hn_stations: 's.hn_stations', fn_stations: 's.fn_stations',
+  stocked_per_100ac: 'lsm.adults_per_100ac AS stocked_per_100ac',
+};
+
+// /lake/:id surveys list (legacy aliases COUNT/GROUP_CONCAT the same way).
+const LAKE_SURVEYS_SRC = {
+  id: 's.id',
+  survey_date: 's.survey_date',
+  survey_year: 's.survey_year',
+  survey_type: 's.survey_type',
+  survey_sub_type: 's.survey_sub_type',
+  gear: 's.gear',
+  report_id: 's.report_id',
+  source_pdf: 's.source_pdf',
+  source_url: 's.source_url',
+  species_count: 'COUNT(fc.id) as species_count',
+  species_list: 'GROUP_CONCAT(DISTINCT fc.species_native) as species_list',
+};
+
+// /lake/:id catches list. Note survey_id here reads fc.survey_id (legacy did).
+const LAKE_CATCHES_SRC = {
+  species: 'fc.species_native AS species',
+  species_name: 'fc.species_name',
+  gear: 'fc.gear',
+  survey_id: 'fc.survey_id',
+  survey_date: 's.survey_date',
+  survey_year: 's.survey_year',
+  survey_type: 's.survey_type',
+  survey_gear: 's.gear AS survey_gear',
+  report_id: 's.report_id',
+  cpue: 'fc.cpue',
+  cpue_ci: 'fc.cpue_ci',
+  cpue_all_gear: 'fc.cpue_all_gear',
+  cpue_normalized: 'fc.cpue_normalized',
+  average_weight: 'fc.average_weight',
+  weight_lbs: 'fc.weight_lbs',
+  total_catch: 'fc.total_catch',
+  sample_n: 'fc.sample_n',
+  gear_count: 'fc.gear_count',
+  average_length: 'fc.average_length',
+  min_length: 'fc.min_length',
+  max_length: 'fc.max_length',
+  n_measured: 'fc.n_measured',
+  quartile_count_low: 'fc.quartile_count_low',
+  quartile_count_high: 'fc.quartile_count_high',
+  psd: 'fc.psd', psd_p: 'fc.psd_p', wr: 'fc.wr',
+  wr_sq: 'fc.wr_sq', wr_qp: 'fc.wr_qp', wr_pm: 'fc.wr_pm', wr_m: 'fc.wr_m',
+  n_sq: 'fc.n_sq', n_qp: 'fc.n_qp', n_pm: 'fc.n_pm', n_m: 'fc.n_m',
+  ef_stations: 's.ef_stations', hn_stations: 's.hn_stations', fn_stations: 's.fn_stations',
+};
+
+// ORDER BY column tokens used in wire.lakeSurveysOrder / wire.lakeCatchesOrder.
+const ORDER_SRC = {
+  survey_date: 's.survey_date',
+  survey_year: 's.survey_year',
+  species: 'fc.species_native',
+  report_id: 's.report_id',
+};
+
+function projectCols(fields, srcMap, what) {
+  return fields.map(f => {
+    const src = srcMap[f];
+    if (!src) throw new Error(`no canonical source mapping for ${what} wire field '${f}'`);
+    return src;
+  }).join(',\n        ');
+}
+
+function mapOrder(spec) {
+  return spec.split(',').map(tok => {
+    const parts = tok.trim().split(/\s+/);
+    const col = ORDER_SRC[parts[0]] || parts[0];
+    return parts.length > 1 ? `${col} ${parts.slice(1).join(' ')}` : col;
+  }).join(', ');
+}
+
+// ── Query-plan pinning ─────────────────────────────────────────────────────
+// The canonical artifacts carry ANALYZE stats plus indexes the legacy DBs
+// don't have (idx_fc_gearcat, the fish_catch UNIQUE autoindex), so SQLite
+// picks different plans — which changes the ARRIVAL order of rows into
+// GROUP BY / ORDER BY / GROUP_CONCAT(DISTINCT), i.e. the ordering of ties.
+// Wire parity requires reproducing the legacy planner's simple, stat-less
+// choices, so the queries below pin the driving table/index explicitly:
+//   species filter        -> fish_catch via idx_fc_species (legacy: idx_fish_catch_species)
+//   county (no species)   -> lakes outer, fish_catch via idx_fc_lake
+//   otherwise             -> full fish_catch scan (NOT INDEXED)
+// CROSS JOIN is SQLite's documented "do not reorder" join. Verified
+// byte-identical against legacy output by lakelore-data/bin/parity.js.
+
+// Open the canonical DB for a state, or send the appropriate error response.
+// Returns the db handle or null (response already sent).
+function openDb(state, res, ctx) {
+  const db = ctx.getDb(state);
+  if (ctx.isUnhealthy(state)) {
+    res.status(503).json({ error: 'state unhealthy: schema mismatch' });
+    return null;
+  }
+  if (!db) {
+    res.status(503).json({ error: 'Database not ready' });
+    return null;
+  }
+  return db;
+}
+
+// ── /api/:state/filters ────────────────────────────────────────────────────────
+// Replicates the legacy MN behavior against canonical columns:
+// species -> species_native AS species; gear chips from gear_category.
+
+function filters(req, res, ctx) {
+  const { state } = req.params;
+  const db = openDb(state, res, ctx);
+  if (!db) return;
+
+  try {
+    const entry = ctx.getStateEntry(state);
+    const f = entry.features || {};
+    if ((f.gearFilterMode || 'gear') !== 'gear') {
+      // IA station-mode and MI mixed-mode chips land with those states' cutover.
+      throw new Error(`canonical /filters not implemented for gearFilterMode=${f.gearFilterMode}`);
+    }
+
+    const hasCatch = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='fish_catch'").get();
+
+    // Optional county scope: when present, restrict the species lake_count
+    // to lakes in those counties (mirrors legacy).
+    const countyParam = req.query.county ? String(req.query.county) : '';
+    const countyList = countyParam
+      ? countyParam.split(',').map(c => c.trim()).filter(Boolean)
+      : [];
+
+    let species = [];
+    if (hasCatch) {
+      if (countyList.length > 0) {
+        const placeholders = countyList.map(() => '?').join(',');
+        // Plan pin (see header comment): drive from lakes like legacy did.
+        species = db.prepare(`
+          SELECT fc.species_native AS species, COUNT(DISTINCT fc.lake_id) as lake_count
+          FROM fish_catch fc INDEXED BY idx_fc_lake
+          JOIN lakes l ON l.id = fc.lake_id
+          WHERE l.county IN (${placeholders})
+          GROUP BY fc.species_native ORDER BY lake_count DESC
+        `).all(...countyList);
+      } else {
+        species = db.prepare(`
+          SELECT fc.species_native AS species, COUNT(DISTINCT fc.lake_id) as lake_count
+          FROM fish_catch fc GROUP BY fc.species_native ORDER BY lake_count DESC
+        `).all();
+      }
+    }
+
+    const counties = db.prepare(`
+      SELECT DISTINCT county FROM lakes WHERE county IS NOT NULL ORDER BY county
+    `).all().map(r => r.county);
+
+    const yearRange = hasCatch
+      ? db.prepare('SELECT MIN(survey_year) as min, MAX(survey_year) as max FROM surveys').get()
+      : { min: null, max: null };
+
+    // Optional species filter: when set, gear counts reflect that species only.
+    const speciesParam = req.query.species ? String(req.query.species) : null;
+    const speciesAnd = speciesParam ? 'AND fc.species_native = ?' : '';
+    const countyJoin = countyList.length > 0 ? 'JOIN lakes l ON l.id = fc.lake_id' : '';
+    const countyAnd = countyList.length > 0
+      ? `AND l.county IN (${countyList.map(() => '?').join(',')})`
+      : '';
+    const gearArgs = [
+      ...(speciesParam ? [speciesParam] : []),
+      ...countyList,
+    ];
+
+    let gearTypes = [];
+    let gearTypeCounts = undefined;
+    if (hasCatch) {
+      // Plan pin (see header comment): reproduce the legacy planner's driver.
+      const fcPin = countyList.length > 0 ? 'INDEXED BY idx_fc_lake'
+        : speciesParam ? 'INDEXED BY idx_fc_species'
+        : 'NOT INDEXED';
+      const gearRows = db.prepare(`
+        SELECT fc.gear_category AS gear, COUNT(*) AS n
+        FROM fish_catch fc ${fcPin} ${countyJoin}
+        WHERE fc.gear_category IS NOT NULL ${speciesAnd} ${countyAnd}
+        GROUP BY fc.gear_category ORDER BY n DESC
+      `).all(...gearArgs);
+      gearTypes = gearRows.map(r => r.gear);
+      gearTypeCounts = Object.fromEntries(gearRows.map(r => [r.gear, r.n]));
+    }
+
+    const result = { species, gearTypes, gearTypeCounts, counties, yearRange };
+
+    if (f.surveyTypes) {
+      result.surveyTypes = db.prepare(`
+        SELECT DISTINCT survey_type FROM surveys WHERE survey_type IS NOT NULL ORDER BY survey_type
+      `).all().map(r => r.survey_type);
+    }
+
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// ── /api/:state/results ────────────────────────────────────────────────────────
+
+function results(req, res, ctx) {
+  const { state } = req.params;
+  const db = openDb(state, res, ctx);
+  if (!db) return;
+
+  const hasCatch = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='fish_catch'").get();
+  if (!hasCatch) return res.json({ total: 0, results: [] });
+
+  try {
+    const entry = ctx.getStateEntry(state);
+    const f = entry.features || {};
+    const wire = entry.wire;
+    if (!wire || !wire.results) throw new Error(`registry wire.results missing for canonical state ${state}`);
+
+    const {
+      species, lakeName, gear,
+      minCpue, maxCpue,
+      minYear, maxYear,
+      county, minAcres, maxAcres,
+      minStocked, maxStocked,
+      minLength, maxLength,
+      minCatch, maxCatch,
+      mostRecentOnly,
+      surveyType,
+      minWeight, maxWeight,
+      minGearCount, maxGearCount,
+      sortBy = 'cpue',
+      sortDir = 'desc',
+      limit = '100',
+      offset = '0',
+    } = req.query;
+
+    // Validate and clamp numeric query params (identical to legacy).
+    const limitNum = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+    const offsetNum = Math.max(parseInt(offset, 10) || 0, 0);
+
+    const conditions = [];
+    const params = [];
+
+    if (species)          { conditions.push('fc.species_native = ?'); params.push(species); }
+    if (lakeName?.trim()) { conditions.push('LOWER(l.name) LIKE LOWER(?)'); params.push(`%${lakeName.trim()}%`); }
+
+    if (gear) {
+      const gears = gear.split(',').filter(Boolean);
+      if (gears.length) {
+        conditions.push(`fc.gear_category IN (${gears.map(() => '?').join(',')})`);
+        params.push(...gears);
+      }
+    }
+
+    if (minCpue !== undefined && minCpue !== '') { conditions.push('fc.cpue_effective >= ?'); params.push(parseFloat(minCpue)); }
+    if (maxCpue !== undefined && maxCpue !== '') { conditions.push('fc.cpue_effective <= ?'); params.push(parseFloat(maxCpue)); }
+    if (minYear !== undefined && minYear !== '') { conditions.push('s.survey_year >= ?'); params.push(parseInt(minYear, 10)); }
+    if (maxYear !== undefined && maxYear !== '') { conditions.push('s.survey_year <= ?'); params.push(parseInt(maxYear, 10)); }
+
+    if (county) {
+      const counties = county.split(',').filter(Boolean);
+      if (counties.length) {
+        conditions.push(`l.county IN (${counties.map(() => '?').join(',')})`);
+        params.push(...counties);
+      }
+    }
+    if (minAcres !== undefined && minAcres !== '') { conditions.push('l.area_acres >= ?'); params.push(parseFloat(minAcres)); }
+    if (maxAcres !== undefined && maxAcres !== '') { conditions.push('l.area_acres <= ?'); params.push(parseFloat(maxAcres)); }
+
+    if (f.totalCatchFilter) {
+      if (minCatch !== undefined && minCatch !== '') { conditions.push('fc.total_catch >= ?'); params.push(parseInt(minCatch, 10)); }
+      if (maxCatch !== undefined && maxCatch !== '') { conditions.push('fc.total_catch <= ?'); params.push(parseInt(maxCatch, 10)); }
+    }
+
+    if (f.lengthFilter) {
+      if (minLength !== undefined && minLength !== '') { conditions.push('fc.average_length >= ?'); params.push(parseFloat(minLength)); }
+      if (maxLength !== undefined && maxLength !== '') { conditions.push('fc.average_length <= ?'); params.push(parseFloat(maxLength)); }
+    }
+
+    if (f.surveyTypes && surveyType) {
+      const types = surveyType.split(',').filter(Boolean);
+      if (types.length) { conditions.push(`s.survey_type IN (${types.map(() => '?').join(',')})`); params.push(...types); }
+    }
+    if (f.weightFilter) {
+      if (minWeight !== undefined && minWeight !== '') { conditions.push('fc.average_weight >= ?'); params.push(parseFloat(minWeight)); }
+      if (maxWeight !== undefined && maxWeight !== '') { conditions.push('fc.average_weight <= ?'); params.push(parseFloat(maxWeight)); }
+    }
+    if (f.gearCountFilter) {
+      if (minGearCount !== undefined && minGearCount !== '') { conditions.push('fc.gear_count >= ?'); params.push(parseInt(minGearCount, 10)); }
+      if (maxGearCount !== undefined && maxGearCount !== '') { conditions.push('fc.gear_count <= ?'); params.push(parseInt(maxGearCount, 10)); }
+    }
+
+    // ── mostRecentOnly CTE — date expression keyed by registry mostRecentBy ──
+    let ctePrefix = '';
+    const cteParams = [];
+    let mostRecentJoin = '';
+
+    if (mostRecentOnly === 'true') {
+      const subConds = [];
+      if (species) { subConds.push('fc2.species_native = ?'); cteParams.push(species); }
+      if (gear) {
+        const gears = gear.split(',').filter(Boolean);
+        if (gears.length) {
+          subConds.push(`fc2.gear_category IN (${gears.map(() => '?').join(',')})`);
+          cteParams.push(...gears);
+        }
+      }
+      // IA: exclude consolidated rollup rows from the most-recent calculation.
+      if (f.mostRecentBy === 'survey_date_not_null') subConds.push('s2.survey_date IS NOT NULL');
+
+      const subWhere = subConds.length ? 'WHERE ' + subConds.join(' AND ') : '';
+
+      if (f.mostRecentBy === 'survey_date' || f.mostRecentBy === 'survey_date_not_null') {
+        ctePrefix = `WITH _most_recent AS (
+          SELECT s2.lake_id, MAX(s2.survey_date) AS max_date
+          FROM surveys s2 JOIN fish_catch fc2 ON fc2.survey_id = s2.id ${subWhere}
+          GROUP BY s2.lake_id
+        )`;
+        // CROSS JOIN pins mr LAST (legacy planner joined the materialized CTE
+        // last via an automatic index; canonical's ANALYZE stats made it the
+        // driver, permuting tie order).
+        mostRecentJoin = 'CROSS JOIN _most_recent mr ON mr.lake_id = l.id AND s.survey_date = mr.max_date';
+      } else {
+        ctePrefix = `WITH _most_recent AS (
+          SELECT s2.lake_id, MAX(s2.survey_year) AS max_year
+          FROM surveys s2 JOIN fish_catch fc2 ON fc2.survey_id = s2.id ${subWhere}
+          GROUP BY s2.lake_id
+        )`;
+        mostRecentJoin = 'CROSS JOIN _most_recent mr ON mr.lake_id = l.id AND s.survey_year = mr.max_year';
+      }
+    }
+
+    const whereClause = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+
+    // Output projected EXACTLY per registry wire.results.
+    const selectCols = projectCols(wire.results, RESULTS_SRC, 'results');
+
+    // Canonical DBs precompute lake_stocking_metrics for EVERY state, so the
+    // stocked sort/JOIN is SQL always (no JS post-sort branch).
+    const extraJoins = 'LEFT JOIN lake_stocking_metrics lsm ON lsm.lake_id = fc.lake_id AND lsm.species_native = fc.species_native';
+
+    const SORT_COLS = {
+      cpue: 'fc.cpue_effective',
+      lake: 'l.name', acres: 'l.area_acres', year: 's.survey_year',
+      stocked: 'lsm.adults_per_100ac',
+      weight: 'fc.average_weight', catch: 'fc.total_catch',
+      date: f.mostRecentBy === 'survey_date_not_null'
+        ? "COALESCE(s.survey_date, CAST(s.survey_year AS TEXT) || '-12-31')"
+        : 's.survey_date',
+      depth: 'l.max_depth_feet',
+      length: 'fc.average_length',
+      psd: 'fc.psd', psd_p: 'fc.psd_p', wr: 'fc.wr',
+      wr_sq: 'fc.wr_sq', wr_qp: 'fc.wr_qp', wr_pm: 'fc.wr_pm', wr_m: 'fc.wr_m',
+    };
+    const sortCol = SORT_COLS[sortBy] ?? 'fc.cpue_effective';
+    const dir = sortDir === 'asc' ? 'ASC' : 'DESC';
+
+    // Plan pin (see header comment): fix the join order + driving index to the
+    // shape the legacy planner picked, so tie order matches byte-for-byte.
+    let pinnedFrom;
+    if (species) {
+      pinnedFrom = `FROM fish_catch fc INDEXED BY idx_fc_species
+      CROSS JOIN surveys s ON fc.survey_id = s.id
+      CROSS JOIN lakes l ON fc.lake_id = l.id`;
+    } else if (county) {
+      pinnedFrom = `FROM lakes l
+      CROSS JOIN fish_catch fc INDEXED BY idx_fc_lake ON fc.lake_id = l.id
+      CROSS JOIN surveys s ON fc.survey_id = s.id`;
+    } else {
+      pinnedFrom = `FROM fish_catch fc NOT INDEXED
+      CROSS JOIN surveys s ON fc.survey_id = s.id
+      CROSS JOIN lakes l ON fc.lake_id = l.id`;
+    }
+
+    const joinsSql = `
+      ${pinnedFrom}
+      ${extraJoins}
+      ${mostRecentJoin}
+      ${whereClause}
+    `;
+
+    const allParams = [...cteParams, ...params];
+    const total = db.prepare(`${ctePrefix} SELECT COUNT(*) as n ${joinsSql}`).get(allParams).n;
+
+    let rows = db.prepare(`
+      ${ctePrefix}
+      SELECT ${selectCols} ${joinsSql}
+      ORDER BY ${sortCol} ${dir} NULLS LAST
+      LIMIT ? OFFSET ?
+    `).all([...allParams, limitNum, offsetNum]);
+
+    // stocked range post-filter (identical to legacy semantics).
+    if (minStocked !== undefined && minStocked !== '') {
+      rows = rows.filter(r => r.stocked_per_100ac != null && r.stocked_per_100ac >= parseFloat(minStocked));
+    }
+    if (maxStocked !== undefined && maxStocked !== '') {
+      rows = rows.filter(r => r.stocked_per_100ac != null && r.stocked_per_100ac <= parseFloat(maxStocked));
+    }
+
+    res.json({ total, results: rows });
+  } catch (err) {
+    console.error(`[${state}] /results (canonical) error:`, err);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// ── /api/:state/lake/:id ───────────────────────────────────────────────────────
+
+function lakeDetail(req, res, ctx) {
+  const { state, id } = req.params;
+  if (!/^[\w-]+$/.test(id)) return res.status(400).json({ error: 'Invalid lake id' });
+  const db = openDb(state, res, ctx);
+  if (!db) return;
+
+  try {
+    const entry = ctx.getStateEntry(state);
+    const wire = entry.wire;
+    if (!wire || !wire.lakeSurveys || !wire.lakeCatches) {
+      throw new Error(`registry wire lake lists missing for canonical state ${state}`);
+    }
+
+    // Canonical lake shape (SELECT *): drops legacy-internal columns and
+    // renames avg_water_clarity -> water_clarity; whitelisted in parity notes.
+    const lake = db.prepare('SELECT * FROM lakes WHERE id = ?').get(id);
+    if (!lake) return res.status(404).json({ error: 'Lake not found' });
+
+    const hasCatch = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='fish_catch'").get();
+
+    // ── Surveys ──────────────────────────────────────────────────────────────
+    // INDEXED BY idx_fc_survey pin: without it the planner covers the join
+    // from the fish_catch UNIQUE autoindex, which feeds species into
+    // GROUP_CONCAT(DISTINCT ...) alphabetically instead of in legacy rowid order.
+    const surveyCols = projectCols(wire.lakeSurveys, LAKE_SURVEYS_SRC, 'lakeSurveys');
+    const surveys = db.prepare(`
+      SELECT ${surveyCols}
+      FROM surveys s LEFT JOIN fish_catch fc INDEXED BY idx_fc_survey ON fc.survey_id = s.id
+      WHERE s.lake_id = ? GROUP BY s.id ORDER BY ${mapOrder(wire.lakeSurveysOrder)}
+    `).all(id);
+
+    // ── Catches ───────────────────────────────────────────────────────────────
+    let catches = [];
+    if (hasCatch) {
+      const catchCols = projectCols(wire.lakeCatches, LAKE_CATCHES_SRC, 'lakeCatches');
+      catches = db.prepare(`
+        SELECT ${catchCols}
+        FROM fish_catch fc INDEXED BY idx_fc_lake JOIN surveys s ON s.id = fc.survey_id
+        WHERE fc.lake_id = ? ORDER BY ${mapOrder(wire.lakeCatchesOrder)}
+      `).all(id);
+    }
+
+    // ── Stocking ──────────────────────────────────────────────────────────────
+    // Canonical column is species_native; aliased to `species` on the wire
+    // (legacy: SELECT stock_year, species, life_stage, SUM(quantity) ...).
+    let stocking = [];
+    try {
+      stocking = db.prepare(`
+        SELECT stock_year, species_native AS species, life_stage, SUM(quantity) as quantity
+        FROM stocking WHERE lake_id = ?
+        GROUP BY stock_year, species, life_stage ORDER BY stock_year DESC, species
+      `).all(id);
+    } catch { /* stocking table may not exist */ }
+
+    // ── Stocking metrics — same on-the-fly compute path as legacy ────────────
+    const { metrics, metrics_by_year } = ctx.computeLakeStockingMetrics(state, lake.area_acres, stocking);
+
+    // Registry-gated report link (SD only today; SD is not canonical yet).
+    // Legacy returns null for non-SD states, so canonical states emit null
+    // until a `features.stockingReportId` flag exists in the registry.
+    const latest_stocking_report_id = null;
+
+    res.json({ lake, surveys, catches, stocking, metrics, metrics_by_year, latest_stocking_report_id });
+  } catch (err) {
+    console.error(`[${state}] /lake/${id} (canonical) error:`, err);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+module.exports = { filters, results, lakeDetail };

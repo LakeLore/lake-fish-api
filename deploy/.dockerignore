@@ -4,8 +4,17 @@
 
 !lake-fish-mobile-server/server.js
 !lake-fish-mobile-server/entitlement.js
+!lake-fish-mobile-server/server/canonical.js
 !lake-fish-mobile-server/package.json
 !lake-fish-mobile-server/package-lock.json
+
+!lakelore-data/index.js
+!lakelore-data/registry/states.json
+!lakelore-data/registry/species.json
+!lakelore-data/schema/canonical.sql
+!lakelore-data/schema/assert-schema.js
+!lakelore-data/survival/index.js
+!lakelore-data/survival/chains.json
 
 !mn-lake-fish/survival.js
 !sd-lake-fish/survival.js

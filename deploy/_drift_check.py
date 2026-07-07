@@ -33,7 +33,7 @@ APP = "lake-fish-api"
 ROOT = Path(__file__).resolve().parents[2]  # ~ (project root)
 FLY = str(Path.home() / ".fly" / "bin" / "fly")
 
-LOCAL_PATHS = {
+LEGACY_PATHS = {
     "mn": ROOT / "mn-lake-fish" / "data" / "lakes.db",
     "sd": ROOT / "sd-lake-fish" / "data" / "sd_lakes.db",
     "nd": ROOT / "nd-lake-fish" / "data" / "lakes.db",
@@ -42,6 +42,31 @@ LOCAL_PATHS = {
     "wi": ROOT / "wi-lake-fish" / "data" / "lakes.db",
     "mi": ROOT / "mi-lake-fish" / "data" / "lakes.db",
 }
+
+
+def _canonical_states():
+    """States flagged canonical in the lakelore-data registry (empty set if
+    the registry isn't present — legacy behavior)."""
+    reg = ROOT / "lakelore-data" / "registry" / "states.json"
+    if not reg.exists():
+        return set()
+    import json
+    with open(reg) as f:
+        states = json.load(f)["states"]
+    return {s for s, e in states.items() if e.get("canonical")}
+
+
+def _local_path(state: str):
+    """Canonical states compare their canonical artifact (what actually gets
+    uploaded); legacy states compare the raw scraper DB."""
+    if state in _canonical_states():
+        canonical = ROOT / "lakelore-data" / "out" / f"{state}.db"
+        if canonical.exists():
+            return canonical
+    return LEGACY_PATHS.get(state)
+
+
+LOCAL_PATHS = {s: _local_path(s) for s in LEGACY_PATHS}
 ALL_STATES = list(LOCAL_PATHS.keys())
 TABLES = ["lakes", "surveys", "fish_catch", "stocking"]
 

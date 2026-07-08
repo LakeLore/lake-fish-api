@@ -105,11 +105,24 @@ const LAKE_CATCHES_SRC = {
 };
 
 // ORDER BY column tokens used in wire.lakeSurveysOrder / wire.lakeCatchesOrder.
+// survey_date_coalesced is IA's legacy /lake catches ordering: consolidated
+// rollup surveys (survey_date IS NULL) sort as Dec 31 of their survey year.
 const ORDER_SRC = {
   survey_date: 's.survey_date',
   survey_year: 's.survey_year',
   species: 'fc.species_native',
   report_id: 's.report_id',
+  survey_date_coalesced: "COALESCE(s.survey_date, CAST(s.survey_year AS TEXT) || '-12-31')",
+};
+
+// gearFilterMode='stations' (IA): gear chips map to station-presence columns
+// on the surveys table. Keyed by chip token; value builds the SQL condition
+// against a surveys alias ('s' in the main query, 's2' in the mostRecent CTE).
+// Tokens without an entry (incl. 'Comprehensive') are dropped, matching legacy.
+const STATION_CONDS = {
+  EF: (a) => `${a}.ef_stations > 0`,
+  FN: (a) => `${a}.fn_stations > 0`,
+  HN: (a) => `${a}.hn_stations > 0`,
 };
 
 function projectCols(fields, srcMap, what) {
@@ -170,8 +183,10 @@ function openDb(state, res, ctx) {
 }
 
 // ── /api/:state/filters ────────────────────────────────────────────────────────
-// Replicates the legacy MN behavior against canonical columns:
-// species -> species_native AS species; gear chips from gear_category.
+// Replicates the legacy behavior against canonical columns:
+// species -> species_native AS species; gear chips from gear_category
+// (gearFilterMode 'gear') or station-presence counts + defaultGear
+// (gearFilterMode 'stations', IA).
 
 function filters(req, res, ctx) {
   const { state } = req.params;
@@ -181,8 +196,9 @@ function filters(req, res, ctx) {
   try {
     const entry = ctx.getStateEntry(state);
     const f = entry.features || {};
-    if ((f.gearFilterMode || 'gear') !== 'gear') {
-      // IA station-mode and MI mixed-mode chips land with those states' cutover.
+    const gearMode = f.gearFilterMode || 'gear';
+    if (gearMode !== 'gear' && gearMode !== 'stations') {
+      // MI mixed-mode chips land with that state's cutover.
       throw new Error(`canonical /filters not implemented for gearFilterMode=${f.gearFilterMode}`);
     }
 
@@ -237,7 +253,38 @@ function filters(req, res, ctx) {
 
     let gearTypes = [];
     let gearTypeCounts = undefined;
-    if (hasCatch) {
+    let defaultGear = undefined;
+    if (gearMode === 'stations' && hasCatch) {
+      // IA: gear chips derive from station-presence columns on surveys (EF/FN/HN)
+      // plus the 'Comprehensive' survey-gear rollup — byte-identical port of the
+      // legacy IA branch (fc.species -> fc.species_native is the only rename).
+      const stationCount = (cond) => db.prepare(`
+        SELECT COUNT(DISTINCT s.id) AS n
+        FROM surveys s JOIN fish_catch fc ON fc.survey_id = s.id ${countyJoin}
+        WHERE ${cond} ${speciesAnd} ${countyAnd}
+      `).get(...gearArgs).n;
+      const efN = stationCount('s.ef_stations > 0');
+      const fnN = stationCount('s.fn_stations > 0');
+      const hnN = stationCount('s.hn_stations > 0');
+      const compN = stationCount("s.gear = 'Comprehensive'");
+      if (efN) gearTypes.push('EF');
+      if (fnN) gearTypes.push('FN');
+      if (hnN) gearTypes.push('HN');
+      if (compN) gearTypes.push('Comprehensive');
+      if (gearTypes.length) {
+        gearTypeCounts = { EF: efN, FN: fnN, HN: hnN, Comprehensive: compN };
+        // Comprehensive rollups bundle multiple gear types — never the default
+        // unless it's literally the only data for this species/county scope.
+        const stationGears = gearTypes.filter(g => g !== 'Comprehensive');
+        if (stationGears.length === 0) {
+          defaultGear = 'Comprehensive';
+        } else if (speciesParam || countyList.length > 0) {
+          defaultGear = stationGears.slice().sort((a, b) => gearTypeCounts[b] - gearTypeCounts[a])[0];
+        } else {
+          defaultGear = fnN >= hnN && fnN > 0 ? 'FN' : hnN > 0 ? 'HN' : 'EF';
+        }
+      }
+    } else if (hasCatch) {
       // Plan pin (see header comment): reproduce the legacy planner's driver.
       // Unfiltered case: states whose legacy DB had a gear index (SD) emitted the
       // gear list in gear (alphabetical) order — reproduced by driving
@@ -259,6 +306,7 @@ function filters(req, res, ctx) {
     }
 
     const result = { species, gearTypes, gearTypeCounts, counties, yearRange };
+    if (defaultGear !== undefined) result.defaultGear = defaultGear;
 
     if (f.surveyTypes) {
       result.surveyTypes = db.prepare(`
@@ -318,7 +366,13 @@ function results(req, res, ctx) {
 
     if (gear) {
       const gears = gear.split(',').filter(Boolean);
-      if (gears.length) {
+      if (f.gearFilterMode === 'stations') {
+        // IA: gear chips filter by station presence on the survey, not fc.gear.
+        // Unknown tokens (incl. 'Comprehensive') drop out; if none remain, no
+        // condition is added — exactly the legacy IA behavior.
+        const conds = gears.map(g => STATION_CONDS[g] ? STATION_CONDS[g]('s') : null).filter(Boolean);
+        if (conds.length) conditions.push(`(${conds.join(' OR ')})`);
+      } else if (gears.length) {
         conditions.push(`fc.gear_category IN (${gears.map(() => '?').join(',')})`);
         params.push(...gears);
       }
@@ -345,8 +399,16 @@ function results(req, res, ctx) {
     }
 
     if (f.lengthFilter) {
-      if (minLength !== undefined && minLength !== '') { conditions.push('fc.average_length >= ?'); params.push(parseFloat(minLength)); }
-      if (maxLength !== undefined && maxLength !== '') { conditions.push('fc.average_length <= ?'); params.push(parseFloat(maxLength)); }
+      // IA (lengthFilterMeasuredOnly): the legacy min/maxLength filter compared
+      // raw fc.average_length, NOT the size-class estimate the SELECT coalesced
+      // in — so rows whose canonical average_length was baked from
+      // ia_size_classes (length_derivation='estimate') must be treated as NULL
+      // here, keeping filter semantics byte-identical to legacy.
+      const lengthCol = f.lengthFilterMeasuredOnly
+        ? "(CASE WHEN fc.length_derivation = 'estimate' THEN NULL ELSE fc.average_length END)"
+        : 'fc.average_length';
+      if (minLength !== undefined && minLength !== '') { conditions.push(`${lengthCol} >= ?`); params.push(parseFloat(minLength)); }
+      if (maxLength !== undefined && maxLength !== '') { conditions.push(`${lengthCol} <= ?`); params.push(parseFloat(maxLength)); }
     }
 
     if (f.surveyTypes && surveyType) {
@@ -372,7 +434,10 @@ function results(req, res, ctx) {
       if (species) { subConds.push('fc2.species_native = ?'); cteParams.push(species); }
       if (gear) {
         const gears = gear.split(',').filter(Boolean);
-        if (gears.length) {
+        if (f.gearFilterMode === 'stations') {
+          const gconds = gears.map(g => STATION_CONDS[g] ? STATION_CONDS[g]('s2') : null).filter(Boolean);
+          if (gconds.length) subConds.push(`(${gconds.join(' OR ')})`);
+        } else if (gears.length) {
           subConds.push(`fc2.gear_category IN (${gears.map(() => '?').join(',')})`);
           cteParams.push(...gears);
         }
@@ -427,20 +492,53 @@ function results(req, res, ctx) {
     const sortCol = SORT_COLS[sortBy] ?? 'fc.cpue_effective';
     const dir = sortDir === 'asc' ? 'ASC' : 'DESC';
 
+    // mostRecentOrderPin (NE): for species-less mostRecentOnly queries the
+    // legacy planner drives the _most_recent CTE as the OUTER table (verified
+    // by EXPLAIN QUERY PLAN for every species-less variant), so rows ARRIVE in
+    // (numeric lake_id ASC [CTE emission order via idx_surveys_lake], raw fc
+    // rowid ASC within lake [idx_fish_catch_lake]) order — which is what breaks
+    // sort-key ties. Canonical fish_catch.id preserves raw rowid order 1:1
+    // (adapter inserts in raw scan order), so an explicit ORDER BY suffix
+    // reproduces the legacy tie order deterministically, independent of the
+    // canonical planner. Species queries keep the species-index arrival (their
+    // own pin); legacy uses idx_fish_catch_species there too.
+    let orderSuffix = '';
+    if (f.mostRecentOrderPin && mostRecentOnly === 'true' && !species) {
+      const lakeKey = (entry.idWireType || 'text') === 'integer'
+        ? 'CAST(fc.lake_id AS INTEGER)' : 'fc.lake_id';
+      orderSuffix = `, ${lakeKey}, fc.id`;
+    }
+
     // Plan pin (see header comment): fix the join order + driving index to the
     // shape the legacy planner picked, so tie order matches byte-for-byte.
+    // Registry-gated variants (verified by EXPLAIN QUERY PLAN on the raw DBs):
+    //   countyPin=false  (NE)     — the raw DB has no idx_lakes_county, so the
+    //     legacy planner full-scanned fish_catch even for county queries.
+    //   yearRangePin=true (IA/NE) — the raw DB has idx_surveys_year and the
+    //     legacy planner drives BOTH-bounds year-range queries through it
+    //     (surveys in year order), but only when species/county don't provide
+    //     a driver and no _most_recent CTE is present. One-sided year bounds
+    //     stay on the full scan (legacy behavior; verified). ND's raw DB has
+    //     the same index but its parity corpus is tie-clean without the pin,
+    //     so ND keeps the proven full-scan shape.
+    const bothYearBounds = minYear !== undefined && minYear !== ''
+      && maxYear !== undefined && maxYear !== '';
     let pinnedFrom;
     if (species) {
       pinnedFrom = `FROM fish_catch fc INDEXED BY idx_fc_species
       CROSS JOIN surveys s ON fc.survey_id = s.id
       CROSS JOIN lakes l ON fc.lake_id = l.id`;
-    } else if (county) {
+    } else if (county && f.countyPin !== false) {
       // Drive lakes via idx_lakes_county so the scan visits lakes in county
       // order — matches the legacy planner's covering-index choice and keeps the
       // arrival order (hence tie order among equal sort keys) identical.
       pinnedFrom = `FROM lakes l INDEXED BY idx_lakes_county
       CROSS JOIN fish_catch fc INDEXED BY idx_fc_lake ON fc.lake_id = l.id
       CROSS JOIN surveys s ON fc.survey_id = s.id`;
+    } else if (f.yearRangePin && bothYearBounds && mostRecentOnly !== 'true') {
+      pinnedFrom = `FROM surveys s INDEXED BY idx_surveys_year
+      CROSS JOIN fish_catch fc INDEXED BY idx_fc_survey ON fc.survey_id = s.id
+      CROSS JOIN lakes l ON fc.lake_id = l.id`;
     } else {
       pinnedFrom = `FROM fish_catch fc NOT INDEXED
       CROSS JOIN surveys s ON fc.survey_id = s.id
@@ -460,7 +558,7 @@ function results(req, res, ctx) {
     let rows = db.prepare(`
       ${ctePrefix}
       SELECT ${selectCols} ${joinsSql}
-      ORDER BY ${sortCol} ${dir} NULLS LAST
+      ORDER BY ${sortCol} ${dir} NULLS LAST${orderSuffix}
       LIMIT ? OFFSET ?
     `).all([...allParams, limitNum, offsetNum]);
 

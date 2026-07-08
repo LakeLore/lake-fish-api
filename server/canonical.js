@@ -126,6 +126,18 @@ const STATION_CONDS = {
   HN: (a) => `${a}.hn_stations > 0`,
 };
 
+// features.cpueEffectiveWire (MI): the wire `cpue` field must serve the
+// effective CPUE (canonical fc.cpue_effective = legacy COALESCE(fc.cpue,
+// fc.cpue_normalized)), not the raw per-gear fc.cpue which is NULL for the
+// synthetic 'Mixed Gear Normalized' rows. Swap the `cpue` source expression for
+// states that set the flag; every other state keeps raw fc.cpue (identical to
+// cpue_effective for them, since their cpue_normalized is always NULL).
+function cpueSrc(srcMap, entry) {
+  const f = entry.features || {};
+  if (!f.cpueEffectiveWire) return srcMap;
+  return { ...srcMap, cpue: 'fc.cpue_effective AS cpue' };
+}
+
 function projectCols(fields, srcMap, what) {
   return fields.map(f => {
     const src = srcMap[f];
@@ -471,7 +483,7 @@ function results(req, res, ctx) {
     const whereClause = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
     // Output projected EXACTLY per registry wire.results.
-    const selectCols = projectCols(wire.results, RESULTS_SRC, 'results');
+    const selectCols = projectCols(wire.results, cpueSrc(RESULTS_SRC, entry), 'results');
 
     // Canonical DBs precompute lake_stocking_metrics for EVERY state, so the
     // stocked sort/JOIN is SQL always (no JS post-sort branch).
@@ -628,7 +640,7 @@ function lakeDetail(req, res, ctx) {
     // ── Catches ───────────────────────────────────────────────────────────────
     let catches = [];
     if (hasCatch) {
-      const catchCols = projectCols(wire.lakeCatches, LAKE_CATCHES_SRC, 'lakeCatches');
+      const catchCols = projectCols(wire.lakeCatches, cpueSrc(LAKE_CATCHES_SRC, entry), 'lakeCatches');
       catches = db.prepare(`
         SELECT ${catchCols}
         FROM fish_catch fc INDEXED BY idx_fc_lake JOIN surveys s ON s.id = fc.survey_id

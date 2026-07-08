@@ -55,6 +55,15 @@ try {
 // logged loudly at startup and served as 503 (not a crash) so the other
 // states stay up while the registry is fixed.
 const ACTIVE_STATES = new Set(['mn', 'sd', 'nd', 'ia', 'ne']);
+// Dev-only affordance: LAKELORE_ACTIVE_STATES_EXTRA=wi,mi lets a LOCAL run serve
+// additional canonical:true states (e.g. staged-but-inactive WI/MI) for smoke
+// testing WITHOUT editing the committed registry's active flags. Never set in
+// production. Each extra state still must be canonical:true in the registry, or
+// the config-error loop below flags it and its routes 503.
+for (const s of (process.env.LAKELORE_ACTIVE_STATES_EXTRA || '')
+  .split(',').map(x => x.trim()).filter(Boolean)) {
+  ACTIVE_STATES.add(s);
+}
 const VALID_STATES = ACTIVE_STATES;
 
 const _configErrorStates = new Set();

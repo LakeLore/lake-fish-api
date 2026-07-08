@@ -15,11 +15,3 @@
 !lakelore-data/schema/assert-schema.js
 !lakelore-data/survival/index.js
 !lakelore-data/survival/chains.json
-
-!mn-lake-fish/survival.js
-!sd-lake-fish/survival.js
-!nd-lake-fish/survival.js
-!ia-lake-fish/survival.js
-!ne-lake-fish/survival.js
-!wi-lake-fish/survival.js
-!mi-lake-fish/survival.js

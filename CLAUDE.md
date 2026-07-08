@@ -1,6 +1,6 @@
 # lake-fish-api — Working Context
 
-Express + better-sqlite3 API behind LakeLore. Hosted on Fly.io (`lake-fish-api`, Chicago, `ord`). Reads 7 read-only state SQLite databases from a persistent volume at `/data/`.
+Express + better-sqlite3 API behind LakeLore. Hosted on Fly.io (`lake-fish-api`, Chicago, `ord`). Reads read-only canonical state SQLite databases (built by `~/lakelore-data`) from a persistent volume at `/data/`.
 
 > **Endpoint reference and routine ops:** `./README.md`.
 > **Vendor accounts, secrets, identifiers, gotchas:** `~/APP_OPS.md`.
@@ -12,8 +12,9 @@ Express + better-sqlite3 API behind LakeLore. Hosted on Fly.io (`lake-fish-api`,
 ## File map
 
 ```
-server.js                 — Express app + all routes; thin dispatch to canonical
-                            handlers for registry-canonical states
+server.js                 — Express app + all routes (~550 lines post-P5-cleanup;
+                            was 1473 with legacy branches); unconditional dispatch
+                            to the canonical handlers for every active state
 server/canonical.js       — generic registry-driven filters/results/lake handlers
                             (wire projection per registry wire lists; query plans
                             pinned for tie-order parity — see PARITY_NOTES)
@@ -22,7 +23,8 @@ package.json              — express, cors, better-sqlite3, express-rate-limit,
                             @sentry/node
 deploy/
   Dockerfile              — two-stage Alpine build; copies server.js + entitlement.js
-                            + survival.js modules from sibling state folders.
+                            + server/canonical.js + the lakelore-data runtime files
+                            (registry, species map, schema assertion, shared survival).
                             Build context is ~/ (so cross-folder COPY works).
   fly.toml                — single machine in ord, 512 MB, /healthz check
   .dockerignore           — strict allow-list
@@ -40,9 +42,9 @@ All five deploy artifacts are symlinked from `~/` so existing commands (`flyctl 
 
 ## Architecture in 30 seconds
 
-- One Fly machine, one Express process, 7 SQLite connections (one per state, read-only WAL, lazily opened).
-- **Canonical vs legacy state serving (2026-07):** states flagged `canonical: true` in `~/lakelore-data/registry/states.json` are served by generic registry-driven handlers (`server/canonical.js`) against a canonical-schema DB built by `lakelore-data`'s `normalize.js`; other states keep the legacy per-state branches in `server.js`. MN is canonical since 2026-07-07 (parity-proven: 352-request exact-diff harness, `~/lakelore-data/bin/parity.js`). Canonical states get startup schema validation (mismatch → that state 503s `state unhealthy`, others unaffected) and `GET /healthz?deep=1` reports per-state `{ok, schemaOk, lakes, generatedAt, ageDays}`. Emergency override: `CANONICAL_STATES` env var (complete authoritative list; `none` forces all-legacy).
-- Survival modules required per state via `../{state}-lake-fish/survival.js` at runtime — these compute "adults per 100 acres" from stocking records on the fly per lake.
+- One Fly machine, one Express process, one read-only SQLite connection per active state (lazily opened; canonical artifacts are immutable snapshots, no WAL).
+- **Canonical-only serving (P5 cleanup, 2026-07):** every active state (MN, SD, ND, IA, NE) is served by the generic registry-driven handlers (`server/canonical.js`) against a canonical-schema DB built by `lakelore-data`'s `normalize.js`. The legacy per-state branches, species maps, SD startup migration (`migrateSd`/`computeSdStockingMetrics`), in-memory stocking metrics, and per-state `../{state}-lake-fish/survival.js` requires were all DELETED from `server.js` (1473 → ~550 lines) after each state was parity-proven (`~/lakelore-data/bin/parity.js`; whitelists + P5 byte-identical replay verification in `~/lakelore-data/reports/PARITY_NOTES.md`). Routes are: validateState → canonical handler, unconditionally. **`../lakelore-data` is a hard startup requirement** — if it's missing the process exits 1 immediately. An active state the registry doesn't mark `canonical: true` is a config error: loud startup log + 503 on its routes (not a crash). The `CANONICAL_STATES` env override no longer exists; rollback = Fly image rollback (`~/RUNBOOK.md` §2/§9b). Startup validates each state's schema (mismatch → that state 503s `state unhealthy`, others unaffected) and `GET /healthz?deep=1` reports per-state `{ok, lakes, generatedAt, ageDays, schemaOk}`.
+- Stocking metrics: `/results` reads the precomputed `lake_stocking_metrics` table baked into each artifact; `/lake/:id` computes "adults per 100 acres" on the fly via the shared `~/lakelore-data/survival` model (equivalence-proven against the retired per-state modules) + registry species resolution.
 - Entitlement gate via `entitlement.js` middleware: paid-state `/results`, `/lake/:id`, `/pdf` return 402 without entitlement. `/status` and `/filters` stay public. MN is the free state.
 - 5-min per-user entitlement cache (in-memory). Invalidated by RC webhook events at `POST /webhooks/revenuecat`.
 - **Important — RC v2 active_entitlements gotcha:** the `/v2/projects/{id}/customers/{user_id}/active_entitlements` endpoint returns items that carry only `entitlement_id` (`entl_xxx`), never `lookup_key`. We resolve `LakeLore All-States` → its `entl_xxx` ID once at process startup (`_resolveAllStatesEntitlementId`) and match on the internal ID. If the entitlement is ever recreated in the RC dashboard, restart the server to pick up the new ID.
@@ -55,7 +57,7 @@ All five deploy artifacts are symlinked from `~/` so existing commands (`flyctl 
 cd ~ && ~/.fly/bin/flyctl deploy
 ```
 
-The Dockerfile's COPY directives reference both this folder (`lake-fish-mobile-server/server.js`) and sibling state folders (`mn-lake-fish/survival.js` etc.), which is why the build context is `~/` rather than this folder. If state folders ever move, update `deploy/Dockerfile` accordingly.
+The Dockerfile's COPY directives reference both this folder (`lake-fish-mobile-server/server.js`) and the sibling `lakelore-data/` package (registry, species map, schema files, shared survival model), which is why the build context is `~/` rather than this folder. The per-state `{state}-lake-fish/survival.js` COPY lines were removed in the P5 cleanup — the shared model covers all states. If `lakelore-data/` ever moves, update `deploy/Dockerfile` and `deploy/.dockerignore` accordingly.
 
 ## Fly secrets currently set
 

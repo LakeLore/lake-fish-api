@@ -15,9 +15,10 @@ COPY lake-fish-mobile-server/entitlement.js                    ./lake-fish-mobil
 COPY lake-fish-mobile-server/server/canonical.js               ./lake-fish-mobile-server/server/canonical.js
 
 # Canonical data layer: registry + schema assertion + shared survival model.
-# server.js requires it via ../lakelore-data; states with registry
-# canonical:true serve from generic handlers against /data/{state}.db built
-# by lakelore-data's normalize.js. Missing package = loud legacy fallback.
+# server.js requires it via ../lakelore-data and exits at startup if missing;
+# every active state serves from the generic handlers against /data/{state}.db
+# built by lakelore-data's normalize.js. (The per-state survival.js modules are
+# gone — the shared lakelore-data survival model covers all states.)
 COPY lakelore-data/index.js               ./lakelore-data/index.js
 COPY lakelore-data/registry/states.json   ./lakelore-data/registry/states.json
 COPY lakelore-data/registry/species.json  ./lakelore-data/registry/species.json
@@ -25,15 +26,6 @@ COPY lakelore-data/schema/canonical.sql   ./lakelore-data/schema/canonical.sql
 COPY lakelore-data/schema/assert-schema.js ./lakelore-data/schema/assert-schema.js
 COPY lakelore-data/survival/index.js      ./lakelore-data/survival/index.js
 COPY lakelore-data/survival/chains.json   ./lakelore-data/survival/chains.json
-
-# Survival modules are required at runtime via relative paths (../state/survival)
-COPY mn-lake-fish/survival.js ./mn-lake-fish/survival.js
-COPY sd-lake-fish/survival.js ./sd-lake-fish/survival.js
-COPY nd-lake-fish/survival.js ./nd-lake-fish/survival.js
-COPY ia-lake-fish/survival.js ./ia-lake-fish/survival.js
-COPY ne-lake-fish/survival.js ./ne-lake-fish/survival.js
-COPY wi-lake-fish/survival.js ./wi-lake-fish/survival.js
-COPY mi-lake-fish/survival.js ./mi-lake-fish/survival.js
 
 WORKDIR /srv/lake-fish-mobile-server
 

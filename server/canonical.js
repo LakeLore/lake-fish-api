@@ -1,10 +1,11 @@
 'use strict';
 
 // ── Canonical (registry-driven) route handlers ────────────────────────────────
-// Generic handlers for states flipped onto the canonical data path
+// Generic handlers serving every active state from the canonical data path
 // (lakelore-data/out/{state}.db, schema per lakelore-data/schema/canonical.sql).
-// Used ONLY when server.js isCanonical(state) is true; legacy branches in
-// server.js remain byte-identical for every other state.
+// server.js dispatches /filters, /results, and /lake/:id here unconditionally —
+// the legacy per-state branches were deleted in the P5 cleanup after all five
+// active states were parity-proven canonical.
 //
 // Wire compatibility is the contract: output field lists come from
 // lakelore-data/registry/states.json `wire` entries (copied verbatim from the

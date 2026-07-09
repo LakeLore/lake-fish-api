@@ -584,6 +584,17 @@ function results(req, res, ctx) {
     }
 
     for (const r of rows) coerceWireIds(entry, r);
+
+    // Preview mode (non-subscriber browsing a paid state — flag set by the
+    // entitlement middleware): every metric ships, but lake identity is
+    // withheld server-side so names never reach an unentitled device. The
+    // client renders a blurred placeholder where the name would go. lake_id
+    // stays on the wire — it keys rows/scatter dots, and /lake/:id is still
+    // 402-gated so the id alone reveals nothing.
+    if (req.lakeLorePreview) {
+      for (const r of rows) r.lake_name = null;
+      return res.json({ total, preview: true, results: rows });
+    }
     res.json({ total, results: rows });
   } catch (err) {
     console.error(`[${state}] /results (canonical) error:`, err);

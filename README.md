@@ -73,8 +73,8 @@ echo "$NEW" > ~/.lakelore_reload_token && chmod 600 ~/.lakelore_reload_token
 | `GET /healthz` | Liveness | DB-independent. Used by the Fly healthcheck. Bypasses rate limiting. |
 | `GET /api/:state/status` | Per-state DB readiness + counts | |
 | `GET /api/:state/filters` | Available species, gear types, counties, year range | |
-| `GET /api/:state/results` | Paginated search | Up to 500 rows per request |
-| `GET /api/:state/lake/:id` | Lake detail with surveys, catches, stocking, computed metrics | |
+| `GET /api/:state/results` | Paginated search | Up to 500 rows per request. Paid states without entitlement get **preview mode**: `200` with `preview: true` and `lake_name: null` on every row (all metrics intact) instead of a 402. |
+| `GET /api/:state/lake/:id` | Lake detail with surveys, catches, stocking, computed metrics | Paid states: 402 without entitlement |
 | `POST /api/:state/reload` | Hot-reload the state's DB cache | Requires `RELOAD_TOKEN` in production |
 | `GET /api/ne/pdf/:name` | Stream Nebraska survey PDFs | Path-traversal protected |
 | `GET /api/me/entitlement` | Server-authoritative entitlement check | `X-User-Id` required; returns `{hasAllStates,expiresAt,source}` |

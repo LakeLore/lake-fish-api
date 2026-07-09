@@ -27,9 +27,12 @@ const RC_API_BASE = 'https://api.revenuecat.com/v2';
 // decide to subscribe, so they stay free for all states.
 //
 // Gated endpoints:
-//   /api/{state}/results      — search results (the actual data)
-//   /api/{state}/lake/:id     — lake detail page (catches, stocking)
-//   /api/{state}/pdf/:name    — Nebraska survey PDFs (NE-specific)
+//   /api/{state}/results      — PREVIEW for non-subscribers: passes through
+//                               with req.lakeLorePreview=true; the handler
+//                               returns all metrics but redacts lake names
+//                               (see server/canonical.js). Never 402s.
+//   /api/{state}/lake/:id     — lake detail page (catches, stocking) — hard 402
+//   /api/{state}/pdf/:name    — Nebraska survey PDFs (NE-specific) — hard 402
 //
 // Only ACTIVE states appear here. Inactive states (wi, mi for v1) fall through
 // to route validation, which returns 400 (not 402). That keeps the client's
@@ -222,15 +225,26 @@ function invalidateCache(userId) {
  * `LakeLore All-States` entitlement; lets MN, /api/me/*, and /healthz
  * through without checks. POST `/api/{state}/reload` is allowed because
  * it's already protected by `requireReloadToken`.
+ *
+ * Paid-state /results is NOT denied for non-subscribers — it passes through
+ * with `req.lakeLorePreview = true`, and the results handler redacts lake
+ * names server-side. This powers the in-app preview: free users can search,
+ * filter, and see every metric in paid states, but can't identify the lakes.
+ * /lake/:id and /pdf remain hard-gated — they're the identifiable payoff.
  */
 function gateByState(req, res, next) {
   const m = req.path.match(GATED_PATH_RE);
   if (!m) return next();
   const state = m[1];
+  const endpoint = m[2]; // 'results' | 'lake' | 'pdf'
   if (!isPaidState(state)) return next();
 
   const userId = req.get('x-user-id');
   if (!userId) {
+    if (endpoint === 'results') {
+      req.lakeLorePreview = true;
+      return next();
+    }
     return res.status(402).json({
       error: 'subscription_required',
       state,
@@ -241,6 +255,10 @@ function gateByState(req, res, next) {
   checkEntitlement(userId).then(result => {
     if (result.hasAllStates) {
       req.entitlement = result;
+      return next();
+    }
+    if (endpoint === 'results') {
+      req.lakeLorePreview = true;
       return next();
     }
     res.status(402).json({

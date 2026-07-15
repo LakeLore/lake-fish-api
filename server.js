@@ -312,13 +312,28 @@ function resolveSpeciesCode(state, rawSpecies) {
 // (per-year line) always come from the same survival model — the shared
 // lakelore-data survival module (equivalence-proven against every legacy
 // per-state module), bound to the state's life-stage normalization rules.
-function computeLakeStockingMetrics(state, areaAcres, stockingRows) {
-  if (!areaAcres || areaAcres <= 0 || !stockingRows?.length) {
+//
+// Lakes WITHOUT usable acreage (2026-07-15): the same math runs without the
+// denominator — every metric row carries `adults_est` (absolute estimated
+// survivors) and `adults_per_100ac: null`. Lakes WITH acreage carry both
+// (adults_est is additive info; the shipped-app contract of numeric
+// adults_per_100ac is unchanged for them).
+//
+// `allowAbsolute` comes from the client's `metricsV2=1` query param: shipped
+// 1.0.x builds call `.toFixed()` on adults_per_100ac unguarded, so a null
+// there would crash their stock-year popup — they keep the legacy empty
+// metrics for acreage-less lakes.
+function computeLakeStockingMetrics(state, areaAcres, stockingRows, allowAbsolute = false) {
+  if (!stockingRows?.length) {
+    return { metrics: [], metrics_by_year: [] };
+  }
+  const hasArea = !!areaAcres && areaAcres > 0;
+  if (!hasArea && !allowAbsolute) {
     return { metrics: [], metrics_by_year: [] };
   }
   const survivingAdults = (species, lifeStage, stockYear, quantity, asOfDate) =>
     sharedSurvival.survivingAdults(species, lifeStage, stockYear, quantity, asOfDate, state);
-  const acres100 = areaAcres / 100;
+  const acres100 = hasArea ? areaAcres / 100 : null;
   const today = new Date();
   const currentYear = today.getFullYear();
 
@@ -358,25 +373,28 @@ function computeLakeStockingMetrics(state, areaAcres, stockingRows) {
     headlineBySpecies.set(r.species, (headlineBySpecies.get(r.species) || 0) + adults);
   }
 
+  const round1 = (v) => Math.round(v * 10) / 10;
   const metrics_by_year = [];
-  const currentBySpecies = new Map();
+  const currentBySpecies = new Map(); // species -> { per100ac, est }
   for (const [k, totalAdults] of byKey) {
     const [species, yrStr] = k.split('|');
     const year = Number(yrStr);
-    const val = Math.round((totalAdults / acres100) * 10) / 10;
-    if (val <= 0) continue;
-    metrics_by_year.push({ species, year, adults_per_100ac: val });
+    const est = round1(totalAdults);
+    const per = hasArea ? round1(totalAdults / acres100) : null;
+    if ((hasArea ? per : est) <= 0) continue;
+    metrics_by_year.push({ species, year, adults_per_100ac: per, adults_est: est });
   }
   for (const [species, totalAdults] of headlineBySpecies) {
-    const val = Math.round((totalAdults / acres100) * 10) / 10;
-    if (val > 0) currentBySpecies.set(species, val);
+    const est = round1(totalAdults);
+    const per = hasArea ? round1(totalAdults / acres100) : null;
+    if ((hasArea ? per : est) > 0) currentBySpecies.set(species, { per, est });
   }
   metrics_by_year.sort((a, b) =>
     a.species === b.species ? a.year - b.year : a.species.localeCompare(b.species));
 
   const metrics = [...currentBySpecies.entries()]
-    .map(([species, adults_per_100ac]) => ({ species, adults_per_100ac }))
-    .sort((a, b) => b.adults_per_100ac - a.adults_per_100ac);
+    .map(([species, v]) => ({ species, adults_per_100ac: v.per, adults_est: v.est }))
+    .sort((a, b) => (b.adults_per_100ac ?? b.adults_est) - (a.adults_per_100ac ?? a.adults_est));
 
   return { metrics, metrics_by_year };
 }

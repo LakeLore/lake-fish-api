@@ -108,6 +108,9 @@ const RESULTS_SRC = {
   n_sq: 'fc.n_sq', n_qp: 'fc.n_qp', n_pm: 'fc.n_pm', n_m: 'fc.n_m',
   ef_stations: 's.ef_stations', hn_stations: 's.hn_stations', fn_stations: 's.fn_stations',
   stocked_per_100ac: 'lsm.adults_per_100ac AS stocked_per_100ac',
+  // Absolute estimated surviving adults — the metric for stocked lakes with
+  // no usable acreage (stocked_per_100ac NULL there). Schema v3.
+  stocked_adults_est: 'lsm.adults_est AS stocked_adults_est',
 };
 
 // /lake/:id surveys list (legacy aliases COUNT/GROUP_CONCAT the same way).
@@ -556,6 +559,12 @@ function results(req, res, ctx) {
     };
     const sortCol = SORT_COLS[sortBy] ?? 'fc.cpue_effective';
     const dir = sortDir === 'asc' ? 'ASC' : 'DESC';
+    // Stocked sort ranks in two blocks (2026-07-15): lakes WITH acreage by
+    // density first, then acreage-less stocked lakes by absolute estimated
+    // adults (adults_est). NULLS LAST keeps never-stocked rows at the bottom.
+    const sortExpr = sortBy === 'stocked'
+      ? `(lsm.adults_per_100ac IS NULL) ASC, COALESCE(lsm.adults_per_100ac, lsm.adults_est) ${dir} NULLS LAST`
+      : null;
 
     // mostRecentOrderPin (NE): for species-less mostRecentOnly queries the
     // legacy planner drives the _most_recent CTE as the OUTER table (verified
@@ -623,7 +632,7 @@ function results(req, res, ctx) {
     let rows = db.prepare(`
       ${ctePrefix}
       SELECT ${selectCols} ${joinsSql}
-      ORDER BY ${sortCol} ${dir} NULLS LAST${orderSuffix}
+      ORDER BY ${sortExpr ?? `${sortCol} ${dir} NULLS LAST`}${orderSuffix}
       LIMIT ? OFFSET ?
     `).all([...allParams, limitNum, offsetNum]);
 
@@ -739,7 +748,11 @@ function lakeDetail(req, res, ctx) {
     } catch { /* stocking table may not exist */ }
 
     // ── Stocking metrics — same on-the-fly compute path as legacy ────────────
-    const { metrics, metrics_by_year } = ctx.computeLakeStockingMetrics(state, lake.area_acres, stocking);
+    // metricsV2=1 (1.1.0+ clients) opts into absolute adults_est metrics for
+    // acreage-less lakes; without it those lakes return empty metrics so
+    // shipped 1.0.x builds never see a null adults_per_100ac.
+    const { metrics, metrics_by_year } = ctx.computeLakeStockingMetrics(
+      state, lake.area_acres, stocking, req.query.metricsV2 === '1');
 
     // Registry-gated report link (SD): surface the most recent survey that
     // actually contributed stocking rows, so the Stocking-tab link lands on a

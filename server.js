@@ -49,12 +49,20 @@ try {
   process.exit(1);
 }
 
-// Active states served by this deployment. Every active state MUST be flagged
-// canonical:true in the registry — there is no legacy serving path anymore.
-// An active state the registry does not mark canonical is a CONFIG ERROR:
-// logged loudly at startup and served as 503 (not a crash) so the other
-// states stay up while the registry is fixed.
-const ACTIVE_STATES = new Set(['mn', 'sd', 'nd', 'ia', 'ne']);
+// Active states served by this deployment — registry-driven (2026-07-15, the
+// all-states launch): every state flagged active:true in
+// lakelore-data/registry/states.json is served; the registry is the single
+// source of truth (no more hand-mirrored literal). Every active state MUST be
+// flagged canonical:true — there is no legacy serving path anymore. An active
+// state the registry does not mark canonical is a CONFIG ERROR: logged loudly
+// at startup and served as 503 (not a crash) so the other states stay up
+// while the registry is fixed.
+const ACTIVE_STATES = new Set(
+  Object.entries(lakeloreData.loadRegistry().states)
+    .filter(([, entry]) => entry.active === true)
+    .map(([code]) => code)
+);
+console.log(`[startup] serving ${ACTIVE_STATES.size} active states from the registry`);
 // Dev-only affordance: LAKELORE_ACTIVE_STATES_EXTRA=wi,mi lets a LOCAL run serve
 // additional canonical:true states (e.g. staged-but-inactive WI/MI) for smoke
 // testing WITHOUT editing the committed registry's active flags. Never set in
@@ -76,11 +84,17 @@ for (const state of ACTIVE_STATES) {
   }
 }
 
-// DB path per state: {STATE}_DB_PATH env wins (production points at the Fly
-// volume), else the lakelore-data artifact built by normalize.js.
+// DB path per state: {STATE}_DB_PATH env wins, then LAKELORE_DB_DIR/{state}.db
+// (production sets LAKELORE_DB_DIR=/data — one var covers the whole fleet),
+// else the local lakelore-data artifact built by normalize.js.
 function canonicalDbPath(state) {
-  return process.env[`${state.toUpperCase()}_DB_PATH`]
-    || path.join(__dirname, '..', 'lakelore-data', 'out', `${state}.db`);
+  if (process.env[`${state.toUpperCase()}_DB_PATH`]) {
+    return process.env[`${state.toUpperCase()}_DB_PATH`];
+  }
+  if (process.env.LAKELORE_DB_DIR) {
+    return path.join(process.env.LAKELORE_DB_DIR, `${state}.db`);
+  }
+  return path.join(__dirname, '..', 'lakelore-data', 'out', `${state}.db`);
 }
 
 // States whose canonical DB failed startup schema validation. Their routes

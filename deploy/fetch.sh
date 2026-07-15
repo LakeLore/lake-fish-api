@@ -17,7 +17,21 @@ case $STATE in
   ne) DIR="$HOME/ne-lake-fish" ;;
   wi) DIR="$HOME/wi-lake-fish" ;;
   mi) DIR="$HOME/mi-lake-fish" ;;
-  *)  echo "Unknown state: $STATE (valid: mn sd nd ia ne wi mi)"; exit 1 ;;
+  wa) DIR="$HOME/wa-lake-fish" ;;
+  mt) DIR="$HOME/mt-lake-fish" ;;
+  ks) DIR="$HOME/ks-lake-fish" ;;
+  mo) DIR="$HOME/mo-lake-fish" ;;
+  il) DIR="$HOME/il-lake-fish" ;;
+  oh) DIR="$HOME/oh-lake-fish" ;;
+  in) DIR="$HOME/in-lake-fish" ;;
+  fl) DIR="$HOME/fl-lake-fish" ;;
+  ga) DIR="$HOME/ga-lake-fish" ;;
+  al) DIR="$HOME/al-lake-fish" ;;
+  tn) DIR="$HOME/tn-lake-fish" ;;
+  sc) DIR="$HOME/sc-lake-fish" ;;
+  ky) DIR="$HOME/ky-lake-fish" ;;
+  va) DIR="$HOME/va-lake-fish" ;;
+  *)  echo "Unknown state: $STATE (valid: mn sd nd ia ne wi mi wa mt ks mo il oh in fl ga al tn sc ky va)"; exit 1 ;;
 esac
 
 echo "▶ fetching $STATE data..."
@@ -30,6 +44,71 @@ if [ -f "$DIR/stock-fetcher.js" ]; then
   echo ""
   echo "▶ fetching $STATE stocking data..."
   node stock-fetcher.js
+fi
+
+# MO's survey/catch signal comes from MDC Fishing Prospects prose pages, scraped
+# by a second script (same chaining rule as stock-fetcher above).
+if [ -f "$DIR/prospects-fetcher.js" ]; then
+  echo ""
+  echo "▶ fetching $STATE prospects data..."
+  node prospects-fetcher.js
+fi
+
+# OH's CPUE comes from a Tableau guest bootstrap scrape in a third script.
+if [ -f "$DIR/survey-fetcher.js" ]; then
+  echo ""
+  echo "▶ fetching $STATE survey data..."
+  node survey-fetcher.js
+fi
+
+# FL/GA's survey signal comes from agency fishing-forecast pages (FWC regional
+# forecasts / GA DNR StoryMaps), scraped by a forecast-fetcher (same chaining rule).
+if [ -f "$DIR/forecast-fetcher.js" ]; then
+  echo ""
+  echo "▶ fetching $STATE forecast data..."
+  node forecast-fetcher.js
+fi
+
+# FL stocking comes from manually-extracted PDF accumulators in
+# ~/lakelore-data/accumulators/fl/ — the importer only consumes what's there.
+# A NEW stocking year needs a Claude PDF-extraction session first (~/PDF_EXTRACTION.md).
+if [ -f "$DIR/import_stocking.js" ]; then
+  echo ""
+  echo "▶ importing $STATE stocking accumulators..."
+  node import_stocking.js
+fi
+
+# AL's survey/catch signal comes from manually-extracted BAIT tournament-report
+# accumulators in ~/lakelore-data/accumulators/al/ (same rule as FL stocking:
+# a NEW year needs a Claude PDF-extraction session first, ~/PDF_EXTRACTION.md).
+if [ -f "$DIR/import_bait.js" ]; then
+  echo ""
+  echo "▶ importing $STATE BAIT accumulators..."
+  node import_bait.js
+fi
+
+# SC's survey signal is species presence decoded from the SCDNR access-site layer.
+if [ -f "$DIR/species-fetcher.js" ]; then
+  echo ""
+  echo "▶ fetching $STATE species-presence data..."
+  node species-fetcher.js
+fi
+
+# KY's survey signal comes from manually-extracted Fishing Forecast star-rating
+# accumulators in ~/lakelore-data/accumulators/ky/ (a NEW edition needs a Claude
+# PDF-extraction session first, ~/PDF_EXTRACTION.md).
+if [ -f "$DIR/import_forecast.js" ]; then
+  echo ""
+  echo "▶ importing $STATE forecast accumulators..."
+  node import_forecast.js
+fi
+
+# KY also carries a REAL-CPUE overlay from the annual Lake & Tailwater Survey PDF
+# (accumulators/ky/ky_survey_<year>_part*.json), loaded as a second gear stream.
+if [ -f "$DIR/import_surveys.js" ]; then
+  echo ""
+  echo "▶ importing $STATE survey CPUE accumulators..."
+  node import_surveys.js
 fi
 
 echo ""

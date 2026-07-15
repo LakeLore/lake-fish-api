@@ -30,15 +30,11 @@ COPY lakelore-data/survival/chains.json   ./lakelore-data/survival/chains.json
 WORKDIR /srv/lake-fish-mobile-server
 
 # Databases and PDFs live on a persistent volume at /data, not in the image.
-# This lets you upload fresh databases without a full redeploy.
-ENV MN_DB_PATH=/data/mn.db \
-    SD_DB_PATH=/data/sd.db \
-    ND_DB_PATH=/data/nd.db \
-    IA_DB_PATH=/data/ia.db \
-    NE_DB_PATH=/data/ne.db \
-    WI_DB_PATH=/data/wi.db \
+# This lets you upload fresh databases without a full redeploy. LAKELORE_DB_DIR
+# covers the whole fleet ({state}.db per active registry state); a per-state
+# {STATE}_DB_PATH env var still overrides it if ever needed.
+ENV LAKELORE_DB_DIR=/data \
     NE_PDF_DIR=/data/pdfs \
-    MI_DB_PATH=/data/mi.db \
     NODE_ENV=production
 
 EXPOSE 3100

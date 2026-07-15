@@ -66,7 +66,18 @@ def _local_path(state: str):
     return LEGACY_PATHS.get(state)
 
 
-LOCAL_PATHS = {s: _local_path(s) for s in LEGACY_PATHS}
+def _registry_states():
+    """All states in the lakelore-data registry (falls back to the legacy
+    seven if the registry isn't present)."""
+    reg = ROOT / "lakelore-data" / "registry" / "states.json"
+    if not reg.exists():
+        return list(LEGACY_PATHS.keys())
+    import json
+    with open(reg) as f:
+        return list(json.load(f)["states"].keys())
+
+
+LOCAL_PATHS = {s: _local_path(s) for s in _registry_states()}
 ALL_STATES = list(LOCAL_PATHS.keys())
 TABLES = ["lakes", "surveys", "fish_catch", "stocking"]
 

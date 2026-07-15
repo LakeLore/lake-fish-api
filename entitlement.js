@@ -29,10 +29,15 @@ const RC_API_BASE = 'https://api.revenuecat.com/v2';
 // Gated endpoints:
 //   /api/{state}/results      — PREVIEW for non-subscribers: passes through
 //                               with req.lakeLorePreview=true; the handler
-//                               returns all metrics but redacts lake names
-//                               (see server/canonical.js). Never 402s.
-//   /api/{state}/lake/:id     — lake detail page (catches, stocking) — hard 402
+//                               returns all metrics but redacts lake identity
+//                               (name, county, acres, coords — see
+//                               server/canonical.js). Never 402s.
+//   /api/{state}/lake/:id     — PREVIEW for non-subscribers too (2026-07-15):
+//                               full CPUE/stocking detail with the same
+//                               identity fields redacted, plus report ids and
+//                               source-PDF links withheld. Never 402s.
 //   /api/{state}/pdf/:name    — Nebraska survey PDFs (NE-specific) — hard 402
+//                               (the PDF itself names the lake).
 //
 // Only ACTIVE states appear here. Inactive states (wi, mi for v1) fall through
 // to route validation, which returns 400 (not 402). That keeps the client's
@@ -41,11 +46,9 @@ const RC_API_BASE = 'https://api.revenuecat.com/v2';
 //
 // The state list is generated from lakelore-data/registry/states.json (all
 // `active` states — including free MN, which matches and then passes through
-// inside gateByState via FREE_STATES, exactly like the historical literal).
-// When the registry is unavailable (e.g. Docker image without lakelore-data),
-// we fall back to the legacy literal. A startup assertion cross-checks the
-// generated source against the literal and logs loudly on drift — it never
-// crashes the server.
+// inside gateByState via FREE_STATES). When the registry is unavailable
+// (e.g. Docker image without lakelore-data), we fall back to the legacy
+// 5-state literal so the original launch states are never served ungated.
 const LEGACY_GATED_SOURCE = '^\\/api\\/(mn|sd|nd|ia|ne)\\/(results|lake|pdf)(?:\\/|\\?|$)';
 const GATED_PATH_RE = (() => {
   const fallback = new RegExp(LEGACY_GATED_SOURCE);
@@ -55,12 +58,7 @@ const GATED_PATH_RE = (() => {
     const active = Object.keys(reg.states).filter(s => reg.states[s].active === true);
     if (!active.length) throw new Error('registry lists no active states');
     const generated = `^\\/api\\/(${active.join('|')})\\/(results|lake|pdf)(?:\\/|\\?|$)`;
-    if (generated !== LEGACY_GATED_SOURCE) {
-      console.error(
-        '[entitlement] registry-generated gate regex DIFFERS from the legacy literal — '
-        + `verify registry active flags are intentional.\n  generated: ${generated}\n  legacy:    ${LEGACY_GATED_SOURCE}`
-      );
-    }
+    console.log(`[entitlement] gate covers ${active.length} active states (registry-generated)`);
     return new RegExp(generated);
   } catch (err) {
     console.error(`[entitlement] registry unavailable — using legacy gated-path literal: ${err.message}`);
@@ -227,10 +225,12 @@ function invalidateCache(userId) {
  * it's already protected by `requireReloadToken`.
  *
  * Paid-state /results is NOT denied for non-subscribers — it passes through
- * with `req.lakeLorePreview = true`, and the results handler redacts lake
- * names server-side. This powers the in-app preview: free users can search,
- * filter, and see every metric in paid states, but can't identify the lakes.
- * /lake/:id and /pdf remain hard-gated — they're the identifiable payoff.
+ * with `req.lakeLorePreview = true`, and the canonical handlers redact lake
+ * identity server-side. This powers the in-app preview: free users can search,
+ * filter, see every metric, and open full lake detail (CPUE history, stocking)
+ * in paid states — but can't identify the lakes (name, county, acres, coords,
+ * and report/PDF links are all withheld). Only /pdf remains hard-gated: the
+ * document itself names the lake.
  */
 function gateByState(req, res, next) {
   const m = req.path.match(GATED_PATH_RE);
@@ -241,7 +241,7 @@ function gateByState(req, res, next) {
 
   const userId = req.get('x-user-id');
   if (!userId) {
-    if (endpoint === 'results') {
+    if (endpoint === 'results' || endpoint === 'lake') {
       req.lakeLorePreview = true;
       return next();
     }
@@ -257,7 +257,7 @@ function gateByState(req, res, next) {
       req.entitlement = result;
       return next();
     }
-    if (endpoint === 'results') {
+    if (endpoint === 'results' || endpoint === 'lake') {
       req.lakeLorePreview = true;
       return next();
     }

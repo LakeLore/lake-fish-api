@@ -17,6 +17,58 @@
 //   ctx.getStateEntry(state)            — registry entry (features, wire)
 //   ctx.computeLakeStockingMetrics(...) — server.js shared metrics compute
 
+// ── Preview-mode redaction ─────────────────────────────────────────────────────
+// Fields withheld from non-subscribers browsing a paid state. The contract with
+// the app (2026-07-15): a preview user sees every METRIC (cpue, lengths,
+// stocking, depth, metrics_by_year) but nothing that IDENTIFIES the lake —
+// no name, county, acreage, coordinates, location blurb, or links/ids that
+// resolve to an agency document naming the lake. Redaction is server-side so
+// the data never reaches an unentitled device.
+const PREVIEW_REDACT_RESULT = [
+  'lake_name', 'county', 'area_acres', 'latitude', 'longitude', 'location',
+  // Document ids/links resolve to agency reports that name the lake (SD's
+  // results wire carries report_id).
+  'report_id', 'source_pdf', 'source_url',
+];
+const PREVIEW_REDACT_LAKE = ['name', 'county', 'area_acres', 'latitude', 'longitude', 'location', 'shore_length_miles'];
+const PREVIEW_REDACT_DOC_LINKS = ['report_id', 'source_pdf', 'source_url'];
+
+// Null out the listed fields when present. Only touches keys the row already
+// carries — wire projections differ per state, and adding absent keys would
+// change the response shape.
+function redactPreviewFields(row, fields) {
+  for (const f of fields) {
+    if (f in row && row[f] != null) row[f] = null;
+  }
+}
+
+// Preview id obfuscation: many 2026-07 states derive lake/survey ids from the
+// lake NAME (tx "aquilla-lake"; fl/ny slugs even embed the county), so raw ids
+// on the preview wire would defeat the field redaction above. In preview every
+// lake/survey id is replaced by a deterministic keyed hash ("p" + 15 hex) —
+// deterministic so React keys stay stable across pages and survey_id
+// references stay consistent between /results and /lake payloads. /lake/:id
+// resolves hashed ids back through a lazily-built per-state reverse map.
+const crypto = require('crypto');
+const PREVIEW_ID_SECRET = process.env.PREVIEW_ID_SECRET || 'lakelore-preview-ids-v1';
+const PREVIEW_ID_RE = /^p[0-9a-f]{15}$/;
+function previewId(state, id) {
+  return 'p' + crypto.createHmac('sha256', PREVIEW_ID_SECRET)
+    .update(`${state}:${id}`).digest('hex').slice(0, 15);
+}
+const _previewLakeIdMaps = new Map(); // state -> Map(previewId -> real lake id)
+function resolvePreviewLakeId(state, db, pid) {
+  let map = _previewLakeIdMaps.get(state);
+  if (!map) {
+    map = new Map();
+    for (const { id } of db.prepare('SELECT id FROM lakes').all()) {
+      map.set(previewId(state, String(id)), String(id));
+    }
+    _previewLakeIdMaps.set(state, map);
+  }
+  return map.get(pid) || null;
+}
+
 // Map wire field name -> SQL source expression for /results.
 // species maps to species_native (registry speciesWire=native): the exact
 // legacy string the shipped app expects.
@@ -587,12 +639,16 @@ function results(req, res, ctx) {
 
     // Preview mode (non-subscriber browsing a paid state — flag set by the
     // entitlement middleware): every metric ships, but lake identity is
-    // withheld server-side so names never reach an unentitled device. The
-    // client renders a blurred placeholder where the name would go. lake_id
-    // stays on the wire — it keys rows/scatter dots, and /lake/:id is still
-    // 402-gated so the id alone reveals nothing.
+    // withheld server-side so identifying fields never reach an unentitled
+    // device. The client renders a blurred placeholder where the name would
+    // go and drops the county/acres line. lake_id stays on the wire — it
+    // keys rows/scatter dots and the (also-redacted) /lake/:id fetch.
     if (req.lakeLorePreview) {
-      for (const r of rows) r.lake_name = null;
+      for (const r of rows) {
+        redactPreviewFields(r, PREVIEW_REDACT_RESULT);
+        if (r.lake_id != null) r.lake_id = previewId(state, String(r.lake_id));
+        if (r.survey_id != null) r.survey_id = previewId(state, String(r.survey_id));
+      }
       return res.json({ total, preview: true, results: rows });
     }
     res.json({ total, results: rows });
@@ -605,10 +661,21 @@ function results(req, res, ctx) {
 // ── /api/:state/lake/:id ───────────────────────────────────────────────────────
 
 function lakeDetail(req, res, ctx) {
-  const { state, id } = req.params;
+  const { state } = req.params;
+  let { id } = req.params;
   if (!/^[\w-]+$/.test(id)) return res.status(400).json({ error: 'Invalid lake id' });
   const db = openDb(state, res, ctx);
   if (!db) return;
+
+  // Hashed preview id (from a preview /results payload) — resolve back to the
+  // real lake id. Resolved regardless of entitlement so a user who subscribes
+  // mid-session can still open a detail screen reached from cached preview
+  // results.
+  if (PREVIEW_ID_RE.test(id)) {
+    const real = resolvePreviewLakeId(state, db, id);
+    if (!real) return res.status(404).json({ error: 'Lake not found' });
+    id = real;
+  }
 
   try {
     const entry = ctx.getStateEntry(state);
@@ -696,6 +763,28 @@ function lakeDetail(req, res, ctx) {
     coerceWireIds(entry, lake);
     for (const r of surveys) coerceWireIds(entry, r);
     for (const r of catches) coerceWireIds(entry, r);
+
+    // Preview mode: serve the full CPUE/stocking detail, but withhold every
+    // field that identifies the lake — name/county/acres/coords on the lake
+    // row, plus report ids and source-PDF/URL links on surveys and catches
+    // (those documents name the lake). Metrics were already computed above
+    // from the real area_acres, so per-100-acre numbers stay correct.
+    if (req.lakeLorePreview) {
+      redactPreviewFields(lake, PREVIEW_REDACT_LAKE);
+      if (lake.id != null) lake.id = previewId(state, String(lake.id));
+      for (const s of surveys) {
+        redactPreviewFields(s, PREVIEW_REDACT_DOC_LINKS);
+        if (s.id != null) s.id = previewId(state, String(s.id));
+      }
+      for (const c of catches) {
+        redactPreviewFields(c, PREVIEW_REDACT_DOC_LINKS);
+        if (c.survey_id != null) c.survey_id = previewId(state, String(c.survey_id));
+      }
+      return res.json({
+        lake, surveys, catches, stocking, metrics, metrics_by_year,
+        latest_stocking_report_id: null, preview: true,
+      });
+    }
 
     res.json({ lake, surveys, catches, stocking, metrics, metrics_by_year, latest_stocking_report_id });
   } catch (err) {

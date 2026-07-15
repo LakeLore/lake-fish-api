@@ -109,13 +109,27 @@ src_for() {
   fi
 }
 
-upload "$(src_for mn mn-lake-fish/data/lakes.db)"    "/data/mn.db" "mn"
-upload "$(src_for sd sd-lake-fish/data/sd_lakes.db)" "/data/sd.db" "sd"
-upload "$(src_for nd nd-lake-fish/data/lakes.db)"    "/data/nd.db" "nd"
-upload "$(src_for ia ia-lake-fish/data/lakes.db)"    "/data/ia.db" "ia"
-upload "$(src_for ne ne-lake-fish/data/lakes.db)"    "/data/ne.db" "ne"
-upload "$(src_for wi wi-lake-fish/data/lakes.db)"    "/data/wi.db" "wi"
-upload "$(src_for mi mi-lake-fish/data/lakes.db)"    "/data/mi.db" "mi"
+# Registry-driven state list (2026-07-15, all-states launch): every state in
+# lakelore-data/registry/states.json ships its canonical artifact. The legacy
+# raw-DB fallbacks survive for the original seven in case a canonical artifact
+# is missing locally (src_for prefers canonical whenever it exists).
+legacy_src() {
+  case "$1" in
+    mn) echo "mn-lake-fish/data/lakes.db" ;;
+    sd) echo "sd-lake-fish/data/sd_lakes.db" ;;
+    nd) echo "nd-lake-fish/data/lakes.db" ;;
+    ia) echo "ia-lake-fish/data/lakes.db" ;;
+    ne) echo "ne-lake-fish/data/lakes.db" ;;
+    wi) echo "wi-lake-fish/data/lakes.db" ;;
+    mi) echo "mi-lake-fish/data/lakes.db" ;;
+    *)  echo "" ;;
+  esac
+}
+
+ALL_REGISTRY_STATES=$(python3 -c "import json,os; print(' '.join(json.load(open(os.path.expanduser('~/lakelore-data/registry/states.json')))['states'].keys()))")
+for st in $ALL_REGISTRY_STATES; do
+  upload "$(src_for "$st" "$(legacy_src "$st")")" "/data/$st.db" "$st"
+done
 
 echo ""
 echo "Restarting app to load new databases..."

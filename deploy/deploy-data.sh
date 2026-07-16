@@ -73,6 +73,16 @@ if [ "$DRIFT_RC" -ne 0 ] && [ "$DRIFT_RC" -ne 2 ]; then
 fi
 
 # ── Upload ────────────────────────────────────────────────────────────────
+# Multi-machine (RUNBOOK §14, 2026-07-16): each machine has its own volume, so
+# every upload runs once PER MACHINE via --machine. With one machine this is
+# identical to the old behavior.
+MACHINE_IDS=$("$FLY" machine list --app "$APP" --json 2>/dev/null \
+  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).map(m=>m.id).join(' '))}catch(e){process.exit(1)}})")
+if [ -z "$MACHINE_IDS" ]; then
+  echo "❌ could not enumerate machines"; exit 1
+fi
+echo "machines: $MACHINE_IDS"
+
 upload() {
   local src="$1" dest="$2" state="$3"
   if [[ "$STATE_ARG" == "all" ]] || [[ " $STATE_ARG " == *" $state "* ]]; then
@@ -81,11 +91,13 @@ upload() {
       # the upload may ship a stale snapshot that lacks recent writes still
       # sitting in lakes.db-wal — burned us once on the MI county backfill.
       sqlite3 "$src" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null
-      # fly sftp put refuses to overwrite, so clear the destination first
-      # (along with any sibling -shm/-wal files left from the previous deploy).
-      "$FLY" ssh console --app "$APP" -C "rm -f $dest ${dest}-shm ${dest}-wal" >/dev/null 2>&1 || true
-      echo "→ uploading $state: $src"
-      "$FLY" sftp put "$src" "$dest" --app "$APP"
+      for mid in $MACHINE_IDS; do
+        # fly sftp put refuses to overwrite, so clear the destination first
+        # (along with any sibling -shm/-wal files left from the previous deploy).
+        "$FLY" ssh console --app "$APP" --machine "$mid" -C "rm -f $dest ${dest}-shm ${dest}-wal" >/dev/null 2>&1 || true
+        echo "→ uploading $state -> $mid: $src"
+        "$FLY" sftp put "$src" "$dest" --app "$APP" --machine "$mid"
+      done
     else
       echo "⚠  $state: source file not found ($src), skipping"
     fi

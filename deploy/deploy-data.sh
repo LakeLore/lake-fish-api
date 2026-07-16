@@ -134,6 +134,22 @@ done
 echo ""
 echo "Restarting app to load new databases..."
 "$FLY" app restart "$APP"
+
+# Post-restart readiness gate (IMPROVEMENT_PLAN 1.10): /readyz is 200 only
+# when EVERY active state serves with a valid schema — a corrupt/missing/
+# schema-drifted DB upload fails HERE instead of as user-facing 500s.
 echo ""
-echo "Done. Verify:"
-echo "  curl https://$APP.fly.dev/api/mn/status"
+echo "Waiting for /readyz..."
+for i in $(seq 1 30); do
+  BODY=$(curl -s --max-time 10 "https://$APP.fly.dev/readyz" || true)
+  if echo "$BODY" | grep -q '"ready":true'; then
+    echo "READY: $BODY"
+    exit 0
+  fi
+  sleep 5
+done
+echo "❌ NOT READY after 150s: $BODY"
+echo "   Per-state detail: curl 'https://$APP.fly.dev/healthz?deep=1'"
+echo "   Roll back by re-uploading the previous artifact (B2 backup) or"
+echo "   'fly image rollback' if the image changed too (~/RUNBOOK.md)."
+exit 1

@@ -168,6 +168,51 @@ app.get('/healthz', (req, res) => {
   res.json({ ok: true, states });
 });
 
+// ── /readyz — data-aware readiness (IMPROVEMENT_PLAN 1.10) ─────────────────
+// 200 only when EVERY active state serves (DB present, schema valid). For
+// external uptime monitors and deploy-data.sh's post-restart gate; Fly's
+// machine check stays on the cheap /healthz liveness probe so one bad state
+// can't take the whole machine out of rotation.
+app.get('/readyz', (req, res) => {
+  const bad = [];
+  for (const state of ACTIVE_STATES) {
+    if (_configErrorStates.has(state)) { bad.push(`${state}:config`); continue; }
+    try {
+      const db = getDb(state);
+      if (!db) { bad.push(`${state}:no-db`); continue; }
+      if (_canonicalUnhealthy.has(state)) { bad.push(`${state}:schema`); continue; }
+    } catch (e) {
+      bad.push(`${state}:${e.message.slice(0, 40)}`);
+    }
+  }
+  if (bad.length) return res.status(503).json({ ready: false, bad });
+  res.json({ ready: true, states: ACTIVE_STATES.size });
+});
+
+// ── Client identity signature (IMPROVEMENT_PLAN 1.8 scaffolding) ────────────
+// gateByState trusts a raw X-User-Id header; a hostile caller who OBTAINS a
+// subscriber's RC id gets paid access. 1.1.0+ clients also send
+// X-User-Sig = HMAC-SHA256(userId, embedded key). Enforcement is LOG-ONLY
+// until the 1.0.x fleet drains (they can't send it) — flip
+// LAKELORE_REQUIRE_USER_SIG=1 to enforce once adoption allows. This raises
+// the bar from "copy a header" to "extract a key from the app binary"; full
+// signed-token auth remains the long-term item.
+const USER_SIG_KEY = process.env.LAKELORE_USER_SIG_KEY || 'lakelore-client-v1';
+const nodeCrypto = require('crypto');
+app.use((req, res, next) => {
+  const userId = req.get('x-user-id');
+  if (!userId) return next();
+  const sig = req.get('x-user-sig');
+  const expected = nodeCrypto.createHmac('sha256', USER_SIG_KEY).update(userId).digest('hex').slice(0, 32);
+  const valid = sig === expected;
+  req.lakeLoreSigValid = valid;
+  if (!valid && process.env.LAKELORE_REQUIRE_USER_SIG === '1') {
+    return res.status(401).json({ error: 'invalid_client_signature' });
+  }
+  if (sig && !valid) console.warn(`[sig] BAD signature for user ${userId.slice(0, 8)}… (${req.path})`);
+  next();
+});
+
 // Rate limiting — 600 req per 15 min per IP in production.
 // One typical session uses ~10–15 requests; 600 covers ~40 sessions per
 // rolling 15 min from a single IP, with comfortable headroom for shared NATs.
@@ -252,6 +297,64 @@ app.post('/api/feedback', (req, res) => {
       console.warn('[feedback] write failed:', err.message);
       res.status(500).json({ error: 'write_failed' });
     });
+});
+
+// ── POST /api/subscribe ─────────────────────────────────────────────────────
+// Marketing-site email capture (IMPROVEMENT_PLAN P3.2): appends to a JSONL on
+// the volume — export with `fly ssh console -C "cat /data/subscribers.jsonl"`.
+const SUBSCRIBERS_PATH = process.env.SUBSCRIBERS_PATH
+  || (process.env.LAKELORE_DB_DIR ? path.join(process.env.LAKELORE_DB_DIR, 'subscribers.jsonl')
+    : path.join(__dirname, 'data', 'subscribers.jsonl'));
+app.post('/api/subscribe', (req, res) => {
+  const { email, state, source } = req.body || {};
+  if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || email.length > 320) {
+    return res.status(400).json({ error: 'invalid_email' });
+  }
+  const entry = {
+    ts: new Date().toISOString(),
+    email: email.trim().toLowerCase(),
+    state: typeof state === 'string' ? state.slice(0, 8) : null,
+    source: typeof source === 'string' ? source.slice(0, 64) : null,
+  };
+  fs.promises.mkdir(path.dirname(SUBSCRIBERS_PATH), { recursive: true })
+    .then(() => fs.promises.appendFile(SUBSCRIBERS_PATH, JSON.stringify(entry) + '\n'))
+    .then(() => res.json({ ok: true }))
+    .catch(err => {
+      console.warn('[subscribe] write failed:', err.message);
+      res.status(500).json({ error: 'write_failed' });
+    });
+});
+
+// ── GET /api/:state/lakes-index — public SEO index (IMPROVEMENT_PLAN P3.1) ──
+// Lake NAMES + counts only, no metrics: powers the marketing site's
+// programmatic per-lake pages ("teaser + paywall pitch" for paid states —
+// the name is the search term, the numbers stay in the app/behind the sub).
+// Free-state pages additionally pull full data from the already-public
+// /results. Registered BEFORE gateByState-sensitive ordering is irrelevant —
+// this path isn't in the gated regex. Cached in-memory per state.
+const _lakesIndexCache = new Map(); // state -> { at, body }
+app.get('/api/:state/lakes-index', (req, res) => {
+  if (!validateState(req, res)) return;
+  const { state } = req.params;
+  const cached = _lakesIndexCache.get(state);
+  if (cached && Date.now() - cached.at < 6 * 60 * 60 * 1000) return res.json(cached.body);
+  try {
+    const db = getDb(state);
+    if (!db) return res.status(503).json({ error: 'not ready' });
+    const rows = db.prepare(`
+      SELECT l.id, l.name, l.county,
+             (SELECT COUNT(*) FROM surveys s WHERE s.lake_id = l.id) AS surveys,
+             (SELECT COUNT(DISTINCT fc.species_native) FROM fish_catch fc WHERE fc.lake_id = l.id) AS species,
+             (SELECT COUNT(*) FROM stocking st WHERE st.lake_id = l.id) AS stocking_events
+      FROM lakes l ORDER BY l.name
+    `).all();
+    const body = { state, count: rows.length, lakes: rows };
+    _lakesIndexCache.set(state, { at: Date.now(), body });
+    res.json(body);
+  } catch (err) {
+    console.error(`[${state}] /lakes-index error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── POST /webhooks/revenuecat ──────────────────────────────────────────────

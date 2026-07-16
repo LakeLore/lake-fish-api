@@ -188,6 +188,15 @@ async function fetchEntitlementFromRevenueCat(userId) {
   }
 }
 
+// Grace window for KNOWN subscribers when RevenueCat is unreachable
+// (IMPROVEMENT_PLAN 1.9): an RC outage must not lock paying customers out of
+// lake detail/PDFs. We keep the last POSITIVE entitlement per user in
+// _lastGood and serve it for up to GRACE_MS when a fresh lookup ERRORS
+// (network/5xx). A positive RC "not subscribed" answer still wins — grace
+// only bridges outages, it never overrides a real denial.
+const GRACE_MS = 72 * 60 * 60 * 1000;
+const _lastGood = new Map(); // userId -> { expiresAt, seenAt }
+
 async function checkEntitlement(userId) {
   if (!userId) return { hasAllStates: false, expiresAt: null, source: 'no-user-id' };
 
@@ -202,6 +211,22 @@ async function checkEntitlement(userId) {
   }
 
   const result = await fetchEntitlementFromRevenueCat(userId);
+  if (result.hasAllStates) {
+    _lastGood.set(userId, { expiresAt: result.expiresAt, seenAt: now });
+  } else if (!result.error) {
+    // RC positively says not subscribed — clear any stale grace record.
+    _lastGood.delete(userId);
+  } else {
+    // RC errored. Serve the last-known-good entitlement inside the grace
+    // window instead of 402ing a paying customer during an outage.
+    const good = _lastGood.get(userId);
+    if (good && (now - good.seenAt) < GRACE_MS) {
+      console.warn(`[entitlement] RC error for known subscriber ${userId.slice(0, 8)}… — serving grace entitlement`);
+      const grace = { hasAllStates: true, expiresAt: good.expiresAt, source: 'grace' };
+      _cache.set(userId, { ...grace, fetchedAt: now, _ttl: 30_000 });
+      return grace;
+    }
+  }
   // Cache successful lookups for the full TTL; cache errors briefly so
   // we don't hammer RC during a sustained outage.
   const ttl = result.error ? 30_000 : CACHE_TTL_MS;

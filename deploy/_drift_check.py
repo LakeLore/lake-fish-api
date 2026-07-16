@@ -93,6 +93,7 @@ def local_counts(state: str):
                 counts[t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
             except sqlite3.OperationalError:
                 counts[t] = None
+        counts["_user_version"] = conn.execute("PRAGMA user_version").fetchone()[0]
     return counts
 
 
@@ -114,6 +115,7 @@ def prod_counts_all(states):
                     try { row[t] = db.prepare('SELECT COUNT(*) AS n FROM ' + t).get().n; }
                     catch { row[t] = null; }
                 }
+                row._user_version = db.pragma('user_version', { simple: true });
                 db.close();
             } catch (e) {
                 row.error = e.message;
@@ -189,6 +191,11 @@ def main():
             print(f"  {state:<6} (prod error: {p['error']})")
             any_drift = True
             continue
+        # Schema-version drift (the NE source_url class of regression): the
+        # uploaded artifact's user_version must match what we're shipping.
+        lv, pv_ver = local.get("_user_version"), p.get("_user_version")
+        if pv_ver is not None and lv is not None and lv != pv_ver:
+            print(f"  {state:<6} schema user_version local {lv} vs prod {pv_ver} (expected when shipping a schema bump WITH a new image)")
         for t in TABLES:
             l = local.get(t)
             pv = p.get(t)

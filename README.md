@@ -2,7 +2,7 @@
 
 The unified Express + SQLite API server behind the **LakeLore** mobile app and marketing site, deployed to Fly.io as `lake-fish-api` (https://lake-fish-api.fly.dev).
 
-Serves the active states at `/api/{state}/{status|filters|results|lake/:id}` plus a `/healthz` and a token-protected `/api/:state/reload`. **The active set is 48 registry states — 43 US states + 5 Canadian provinces (ON, BC, MB, SK, AB) — as of the 2026-07-15 all-states launch. The 8 states with no stocking AND no CPUE data (GA, SC, AZ, CA, MA, DE, RI, QC) stay `active:false` until they earn a metric.** `ACTIVE_STATES` is derived at startup from `active: true` flags in `~/lakelore-data/registry/states.json` (the authoritative registry; no hand-mirrored literal anymore). Every active state is canonical and serves from `LAKELORE_DB_DIR/{state}.db` (`/data` in production; a per-state `{STATE}_DB_PATH` env still overrides). The registry `country` field (`"CA"`) distinguishes Canadian provinces. `LAKELORE_ACTIVE_STATES_EXTRA` remains as a dev affordance for smoke-testing a state not yet flagged active (never set in production).
+Serves the active states at `/api/{state}/{status|filters|results|lake/:id}` plus a `/healthz` and a token-protected `/api/:state/reload`. **The active set is 50 registry states — 45 US states + 5 Canadian provinces (ON, BC, MB, SK, AB) — as of the 2026-07-15 all-states launch. The 6 states with no stocking AND no CPUE data (SC, AZ, MA, DE, RI, QC) stay `active:false` until they earn a metric; CA (measured lengths), GA (length estimates), and MO (ratings) are kept active despite lacking CPUE/stocking metrics.** `ACTIVE_STATES` is derived at startup from `active: true` flags in `~/lakelore-data/registry/states.json` (the authoritative registry; no hand-mirrored literal anymore). Every active state is canonical and serves from `LAKELORE_DB_DIR/{state}.db` (`/data` in production; a per-state `{STATE}_DB_PATH` env still overrides). The registry `country` field (`"CA"`) distinguishes Canadian provinces. `LAKELORE_ACTIVE_STATES_EXTRA` remains as a dev affordance for smoke-testing a state not yet flagged active (never set in production).
 
 ## Layout
 
@@ -72,7 +72,7 @@ echo "$NEW" > ~/.lakelore_reload_token && chmod 600 ~/.lakelore_reload_token
 |---|---|---|
 | `GET /healthz` | Liveness | DB-independent. Used by the Fly healthcheck. Bypasses rate limiting. |
 | `GET /api/:state/status` | Per-state DB readiness + counts | |
-| `GET /api/:state/filters` | Available species, gear types, counties, year range | |
+| `GET /api/:state/filters` | Available species, gear types (+ `gearTypeCounts` and `gearCpueCounts` — per-gear CPUE-bearing row counts the app uses for its default-gear pick), counties, year range | |
 | `GET /api/:state/results` | Paginated search | Up to 500 rows per request. Paid states without entitlement get **preview mode**: `200` with `preview: true`; lake identity redacted (`lake_name`, `county`, `area_acres`, coords, report/PDF refs all null) and lake/survey ids replaced by deterministic hashes; all metrics intact. |
 | `GET /api/:state/lake/:id` | Lake detail with surveys, catches, stocking, computed metrics | Paid states without entitlement get **preview mode** too (2026-07-15): full detail with the same identity fields + report ids/source links redacted, ids hashed; accepts hashed preview ids from `/results`. |
 | `POST /api/:state/reload` | Hot-reload the state's DB cache | Requires `RELOAD_TOKEN` in production |

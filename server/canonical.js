@@ -111,6 +111,10 @@ const RESULTS_SRC = {
   // Absolute estimated surviving adults — the metric for stocked lakes with
   // no usable acreage (stocked_per_100ac NULL there). Schema v3.
   stocked_adults_est: 'lsm.adults_est AS stocked_adults_est',
+  // Agency fishing-forecast rating (schema v4) — headline metric for
+  // ratings-tier states with no published CPUE (GA/MO/IL/FL/KY/OK).
+  rating: 'fc.rating',
+  rating_ordinal: 'fc.rating_ordinal',
 };
 
 // /lake/:id surveys list (legacy aliases COUNT/GROUP_CONCAT the same way).
@@ -321,6 +325,7 @@ function filters(req, res, ctx) {
 
     let gearTypes = [];
     let gearTypeCounts = undefined;
+    let gearCpueCounts = undefined;
     let defaultGear = undefined;
     if (gearMode === 'stations' && hasCatch) {
       // IA: gear chips derive from station-presence columns on surveys (EF/FN/HN)
@@ -371,9 +376,22 @@ function filters(req, res, ctx) {
       `).all(...gearArgs);
       gearTypes = gearRows.map(r => r.gear);
       gearTypeCounts = Object.fromEntries(gearRows.map(r => [r.gear, r.n]));
+      // Per-gear counts of CPUE-BEARING rows under the same species/county
+      // scope (2026-07-15): several fleet states put a synthetic presence
+      // bucket at the top of the raw counts, so the app picks its default
+      // gear from these instead — otherwise the presence bucket hides the
+      // real electrofishing/net survey rows (NC's "no Largemouth records").
+      const gearCpueRows = db.prepare(`
+        SELECT fc.gear_category AS gear, COUNT(*) AS n
+        FROM fish_catch fc ${countyJoin}
+        WHERE fc.gear_category IS NOT NULL AND fc.cpue_effective IS NOT NULL ${speciesAnd} ${countyAnd}
+        GROUP BY fc.gear_category
+      `).all(...gearArgs);
+      gearCpueCounts = Object.fromEntries(gearCpueRows.map(r => [r.gear, r.n]));
     }
 
     const result = { species, gearTypes, gearTypeCounts, counties, yearRange };
+    if (gearCpueCounts !== undefined) result.gearCpueCounts = gearCpueCounts;
     if (defaultGear !== undefined) result.defaultGear = defaultGear;
 
     if (f.surveyTypes) {
@@ -554,6 +572,7 @@ function results(req, res, ctx) {
         : 's.survey_date',
       depth: 'l.max_depth_feet',
       length: 'fc.average_length',
+      rating: 'fc.rating_ordinal',
       psd: 'fc.psd', psd_p: 'fc.psd_p', wr: 'fc.wr',
       wr_sq: 'fc.wr_sq', wr_qp: 'fc.wr_qp', wr_pm: 'fc.wr_pm', wr_m: 'fc.wr_m',
     };

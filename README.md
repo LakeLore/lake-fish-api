@@ -78,6 +78,8 @@ echo "$NEW" > ~/.lakelore_reload_token && chmod 600 ~/.lakelore_reload_token
 | `POST /api/:state/reload` | Hot-reload the state's DB cache | Requires `RELOAD_TOKEN` in production |
 | `GET /api/ne/pdf/:name` | Stream Nebraska survey PDFs | Path-traversal protected |
 | `GET /api/me/entitlement` | Server-authoritative entitlement check | `X-User-Id` required; returns `{hasAllStates,expiresAt,source}` |
+| `GET /api/session/challenge` | Attestation challenge for session issuance | Requires `X-User-Id` + valid `X-User-Sig`. Stateless HMAC nonce bound to the userId, 10-min TTL — verifies on either Fly machine. |
+| `POST /api/session` | Mint a 7-day HS256 session token | Requires `X-User-Id` + valid `X-User-Sig`. Optional JSON body `{platform, challenge, keyId?, attestation?, token?}` carries an App Attest (iOS) / Play Integrity (Android) proof — verified server-side (`server/attest.js`), stamps `att: ios\|android\|none` on the token and `attested` on the response. Unattested issuance still succeeds until `LAKELORE_REQUIRE_ATTEST=1` (RUNBOOK §16). Telemetry: hourly `[attest]` log + `attest` in `/healthz?deep=1`. |
 | `POST /api/feedback` | Capture in-app feedback | Appends one JSON line per submission to `/data/feedback.jsonl` on the volume. `message` 1–2000 chars, all other fields optional. |
 
 ## Hardening summary (2026-05-05)

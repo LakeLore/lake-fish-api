@@ -165,7 +165,7 @@ app.get('/healthz', (req, res) => {
     }
     states[state] = entry;
   }
-  res.json({ ok: true, states, sig: { ..._sigStats } });
+  res.json({ ok: true, states, sig: { ..._sigStats }, attest: { ...require('./server/attest').stats } });
 });
 
 // ── /readyz — data-aware readiness (IMPROVEMENT_PLAN 1.10) ─────────────────
@@ -241,10 +241,10 @@ app.use((req, res, next) => {
 const JWT_SECRET = process.env.LAKELORE_JWT_SECRET || 'lakelore-dev-jwt-secret';
 const TOKEN_TTL_S = 7 * 24 * 60 * 60;
 const b64u = (buf) => Buffer.from(buf).toString('base64url');
-function signToken(sub) {
+function signToken(sub, att = 'none') {
   const now = Math.floor(Date.now() / 1000);
   const h = b64u(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-  const p = b64u(JSON.stringify({ sub, iat: now, exp: now + TOKEN_TTL_S }));
+  const p = b64u(JSON.stringify({ sub, att, iat: now, exp: now + TOKEN_TTL_S }));
   const sig = nodeCrypto.createHmac('sha256', JWT_SECRET).update(`${h}.${p}`).digest('base64url');
   return `${h}.${p}.${sig}`;
 }
@@ -278,12 +278,59 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 // Session-token issuance + bearer verification (helpers defined above).
-app.post('/api/session', (req, res) => {
+// Platform attestation (App Attest / Play Integrity) rides the same route:
+// clients fetch a challenge, attest it on-device, and attach the proof to the
+// POST. Verified proofs stamp an `att` claim on the token; unattested
+// requests still succeed until LAKELORE_REQUIRE_ATTEST=1 (drain-gated on the
+// [attest] telemetry — ~/RUNBOOK.md §16). Verification lives in
+// server/attest.js.
+const attest = require('./server/attest');
+setInterval(attest.logAndResetStats, 60 * 60 * 1000).unref();
+
+app.get('/api/session/challenge', (req, res) => {
   const userId = req.get('x-user-id');
   if (!userId || userId.length > 128) return res.status(400).json({ error: 'missing_x_user_id' });
   if (!req.lakeLoreSigValid) return res.status(401).json({ error: 'invalid_client_signature' });
-  const token = signToken(userId);
-  res.json({ token, expiresIn: TOKEN_TTL_S });
+  res.json({ challenge: attest.makeChallenge(userId), expiresIn: 600 });
+});
+
+app.post('/api/session', async (req, res) => {
+  const userId = req.get('x-user-id');
+  if (!userId || userId.length > 128) return res.status(400).json({ error: 'missing_x_user_id' });
+  if (!req.lakeLoreSigValid) return res.status(401).json({ error: 'invalid_client_signature' });
+
+  let att = 'none';
+  const body = req.body ?? {};
+  if (body.platform === 'ios' || body.platform === 'android') {
+    if (!attest.checkChallenge(userId, body.challenge)) {
+      attest.stats.bad_challenge++;
+    } else if (body.platform === 'ios') {
+      const v = await attest.verifyIos({
+        keyId: body.keyId, attestation: body.attestation, challenge: body.challenge,
+      });
+      if (v.ok) { att = 'ios'; attest.stats.ios_ok++; }
+      else {
+        attest.stats.ios_fail++;
+        console.warn(`[attest] ios verify failed (${v.reason}) for ${userId.slice(0, 8)}…`);
+      }
+    } else {
+      const v = await attest.verifyAndroid({ token: body.token, challenge: body.challenge });
+      if (v.ok) { att = 'android'; attest.stats.android_ok++; }
+      else if (v.reason === 'not_configured') attest.stats.android_unavailable++;
+      else {
+        attest.stats.android_fail++;
+        console.warn(`[attest] android verify failed (${v.reason}) for ${userId.slice(0, 8)}…`);
+      }
+    }
+  } else {
+    attest.stats.none++;
+  }
+
+  if (att === 'none' && process.env.LAKELORE_REQUIRE_ATTEST === '1') {
+    return res.status(401).json({ error: 'attestation_required' });
+  }
+  const token = signToken(userId, att);
+  res.json({ token, expiresIn: TOKEN_TTL_S, attested: att !== 'none' });
 });
 
 app.use((req, res, next) => {

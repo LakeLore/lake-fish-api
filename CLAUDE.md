@@ -69,6 +69,8 @@ The Dockerfile's COPY directives reference both this folder (`lake-fish-mobile-s
 | `REVENUECAT_PROJECT_ID` | RC project short ID (`5155d3e4`) |
 | `REVENUECAT_WEBHOOK_AUTH` | Compared byte-for-byte to the `Authorization` header on `POST /webhooks/revenuecat`. When unset the handler accepts unsigned events (warning log only). Local copy at `~/.lakelore_rc_webhook_auth`. |
 | `SENTRY_DSN` | Server-side Sentry error reporting |
+| `LAKELORE_JWT_SECRET` | Signs 7-day HS256 session tokens (POST /api/session) AND keys the attestation challenge HMAC (server/attest.js derives from it) |
+| `PLAY_INTEGRITY_SA_JSON` | **NOT YET SET** (blocked on Play console steps — see ~/APP_OPS.md "App Attest / Play Integrity"). Full Google service-account JSON used to decode Play Integrity tokens. Until set, Android attestation reports `android_unavailable` and sessions issue unattested. |
 
 Audit current: `~/.fly/bin/flyctl secrets list --app lake-fish-api`.
 

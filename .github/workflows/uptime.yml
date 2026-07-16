@@ -1,0 +1,34 @@
+# External uptime monitoring (IMPROVEMENT_PLAN 0.5): GitHub-hosted, so it
+# watches production from OUTSIDE the Mac/Fly. /readyz is 200 only when every
+# active state serves with a valid schema. A failing run makes the workflow
+# fail -> GitHub notifies the org email. Every 15 minutes.
+name: uptime
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: readyz
+        run: |
+          BODY=$(curl -sS --max-time 20 -w '\n%{http_code}' https://lake-fish-api.fly.dev/readyz)
+          CODE=$(echo "$BODY" | tail -1)
+          echo "$BODY"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::lake-fish-api /readyz returned $CODE"
+            exit 1
+          fi
+      - name: sample data call
+        run: |
+          CODE=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' 'https://lake-fish-api.fly.dev/api/mn/results?species=WAE&limit=1&sortBy=cpue&sortDir=desc&mostRecentOnly=true')
+          echo "mn results: $CODE"
+          [ "$CODE" = "200" ] || { echo "::error::mn /results returned $CODE"; exit 1; }
+      - name: marketing site
+        run: |
+          CODE=$(curl -sS -o /dev/null -L --max-time 20 -w '%{http_code}' https://lakeloreapp.com)
+          echo "site: $CODE"
+          [ "$CODE" = "200" ] || { echo "::error::lakeloreapp.com returned $CODE"; exit 1; }

@@ -165,7 +165,7 @@ app.get('/healthz', (req, res) => {
     }
     states[state] = entry;
   }
-  res.json({ ok: true, states });
+  res.json({ ok: true, states, sig: { ..._sigStats } });
 });
 
 // ── /readyz — data-aware readiness (IMPROVEMENT_PLAN 1.10) ─────────────────
@@ -199,6 +199,16 @@ app.get('/readyz', (req, res) => {
 // signed-token auth remains the long-term item.
 const USER_SIG_KEY = process.env.LAKELORE_USER_SIG_KEY || 'lakelore-client-v1';
 const nodeCrypto = require('crypto');
+// Telemetry for the enforcement flip: the flip is safe when `unsigned` is
+// ~0 over a sustained window (the 1.0.x fleet has drained). Counters reset
+// hourly with a summary log line; live totals ride /healthz?deep=1 as `sig`.
+const _sigStats = { signed: 0, unsigned: 0, invalid: 0, since: Date.now() };
+setInterval(() => {
+  const mins = Math.round((Date.now() - _sigStats.since) / 60000);
+  console.log(`[sig] last ${mins}m: signed=${_sigStats.signed} unsigned=${_sigStats.unsigned} invalid=${_sigStats.invalid}`
+    + (_sigStats.unsigned === 0 && _sigStats.signed > 0 ? ' — unsigned traffic drained; LAKELORE_REQUIRE_USER_SIG=1 is safe if this holds' : ''));
+  _sigStats.signed = 0; _sigStats.unsigned = 0; _sigStats.invalid = 0; _sigStats.since = Date.now();
+}, 60 * 60 * 1000).unref();
 app.use((req, res, next) => {
   const userId = req.get('x-user-id');
   if (!userId) return next();
@@ -206,12 +216,53 @@ app.use((req, res, next) => {
   const expected = nodeCrypto.createHmac('sha256', USER_SIG_KEY).update(userId).digest('hex').slice(0, 32);
   const valid = sig === expected;
   req.lakeLoreSigValid = valid;
+  if (valid) _sigStats.signed++;
+  else if (sig) _sigStats.invalid++;
+  else _sigStats.unsigned++;
   if (!valid && process.env.LAKELORE_REQUIRE_USER_SIG === '1') {
     return res.status(401).json({ error: 'invalid_client_signature' });
   }
   if (sig && !valid) console.warn(`[sig] BAD signature for user ${userId.slice(0, 8)}… (${req.path})`);
   next();
 });
+
+// ── Session tokens (IMPROVEMENT_PLAN 1.8, the long-term item) ───────────────
+// Server-issued HS256 tokens bind the entitlement identity to a SERVER-ONLY
+// secret: expiry (7d), server-side rotation (rotate LAKELORE_JWT_SECRET), and
+// a future hard-enforcement point (LAKELORE_REQUIRE_TOKEN=1, same drain-gated
+// flip as the client signature). Issuance is bootstrapped on x-user-id + a
+// VALID x-user-sig; a verified Bearer token then becomes the AUTHORITATIVE
+// identity — the middleware overwrites x-user-id with the token's subject so
+// every downstream consumer (gateByState, /api/me, feedback) transparently
+// uses the verified id. A present-but-invalid token is always a 401.
+// Honest limit: without platform attestation (App Attest / Play Integrity —
+// the documented next step), issuance trust still roots in the embedded
+// client key; what this adds is rotation, expiry, and the enforcement point.
+const JWT_SECRET = process.env.LAKELORE_JWT_SECRET || 'lakelore-dev-jwt-secret';
+const TOKEN_TTL_S = 7 * 24 * 60 * 60;
+const b64u = (buf) => Buffer.from(buf).toString('base64url');
+function signToken(sub) {
+  const now = Math.floor(Date.now() / 1000);
+  const h = b64u(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const p = b64u(JSON.stringify({ sub, iat: now, exp: now + TOKEN_TTL_S }));
+  const sig = nodeCrypto.createHmac('sha256', JWT_SECRET).update(`${h}.${p}`).digest('base64url');
+  return `${h}.${p}.${sig}`;
+}
+function verifyToken(token) {
+  const parts = String(token).split('.');
+  if (parts.length !== 3) return null;
+  const expect = nodeCrypto.createHmac('sha256', JWT_SECRET).update(`${parts[0]}.${parts[1]}`).digest('base64url');
+  const a = Buffer.from(parts[2]); const b = Buffer.from(expect);
+  if (a.length !== b.length || !nodeCrypto.timingSafeEqual(a, b)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+    if (!payload.sub || typeof payload.exp !== 'number' || payload.exp * 1000 < Date.now()) return null;
+    return payload;
+  } catch { return null; }
+}
+
+// (Session route + bearer verification are registered AFTER the rate
+// limiter below so token minting is rate-limited too.)
 
 // Rate limiting — 600 req per 15 min per IP in production.
 // One typical session uses ~10–15 requests; 600 covers ~40 sessions per
@@ -225,6 +276,33 @@ if (process.env.NODE_ENV === 'production') {
     message: { error: 'Too many requests, please try again later.' },
   }));
 }
+
+// Session-token issuance + bearer verification (helpers defined above).
+app.post('/api/session', (req, res) => {
+  const userId = req.get('x-user-id');
+  if (!userId || userId.length > 128) return res.status(400).json({ error: 'missing_x_user_id' });
+  if (!req.lakeLoreSigValid) return res.status(401).json({ error: 'invalid_client_signature' });
+  const token = signToken(userId);
+  res.json({ token, expiresIn: TOKEN_TTL_S });
+});
+
+app.use((req, res, next) => {
+  // /webhooks/* (RC's own Authorization value) and /reload (RELOAD_TOKEN
+  // bearer) carry NON-session Authorization headers — never parse those here.
+  if (req.path.startsWith('/webhooks') || /^\/api\/[a-z]{2}\/reload$/.test(req.path)) return next();
+  const auth = req.get('authorization');
+  if (!auth || !auth.startsWith('Bearer ')) {
+    if (process.env.LAKELORE_REQUIRE_TOKEN === '1' && req.get('x-user-id') && req.path !== '/api/session') {
+      return res.status(401).json({ error: 'session_token_required' });
+    }
+    return next();
+  }
+  const payload = verifyToken(auth.slice(7));
+  if (!payload) return res.status(401).json({ error: 'invalid_session_token' });
+  req.headers['x-user-id'] = payload.sub;
+  req.lakeLoreAuth = 'token';
+  next();
+});
 
 // Subscription gate — applied to /api/{paid-state}/* routes. Free state
 // (MN) passes through; paid states require the `LakeLore All-States`

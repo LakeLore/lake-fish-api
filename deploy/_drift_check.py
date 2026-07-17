@@ -20,6 +20,14 @@ Drift is checked across these tables:
 
     lakes, surveys, fish_catch, stocking
 
+Content drift (2026-07-17): row counts alone MISS value-only fixes — a
+recomputed cpue, a corrected rating_ordinal, a remapped species. Those change
+no counts, so the audit that fixed MN's 270k->91k cpue and IL's NULL
+'Very Good' ordinal looked "in sync" and sat undeployed for a day. We now also
+compute a cheap CONTENT FINGERPRINT (aggregate of the value columns) per state,
+computed with IDENTICAL SQL locally (sqlite3) and on prod (better-sqlite3), so
+"counts match but content differs" is surfaced as drift to ship.
+
 Schema-level drift (e.g. NE was missing surveys.source_url for weeks) is
 out of scope here. Add a column-presence check if that bites again.
 """
@@ -81,6 +89,40 @@ LOCAL_PATHS = {s: _local_path(s) for s in _registry_states()}
 ALL_STATES = list(LOCAL_PATHS.keys())
 TABLES = ["lakes", "surveys", "fish_catch", "stocking"]
 
+# Content fingerprint: one SQL expression that aggregates the VALUE-bearing
+# columns, so a value-only change (cpue, rating_ordinal, gear_category,
+# species remap, area_acres) shifts the fingerprint even when row counts are
+# identical. printf('%.2f', TOTAL(x)) is deterministic across SQLite builds
+# (both sides link SQLite); TOTAL() yields 0.0 for empty/all-NULL. Any table
+# that's missing (some states lack lake_stocking_metrics) contributes 'NA'.
+FINGERPRINT_SQL = {
+    "fish_catch": (
+        "SELECT COUNT(*)||':'||printf('%.2f',TOTAL(cpue))||':'||printf('%.2f',TOTAL(cpue_effective))"
+        "||':'||printf('%.2f',TOTAL(rating_ordinal))||':'||printf('%.2f',TOTAL(average_length))"
+        "||':'||printf('%.2f',TOTAL(average_weight))||':'||CAST(TOTAL(LENGTH(species_code)) AS INT)"
+        "||':'||CAST(TOTAL(LENGTH(COALESCE(rating,''))) AS INT)"
+        "||':'||CAST(TOTAL(LENGTH(COALESCE(gear_category,''))) AS INT)"
+        "||':'||COUNT(DISTINCT gear_category) FROM fish_catch"
+    ),
+    "lakes": (
+        "SELECT COUNT(*)||':'||printf('%.2f',TOTAL(area_acres))||':'||printf('%.2f',TOTAL(max_depth_feet)) FROM lakes"
+    ),
+    "lake_stocking_metrics": (
+        "SELECT COUNT(*)||':'||printf('%.2f',TOTAL(adults_per_100ac))||':'||printf('%.2f',TOTAL(adults_est)) FROM lake_stocking_metrics"
+    ),
+}
+
+
+def _fingerprint(conn):
+    """Combined content fingerprint string for one open DB connection."""
+    parts = []
+    for name, sql in FINGERPRINT_SQL.items():
+        try:
+            parts.append(f"{name}={conn.execute(sql).fetchone()[0]}")
+        except sqlite3.OperationalError:
+            parts.append(f"{name}=NA")
+    return "|".join(parts)
+
 
 def local_counts(state: str):
     path = LOCAL_PATHS.get(state)
@@ -94,6 +136,7 @@ def local_counts(state: str):
             except sqlite3.OperationalError:
                 counts[t] = None
         counts["_user_version"] = conn.execute("PRAGMA user_version").fetchone()[0]
+        counts["_fp"] = _fingerprint(conn)
     return counts
 
 
@@ -102,10 +145,13 @@ def prod_counts_all(states):
     # Node script reads each state's DB via better-sqlite3 (already a
     # dependency on the Fly machine for the server itself). One process,
     # one SSH session, no per-state round trip.
+    import json as _json
+    fp_js = "{" + ",".join(f"{_json.dumps(k)}:{_json.dumps(v)}" for k, v in FINGERPRINT_SQL.items()) + "}"
     node_script = """
         const Database = require('better-sqlite3');
         const states = process.argv.slice(1);
         const tables = ['lakes','surveys','fish_catch','stocking'];
+        const FP = __FP__;
         const out = {};
         for (const s of states) {
             const row = {};
@@ -116,6 +162,12 @@ def prod_counts_all(states):
                     catch { row[t] = null; }
                 }
                 row._user_version = db.pragma('user_version', { simple: true });
+                const parts = [];
+                for (const [name, sql] of Object.entries(FP)) {
+                    try { parts.push(name + '=' + db.prepare(sql).pluck().get()); }
+                    catch { parts.push(name + '=NA'); }
+                }
+                row._fp = parts.join('|');
                 db.close();
             } catch (e) {
                 row.error = e.message;
@@ -123,7 +175,7 @@ def prod_counts_all(states):
             out[s] = row;
         }
         process.stdout.write(JSON.stringify(out));
-    """
+    """.replace("__FP__", fp_js)
     # Use the remote shell to run node with our script + args
     cmd = f"node -e {sh_squote(node_script)} -- " + " ".join(states)
     result = subprocess.run(
@@ -179,7 +231,9 @@ def main():
 
     any_drift = False
     any_local_behind = False
+    any_content_drift = False
     behind_details = []
+    content_drift_states = []
 
     for state in states:
         local = local_counts(state)
@@ -223,10 +277,17 @@ def main():
                     any_drift = True
                     behind_details.append(f"{state}.{t}: local {l:,} < prod {pv:,}")
             print(f"  {state:<6} {t:<14} {fmt_int(l)} {fmt_int(pv)} {drift_val:>10}{mark}")
+        # Content fingerprint: catches value-only changes (recomputed cpue,
+        # corrected ordinal, remapped species) that leave row counts untouched.
+        lfp, pfp = local.get("_fp"), p.get("_fp")
+        if lfp is not None and pfp is not None and lfp != pfp:
+            any_content_drift = True
+            content_drift_states.append(state)
+            print(f"  {state:<6} {'content':<14} {'differs':>10} {'':>10}   ≠ VALUE DRIFT (row counts equal, values changed)")
         print()
 
-    if not any_drift:
-        print("  All counts match. Production is in sync.")
+    if not any_drift and not any_content_drift:
+        print("  All counts and content match. Production is in sync.")
         return 0
 
     if any_local_behind:
@@ -237,6 +298,13 @@ def main():
         print("  If this is intentional, re-run with --force.")
         return 2
 
+    if any_content_drift and not any_drift:
+        print(f"  Row counts match, but CONTENT differs (value-only changes) for: {', '.join(content_drift_states)}")
+        print("  Local has updated values to ship. Proceeding.")
+        return 0
+
+    if any_content_drift:
+        print(f"  (value-only content drift also present for: {', '.join(content_drift_states)})")
     print("  Local has new data to ship. Proceeding.")
     return 0
 

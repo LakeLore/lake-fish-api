@@ -28,11 +28,13 @@ DRIFT_CHECK="$SCRIPT_DIR/_drift_check.py"
 # ── Parse flags ───────────────────────────────────────────────────────────
 CHECK_ONLY=0
 FORCE=0
+NO_RESTART=0
 POSITIONAL=()
 for arg in "$@"; do
   case "$arg" in
     --check) CHECK_ONLY=1 ;;
     --force) FORCE=1 ;;
+    --no-restart) NO_RESTART=1 ;;
     -h|--help)
       sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -76,13 +78,33 @@ fi
 # Multi-machine (RUNBOOK §14, 2026-07-16): each machine has its own volume, so
 # every upload runs once PER MACHINE via --machine. With one machine this is
 # identical to the old behavior.
-MACHINE_IDS=$("$FLY" machine list --app "$APP" --json 2>/dev/null \
-  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).map(m=>m.id).join(' '))}catch(e){process.exit(1)}})")
-if [ -z "$MACHINE_IDS" ]; then
+MACHINE_ROWS=$("$FLY" machine list --app "$APP" --json 2>/dev/null \
+  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).map(m=>m.id+':'+m.state).join(' '))}catch(e){process.exit(1)}})")
+if [ -z "$MACHINE_ROWS" ]; then
   echo "❌ could not enumerate machines"; exit 1
 fi
-echo "machines: $MACHINE_IDS"
+# Wake auto-stopped machines first (2026-07-17): sftp/ssh to a stopped machine
+# errors "not found/started", which used to abort the whole upload on the
+# first state. auto_stop re-stops them after idle.
+MACHINE_IDS=""
+for row in $MACHINE_ROWS; do
+  mid="${row%%:*}"; mstate="${row##*:}"
+  if [ "$mstate" != "started" ]; then
+    echo "waking $mstate machine $mid"
+    "$FLY" machine start "$mid" --app "$APP" >/dev/null 2>&1 || true
+    sleep 10
+  fi
+  MACHINE_IDS="$MACHINE_IDS $mid"
+done
+echo "machines:$MACHINE_IDS"
 
+# A machine can AUTO-STOP mid-run (ssh/sftp sessions don't count as LB
+# activity — a fleet-wide upload takes long enough to hit the idle stop, which
+# aborted the 2026-07-17 v6 upload halfway). wake() + retry on every remote op.
+wake() {
+  "$FLY" machine start "$1" --app "$APP" >/dev/null 2>&1 || true
+  sleep 10
+}
 upload() {
   local src="$1" dest="$2" state="$3"
   if [[ "$STATE_ARG" == "all" ]] || [[ " $STATE_ARG " == *" $state "* ]]; then
@@ -97,8 +119,15 @@ upload() {
         # transfer — an auto-started machine mid-upload 503'd that state.
         "$FLY" ssh console --app "$APP" --machine "$mid" -C "rm -f ${dest}.new" >/dev/null 2>&1 || true
         echo "→ uploading $state -> $mid: $src"
-        "$FLY" sftp put "$src" "${dest}.new" --app "$APP" --machine "$mid"
-        "$FLY" ssh console --app "$APP" --machine "$mid" -C "sh -c 'rm -f ${dest}-shm ${dest}-wal && mv -f ${dest}.new ${dest}'"
+        if ! "$FLY" sftp put "$src" "${dest}.new" --app "$APP" --machine "$mid"; then
+          echo "   retrying after wake ($mid)"
+          wake "$mid"
+          "$FLY" sftp put "$src" "${dest}.new" --app "$APP" --machine "$mid"
+        fi
+        if ! "$FLY" ssh console --app "$APP" --machine "$mid" -C "sh -c 'rm -f ${dest}-shm ${dest}-wal && mv -f ${dest}.new ${dest}'"; then
+          wake "$mid"
+          "$FLY" ssh console --app "$APP" --machine "$mid" -C "sh -c 'rm -f ${dest}-shm ${dest}-wal && mv -f ${dest}.new ${dest}'"
+        fi
       done
     else
       echo "⚠  $state: source file not found ($src), skipping"
@@ -144,6 +173,17 @@ ALL_REGISTRY_STATES=$(python3 -c "import json,os; print(' '.join(json.load(open(
 for st in $ALL_REGISTRY_STATES; do
   upload "$(src_for "$st" "$(legacy_src "$st")")" "/data/$st.db" "$st"
 done
+
+if [ "$NO_RESTART" -eq 1 ]; then
+  # Schema-bump mode (2026-07-17): upload only, no restart. Running processes
+  # keep serving via their already-open handles; the follow-up IMAGE deploy
+  # (new canonical.sql riding the image) restarts machines onto the new DBs,
+  # so schema assert never sees a mixed image/data vintage. Follow with
+  # deploy/deploy.sh immediately.
+  echo ""
+  echo "--no-restart: uploads done. Deploy the matching image NOW (deploy/deploy.sh)."
+  exit 0
+fi
 
 echo ""
 echo "Restarting app to load new databases..."

@@ -109,6 +109,12 @@ const RESULTS_SRC = {
   cpue_kind: 'fc.cpue_kind',
   cpue_ci: 'fc.cpue_ci',
   average_length: 'fc.average_length',
+  // Schema v6 (2026-07-17): how the length was obtained ('measured' vs
+  // 'estimate'/'chart'/'psd_midpoint') and whether a presence fact was
+  // observed or inferred from stocking — both were DB-only before, so
+  // estimates displayed indistinguishably from measured means.
+  length_derivation: 'fc.length_derivation',
+  presence_basis: 'fc.presence_basis',
   min_length: 'fc.min_length',
   max_length: 'fc.max_length',
   n_measured: 'fc.n_measured',
@@ -165,6 +171,9 @@ const LAKE_CATCHES_SRC = {
   sample_n: 'fc.sample_n',
   gear_count: 'fc.gear_count',
   average_length: 'fc.average_length',
+  // Schema v6 — see RESULTS_SRC note.
+  length_derivation: 'fc.length_derivation',
+  presence_basis: 'fc.presence_basis',
   min_length: 'fc.min_length',
   max_length: 'fc.max_length',
   n_measured: 'fc.n_measured',

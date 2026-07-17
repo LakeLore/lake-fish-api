@@ -30,7 +30,18 @@ const PREVIEW_REDACT_RESULT = [
   // results wire carries report_id).
   'report_id', 'source_pdf', 'source_url',
 ];
-const PREVIEW_REDACT_LAKE = ['name', 'county', 'area_acres', 'latitude', 'longitude', 'location', 'shore_length_miles'];
+// /lake preview is an ALLOWLIST (C9, 2026-07-17): the lake row comes from
+// SELECT * — with a redaction blocklist, any future identity-ish column added
+// to the lakes table would ship to preview users BY DEFAULT. Only the columns
+// below may carry values in preview; everything else present is nulled (keys
+// stay present so the response shape is stable). Adding a lakes column now
+// requires an explicit decision to expose it here.
+const PREVIEW_LAKE_ALLOW = new Set(['id', 'max_depth_feet', 'mean_depth_feet', 'water_clarity', 'last_surveyed']);
+function redactPreviewLakeAllowlist(row) {
+  for (const k of Object.keys(row)) {
+    if (!PREVIEW_LAKE_ALLOW.has(k) && row[k] != null) row[k] = null;
+  }
+}
 const PREVIEW_REDACT_DOC_LINKS = ['report_id', 'source_pdf', 'source_url'];
 
 // Null out the listed fields when present. Only touches keys the row already
@@ -837,7 +848,7 @@ function lakeDetail(req, res, ctx) {
     // (those documents name the lake). Metrics were already computed above
     // from the real area_acres, so per-100-acre numbers stay correct.
     if (req.lakeLorePreview) {
-      redactPreviewFields(lake, PREVIEW_REDACT_LAKE);
+      redactPreviewLakeAllowlist(lake);
       if (lake.id != null) lake.id = previewId(state, String(lake.id));
       for (const s of surveys) {
         redactPreviewFields(s, PREVIEW_REDACT_DOC_LINKS);

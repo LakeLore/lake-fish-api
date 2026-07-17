@@ -132,7 +132,12 @@ app.use(cors({
     cb(null, false);
   },
 }));
-app.use(express.json());
+// 16 KB body cap (2026-07-17, B11): the only JSON bodies we accept are
+// feedback (≤2000-char message), subscribe (an email), and session attestation
+// proofs (iOS App Attest CBOR ≈ 5-6 KB raw → ~8 KB base64, the sizing floor
+// here). The express default of 100 KB let an unauthenticated writer grow the
+// jsonl volume 6x faster than needed.
+app.use(express.json({ limit: '16kb' }));
 
 // Healthcheck — independent of any state DB, used by the Fly healthcheck.
 // Kept outside /api so it bypasses rate limiting. Default shape is unchanged;
@@ -173,20 +178,35 @@ app.get('/healthz', (req, res) => {
 // external uptime monitors and deploy-data.sh's post-restart gate; Fly's
 // machine check stays on the cheap /healthz liveness probe so one bad state
 // can't take the whole machine out of rotation.
+//
+// ?deep=1 (2026-07-17, B6) additionally EXECUTES a query against every state
+// DB. The shallow check only proves the file opened at startup — a page that
+// corrupts afterward 500s every request for that state while shallow /readyz
+// stays green. Deep results are cached 60 s (56 full COUNT scans over small
+// lakes tables ≈ cheap, but not per-probe cheap); deploy-data.sh polls deep.
+let _deepReadyCache = { at: 0, bad: null };
 app.get('/readyz', (req, res) => {
-  const bad = [];
-  for (const state of ACTIVE_STATES) {
-    if (_configErrorStates.has(state)) { bad.push(`${state}:config`); continue; }
-    try {
-      const db = getDb(state);
-      if (!db) { bad.push(`${state}:no-db`); continue; }
-      if (_canonicalUnhealthy.has(state)) { bad.push(`${state}:schema`); continue; }
-    } catch (e) {
-      bad.push(`${state}:${e.message.slice(0, 40)}`);
+  const deep = req.query.deep === '1';
+  let bad;
+  if (deep && Date.now() - _deepReadyCache.at < 60_000) {
+    bad = _deepReadyCache.bad;
+  } else {
+    bad = [];
+    for (const state of ACTIVE_STATES) {
+      if (_configErrorStates.has(state)) { bad.push(`${state}:config`); continue; }
+      try {
+        const db = getDb(state);
+        if (!db) { bad.push(`${state}:no-db`); continue; }
+        if (_canonicalUnhealthy.has(state)) { bad.push(`${state}:schema`); continue; }
+        if (deep) db.prepare('SELECT COUNT(*) AS n FROM lakes').get();
+      } catch (e) {
+        bad.push(`${state}:${e.message.slice(0, 40)}`);
+      }
     }
+    if (deep) _deepReadyCache = { at: Date.now(), bad };
   }
-  if (bad.length) return res.status(503).json({ ready: false, bad });
-  res.json({ ready: true, states: ACTIVE_STATES.size });
+  if (bad.length) return res.status(503).json({ ready: false, deep, bad });
+  res.json({ ready: true, deep, states: ACTIVE_STATES.size });
 });
 
 // ── Client identity signature (IMPROVEMENT_PLAN 1.8 scaffolding) ────────────
@@ -396,13 +416,31 @@ app.get('/api/me/entitlement', async (req, res) => {
 // the file (cat / grep / jq).
 //
 // No auth: anyone with the app can submit. Rate limit is the global 600/
-// 15-min from express-rate-limit, applied to /api. Body size is capped at
-// 4 KB so abuse can't fill the volume.
+// 15-min from express-rate-limit, applied to /api; bodies are capped at 16 KB
+// by the express.json limit, and the file itself is capped below so a
+// sustained distributed writer can't fill the volume.
 //
 // Future upgrade path: pipe submissions to email via Resend or Postmark, or
 // surface them inside a dashboard. For v1 we just collect.
 const FEEDBACK_LOG_PATH = process.env.FEEDBACK_LOG_PATH
   || path.join('/data', 'feedback.jsonl');
+
+// Append with a hard per-file byte cap (2026-07-17, B11). 50 MB ≈ hundreds of
+// thousands of entries — legitimate traffic never gets near it, and a filled
+// file degrades to a clean 503 instead of exhausting the 1 GB data volume the
+// state DBs live on. The weekly backup-userdata.sh sweep keeps offsite copies,
+// so truncating a capped file after export is safe recovery.
+const JSONL_MAX_BYTES = 50 * 1024 * 1024;
+async function appendJsonlCapped(p, entry) {
+  await fs.promises.mkdir(path.dirname(p), { recursive: true });
+  const size = await fs.promises.stat(p).then(s => s.size).catch(() => 0);
+  if (size > JSONL_MAX_BYTES) {
+    const err = new Error('jsonl cap reached');
+    err.capped = true;
+    throw err;
+  }
+  await fs.promises.appendFile(p, JSON.stringify(entry) + '\n');
+}
 
 app.post('/api/feedback', (req, res) => {
   const userId = req.get('x-user-id') || null;
@@ -425,12 +463,11 @@ app.post('/api/feedback', (req, res) => {
     build: build ?? null,
     message: message.trim(),
   };
-  fs.promises.mkdir(path.dirname(FEEDBACK_LOG_PATH), { recursive: true })
-    .then(() => fs.promises.appendFile(FEEDBACK_LOG_PATH, JSON.stringify(entry) + '\n'))
+  appendJsonlCapped(FEEDBACK_LOG_PATH, entry)
     .then(() => res.json({ ok: true }))
     .catch(err => {
       console.warn('[feedback] write failed:', err.message);
-      res.status(500).json({ error: 'write_failed' });
+      res.status(err.capped ? 503 : 500).json({ error: err.capped ? 'storage_full' : 'write_failed' });
     });
 });
 
@@ -451,12 +488,11 @@ app.post('/api/subscribe', (req, res) => {
     state: typeof state === 'string' ? state.slice(0, 8) : null,
     source: typeof source === 'string' ? source.slice(0, 64) : null,
   };
-  fs.promises.mkdir(path.dirname(SUBSCRIBERS_PATH), { recursive: true })
-    .then(() => fs.promises.appendFile(SUBSCRIBERS_PATH, JSON.stringify(entry) + '\n'))
+  appendJsonlCapped(SUBSCRIBERS_PATH, entry)
     .then(() => res.json({ ok: true }))
     .catch(err => {
       console.warn('[subscribe] write failed:', err.message);
-      res.status(500).json({ error: 'write_failed' });
+      res.status(err.capped ? 503 : 500).json({ error: err.capped ? 'storage_full' : 'write_failed' });
     });
 });
 

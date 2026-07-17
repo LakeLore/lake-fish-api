@@ -92,11 +92,13 @@ upload() {
       # sitting in lakes.db-wal — burned us once on the MI county backfill.
       sqlite3 "$src" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null
       for mid in $MACHINE_IDS; do
-        # fly sftp put refuses to overwrite, so clear the destination first
-        # (along with any sibling -shm/-wal files left from the previous deploy).
-        "$FLY" ssh console --app "$APP" --machine "$mid" -C "rm -f $dest ${dest}-shm ${dest}-wal" >/dev/null 2>&1 || true
+        # Atomic swap (2026-07-17, B11): upload to <dest>.new and mv into
+        # place. The old rm-then-put left the live path MISSING for the whole
+        # transfer — an auto-started machine mid-upload 503'd that state.
+        "$FLY" ssh console --app "$APP" --machine "$mid" -C "rm -f ${dest}.new" >/dev/null 2>&1 || true
         echo "→ uploading $state -> $mid: $src"
-        "$FLY" sftp put "$src" "$dest" --app "$APP" --machine "$mid"
+        "$FLY" sftp put "$src" "${dest}.new" --app "$APP" --machine "$mid"
+        "$FLY" ssh console --app "$APP" --machine "$mid" -C "sh -c 'rm -f ${dest}-shm ${dest}-wal && mv -f ${dest}.new ${dest}'"
       done
     else
       echo "⚠  $state: source file not found ($src), skipping"
@@ -152,16 +154,50 @@ echo "Restarting app to load new databases..."
 # schema-drifted DB upload fails HERE instead of as user-facing 500s.
 echo ""
 echo "Waiting for /readyz..."
+READY_LB=0
 for i in $(seq 1 30); do
   BODY=$(curl -s --max-time 10 "https://$APP.fly.dev/readyz" || true)
   if echo "$BODY" | grep -q '"ready":true'; then
-    echo "READY: $BODY"
-    exit 0
+    echo "READY (LB): $BODY"
+    READY_LB=1
+    break
   fi
   sleep 5
 done
-echo "❌ NOT READY after 150s: $BODY"
-echo "   Per-state detail: curl 'https://$APP.fly.dev/healthz?deep=1'"
-echo "   Roll back by re-uploading the previous artifact (B2 backup) or"
-echo "   'fly image rollback' if the image changed too (~/RUNBOOK.md)."
-exit 1
+if [ "$READY_LB" -eq 0 ]; then
+  echo "❌ NOT READY after 150s: $BODY"
+  echo "   Per-state detail: curl 'https://$APP.fly.dev/healthz?deep=1'"
+  echo "   Roll back by re-uploading the previous artifact (B2 backup) or"
+  echo "   'fly image rollback' if the image changed too (~/RUNBOOK.md)."
+  exit 1
+fi
+
+# Per-machine DEEP readiness (2026-07-17, B6): the LB poll above can be
+# satisfied entirely by ONE machine (the other may be auto-stopped or serving
+# a diverged vintage), and shallow /readyz never executes a query. Hit every
+# machine directly over localhost with ?deep=1, which runs a real SELECT per
+# state — catches per-machine corruption and split uploads.
+DEEP_FAIL=0
+for mid in $MACHINE_IDS; do
+  DEEP=$("$FLY" ssh console --app "$APP" --machine "$mid" \
+    -C "wget -qO- -T 30 http://localhost:3100/readyz?deep=1" 2>/dev/null || true)
+  if [ -z "$DEEP" ]; then
+    # Machine may have auto-stopped since the restart — wake it and retry once.
+    "$FLY" machine start "$mid" --app "$APP" >/dev/null 2>&1 || true
+    sleep 10
+    DEEP=$("$FLY" ssh console --app "$APP" --machine "$mid" \
+      -C "wget -qO- -T 30 http://localhost:3100/readyz?deep=1" 2>/dev/null || true)
+  fi
+  if echo "$DEEP" | grep -q '"ready":true'; then
+    echo "READY (deep, $mid): $DEEP"
+  else
+    echo "❌ machine $mid deep check failed: ${DEEP:-no response}"
+    DEEP_FAIL=1
+  fi
+done
+if [ "$DEEP_FAIL" -eq 1 ]; then
+  echo "   One or more machines are unhealthy or diverged — see above."
+  echo "   Re-run this deploy (uploads are atomic) or roll back (~/RUNBOOK.md)."
+  exit 1
+fi
+exit 0

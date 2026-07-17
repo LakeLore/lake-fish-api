@@ -28,6 +28,9 @@ entitlement.js            — RC v2 entitlement gate + cache
 package.json              — express, cors, better-sqlite3, express-rate-limit,
                             @sentry/node
 deploy/
+  deploy.sh               — test-gated image deploy (2026-07-17, B5): smoke +
+                            parity spot-replay, then flyctl deploy. Use this,
+                            not bare flyctl deploy.
   Dockerfile              — two-stage Alpine build; copies server.js + entitlement.js
                             + server/canonical.js + the lakelore-data runtime files
                             (registry, species map, schema assertion, shared survival).
@@ -65,9 +68,17 @@ All five deploy artifacts are symlinked from `~/` so existing commands (`flyctl 
 ## Deploy
 
 ```bash
-# From ~/ (Docker build context):
-cd ~ && ~/.fly/bin/flyctl deploy
+# Preferred (2026-07-17, test-gated): smoke tests + parity spot-replay
+# (mn/tx/ga) run first and BLOCK the deploy on failure.
+~/lake-fish-mobile-server/deploy/deploy.sh
+
+# Raw escape hatch (skips the gates — emergencies only):
+cd ~ && ~/.fly/bin/flyctl deploy --config ~/lake-fish-mobile-server/deploy/fly.toml
 ```
+
+A deliberate wire change fails the parity gate by design — re-record the
+goldens (`node ~/lakelore-data/bin/parity.js <st> --record golden/<st>/`)
+first; that forced review step is the point.
 
 The Dockerfile's COPY directives reference both this folder (`lake-fish-mobile-server/server.js`) and the sibling `lakelore-data/` package (registry, species map, schema files, shared survival model), which is why the build context is `~/` rather than this folder. The per-state `{state}-lake-fish/survival.js` COPY lines were removed in the P5 cleanup — the shared model covers all states. If `lakelore-data/` ever moves, update `deploy/Dockerfile` and `deploy/.dockerignore` accordingly.
 

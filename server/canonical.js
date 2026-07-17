@@ -583,8 +583,17 @@ function results(req, res, ctx) {
     // Stocked sort ranks in two blocks (2026-07-15): lakes WITH acreage by
     // density first, then acreage-less stocked lakes by absolute estimated
     // adults (adults_est). NULLS LAST keeps never-stocked rows at the bottom.
+    // cpue sort (2026-07-17): rows WITH a catch rate rank first by cpue; rows
+    // WITHOUT one (net count unstated, or mixed-gear catch that can't be split
+    // per gear — common in the PDF-extracted states) fall below them and are
+    // then ordered by raw total_catch DESC, so "90 fish, rate unknown" outranks
+    // "7 fish, rate unknown". The CASE guard confines the total_catch tiebreak
+    // to the null-cpue block, so rows with a real cpue keep their exact prior
+    // order (no tie-order regression for the legacy-parity states).
     const sortExpr = sortBy === 'stocked'
       ? `(lsm.adults_per_100ac IS NULL) ASC, COALESCE(lsm.adults_per_100ac, lsm.adults_est) ${dir} NULLS LAST`
+      : sortBy === 'cpue'
+      ? `(fc.cpue_effective IS NULL) ASC, fc.cpue_effective ${dir}, (CASE WHEN fc.cpue_effective IS NULL THEN fc.total_catch END) DESC`
       : null;
 
     // mostRecentOrderPin (NE): for species-less mostRecentOnly queries the

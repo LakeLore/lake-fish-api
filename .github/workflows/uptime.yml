@@ -2,14 +2,45 @@
 # watches production from OUTSIDE the Mac/Fly. /readyz is 200 only when every
 # active state serves with a valid schema. A failing run makes the workflow
 # fail -> GitHub notifies the org email. Every 15 minutes.
+#
+# The weekly keepalive job guards GitHub's 60-day trap: scheduled workflows
+# are silently auto-disabled after 60 days without repo activity — exactly
+# the post-launch quiet period when this monitor matters most
+# (IMPROVEMENT_PLAN_2026-07-17 B3, documented in RUNBOOK §1).
 name: uptime
 on:
   schedule:
     - cron: '*/15 * * * *'
+    - cron: '30 6 * * 3'   # weekly keepalive check (Wed 06:30 UTC)
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
+  keepalive:
+    if: github.event.schedule == '30 6 * * 3'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Empty commit if repo nearing 60-day inactivity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pushed_at=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .pushed_at)
+          age_days=$(( ($(date +%s) - $(date -d "$pushed_at" +%s)) / 86400 ))
+          echo "last push ${age_days}d ago"
+          if [ "$age_days" -ge 50 ]; then
+            git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ka
+            cd ka
+            git config user.name  "lakelore-keepalive"
+            git config user.email "keepalive@lakeloreapp.com"
+            git commit --allow-empty -m "keepalive: prevent 60-day scheduled-workflow auto-disable"
+            git push
+          fi
+
   probe:
+    if: github.event.schedule != '30 6 * * 3'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
@@ -27,6 +58,14 @@ jobs:
           CODE=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' 'https://lake-fish-api.fly.dev/api/mn/results?species=WAE&limit=1&sortBy=cpue&sortDir=desc&mostRecentOnly=true')
           echo "mn results: $CODE"
           [ "$CODE" = "200" ] || { echo "::error::mn /results returned $CODE"; exit 1; }
+      - name: sample paid-state data call
+        # A paid state exercises the preview/redaction path the free-state
+        # probe can't — without this, a 500 confined to the 49 paid states
+        # never trips the monitor. TX serves in preview mode without auth.
+        run: |
+          CODE=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' 'https://lake-fish-api.fly.dev/api/tx/results?species=Largemouth+Bass&limit=1')
+          echo "tx results (preview): $CODE"
+          [ "$CODE" = "200" ] || { echo "::error::tx /results returned $CODE"; exit 1; }
       - name: marketing site
         run: |
           CODE=$(curl -sS -o /dev/null -L --max-time 20 -w '%{http_code}' https://lakeloreapp.com)

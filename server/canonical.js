@@ -50,7 +50,17 @@ function redactPreviewFields(row, fields) {
 // references stay consistent between /results and /lake payloads. /lake/:id
 // resolves hashed ids back through a lazily-built per-state reverse map.
 const crypto = require('crypto');
-const PREVIEW_ID_SECRET = process.env.PREVIEW_ID_SECRET || 'lakelore-preview-ids-v1';
+// Key precedence: explicit PREVIEW_ID_SECRET → derived from the server-only
+// JWT secret (HMAC, so the JWT key itself is never reused directly) → the dev
+// literal. The middle tier matters: without it, production quietly ran on the
+// repo-known literal, making preview hashes offline-reversible for the many
+// states whose raw ids are name slugs. Deriving from LAKELORE_JWT_SECRET keeps
+// the key server-only, identical across both machines, and stable across
+// restarts — no separate Fly secret required.
+const PREVIEW_ID_SECRET = process.env.PREVIEW_ID_SECRET
+  || (process.env.LAKELORE_JWT_SECRET
+    ? crypto.createHmac('sha256', process.env.LAKELORE_JWT_SECRET).update('lakelore-preview-ids').digest('hex')
+    : 'lakelore-preview-ids-v1');
 const PREVIEW_ID_RE = /^p[0-9a-f]{15}$/;
 function previewId(state, id) {
   return 'p' + crypto.createHmac('sha256', PREVIEW_ID_SECRET)
@@ -164,6 +174,11 @@ const LAKE_CATCHES_SRC = {
   wr_sq: 'fc.wr_sq', wr_qp: 'fc.wr_qp', wr_pm: 'fc.wr_pm', wr_m: 'fc.wr_m',
   n_sq: 'fc.n_sq', n_qp: 'fc.n_qp', n_pm: 'fc.n_pm', n_m: 'fc.n_m',
   ef_stations: 's.ef_stations', hn_stations: 's.hn_stations', fn_stations: 's.fn_stations',
+  // Agency forecast rating (schema v4) — without these on the /lake wire, the
+  // ratings-tier states' HEADLINE metric appears in /results but vanishes on
+  // the detail screen (IMPROVEMENT_PLAN_2026-07-17 A5).
+  rating: 'fc.rating',
+  rating_ordinal: 'fc.rating_ordinal',
 };
 
 // ORDER BY column tokens used in wire.lakeSurveysOrder / wire.lakeCatchesOrder.

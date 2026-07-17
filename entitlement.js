@@ -17,7 +17,21 @@
 //     set the Fly secret to enable paid access.
 
 const ALL_STATES_ENTITLEMENT = 'LakeLore All-States';
-const FREE_STATES = new Set(['mn']);
+// Free tier derives from registry `free: true` flags — same source of truth
+// as the app's generated config. Falls back to the launch literal only if
+// the registry is unreadable (server.js exits at startup in that case anyway).
+const FREE_STATES = (() => {
+  try {
+    const { loadRegistry } = require('../lakelore-data');
+    const reg = loadRegistry();
+    const free = Object.keys(reg.states).filter(s => reg.states[s].free === true);
+    if (!free.length) throw new Error('registry lists no free states');
+    return new Set(free);
+  } catch (err) {
+    console.error(`[entitlement] registry unavailable for FREE_STATES — defaulting to mn: ${err.message}`);
+    return new Set(['mn']);
+  }
+})();
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const RC_API_BASE = 'https://api.revenuecat.com/v2';
 
@@ -199,12 +213,73 @@ async function fetchEntitlementFromRevenueCat(userId) {
 const GRACE_MS = 72 * 60 * 60 * 1000;
 const _lastGood = new Map(); // userId -> { expiresAt, seenAt }
 
+// The grace map must survive restarts — a deploy/failover DURING an RC outage
+// is exactly when it's needed. Write-through to the data volume (per-machine;
+// each machine bridges outages for the users it has served).
+const fs = require('fs');
+const path = require('path');
+const GRACE_PATH = process.env.LAKELORE_GRACE_PATH
+  || (process.env.LAKELORE_DB_DIR
+    ? path.join(process.env.LAKELORE_DB_DIR, 'entitlement-lastgood.json')
+    : path.join(__dirname, '.entitlement-lastgood.json'));
+
+(function loadLastGood() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(GRACE_PATH, 'utf8'));
+    const now = Date.now();
+    let n = 0;
+    for (const [userId, rec] of Object.entries(raw)) {
+      if (rec && typeof rec.seenAt === 'number' && (now - rec.seenAt) < GRACE_MS) {
+        _lastGood.set(userId, rec);
+        n++;
+      }
+    }
+    if (n) console.log(`[entitlement] loaded ${n} grace records from ${GRACE_PATH}`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.warn(`[entitlement] could not load grace records: ${err.message}`);
+  }
+})();
+
+let _saveTimer = null;
+function saveLastGoodSoon() {
+  if (_saveTimer) return;
+  _saveTimer = setTimeout(() => {
+    _saveTimer = null;
+    try {
+      const now = Date.now();
+      const out = {};
+      for (const [userId, rec] of _lastGood.entries()) {
+        if ((now - rec.seenAt) < GRACE_MS) out[userId] = rec;
+      }
+      const tmp = `${GRACE_PATH}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(out));
+      fs.renameSync(tmp, GRACE_PATH);
+    } catch (err) {
+      console.warn(`[entitlement] could not persist grace records: ${err.message}`);
+    }
+  }, 5000);
+  _saveTimer.unref?.();
+}
+
+// Hourly RC-error-rate telemetry: individual failures already warn per
+// request, but a sustained outage should be visible as one summarizable
+// signal in the logs.
+let _rcErrorCount = 0;
+setInterval(() => {
+  if (_rcErrorCount > 0) {
+    console.warn(`[rc] ${_rcErrorCount} RevenueCat lookup errors in the last hour`);
+    _rcErrorCount = 0;
+  }
+}, 60 * 60 * 1000).unref?.();
+
 async function checkEntitlement(userId) {
   if (!userId) return { hasAllStates: false, expiresAt: null, source: 'no-user-id' };
 
   const cached = _cache.get(userId);
   const now = Date.now();
-  if (cached && (now - cached.fetchedAt) < CACHE_TTL_MS) {
+  // Honor the per-entry TTL: error results are cached briefly (30 s) so an
+  // RC blip doesn't pin `hasAllStates:false` for the full 5 minutes.
+  if (cached && (now - cached.fetchedAt) < (cached._ttl ?? CACHE_TTL_MS)) {
     return {
       hasAllStates: cached.hasAllStates,
       expiresAt: cached.expiresAt,
@@ -215,10 +290,12 @@ async function checkEntitlement(userId) {
   const result = await fetchEntitlementFromRevenueCat(userId);
   if (result.hasAllStates) {
     _lastGood.set(userId, { expiresAt: result.expiresAt, seenAt: now });
+    saveLastGoodSoon();
   } else if (!result.error) {
     // RC positively says not subscribed — clear any stale grace record.
-    _lastGood.delete(userId);
+    if (_lastGood.delete(userId)) saveLastGoodSoon();
   } else {
+    _rcErrorCount++;
     // RC errored. Serve the last-known-good entitlement inside the grace
     // window instead of 402ing a paying customer during an outage.
     const good = _lastGood.get(userId);

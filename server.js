@@ -239,6 +239,16 @@ app.use((req, res, next) => {
 // the documented next step), issuance trust still roots in the embedded
 // client key; what this adds is rotation, expiry, and the enforcement point.
 const JWT_SECRET = process.env.LAKELORE_JWT_SECRET || 'lakelore-dev-jwt-secret';
+// Refuse to serve production traffic with the repo-known default JWT key: a
+// secrets mishap would otherwise make session tokens forgeable — and the
+// preview-id key (server/canonical.js) is derived from this secret too, so
+// losing it would also make preview lake ids offline-reversible. NOTHING else
+// would fail or warn. (USER_SIG_KEY is intentionally exempt — its default is
+// the client-embedded value.)
+if (process.env.NODE_ENV === 'production' && !process.env.LAKELORE_JWT_SECRET) {
+  console.error("FATAL: production requires LAKELORE_JWT_SECRET — refusing to start with the repo-default key. Set it via 'flyctl secrets set'.");
+  process.exit(1);
+}
 const TOKEN_TTL_S = 7 * 24 * 60 * 60;
 const b64u = (buf) => Buffer.from(buf).toString('base64url');
 function signToken(sub, att = 'none') {

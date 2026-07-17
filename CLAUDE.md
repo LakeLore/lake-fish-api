@@ -1,5 +1,7 @@
 # lake-fish-api — Working Context
 
+*Last reconciled with code: 2026-07-17.*
+
 Express + better-sqlite3 API behind LakeLore. Hosted on Fly.io (`lake-fish-api`, Chicago, `ord`). Reads read-only canonical state SQLite databases (built by `~/lakelore-data`) from a persistent volume at `/data/`.
 
 > **Endpoint reference and routine ops:** `./README.md`.
@@ -12,12 +14,16 @@ Express + better-sqlite3 API behind LakeLore. Hosted on Fly.io (`lake-fish-api`,
 ## File map
 
 ```
-server.js                 — Express app + all routes (~550 lines post-P5-cleanup;
-                            was 1473 with legacy branches); unconditional dispatch
-                            to the canonical handlers for every active state
+server.js                 — Express app + all routes (single file, ~800 lines;
+                            was 1473 with legacy branches pre-P5-cleanup);
+                            unconditional dispatch to the canonical handlers
+                            for every active state
 server/canonical.js       — generic registry-driven filters/results/lake handlers
                             (wire projection per registry wire lists; query plans
                             pinned for tie-order parity — see PARITY_NOTES)
+server/attest.js          — App Attest (iOS) / Play Integrity (Android) proof
+                            verification for POST /api/session; challenge HMAC
+                            derived from LAKELORE_JWT_SECRET
 entitlement.js            — RC v2 entitlement gate + cache
 package.json              — express, cors, better-sqlite3, express-rate-limit,
                             @sentry/node
@@ -26,23 +32,28 @@ deploy/
                             + server/canonical.js + the lakelore-data runtime files
                             (registry, species map, schema assertion, shared survival).
                             Build context is ~/ (so cross-folder COPY works).
-  fly.toml                — single machine in ord, 512 MB, /healthz check
+  fly.toml                — two machines in ord (2026-07-16 scale-out, RUNBOOK
+                            §14), 512 MB each, /healthz check
   .dockerignore           — strict allow-list
   fetch.sh                — local: scrape one state and POST /reload to dev server
-  deploy-data.sh          — production: drift-check, sftp state DBs to Fly
-                            volume, restart machine
+  deploy-data.sh          — production: drift-check, sftp state DBs to EVERY
+                            machine's volume (`fly sftp put --machine <id>`),
+                            restart, poll /readyz
   _drift_check.py         — pre-upload safety: diffs local vs prod row counts
                             for lakes/surveys/fish_catch/stocking, aborts the
                             deploy if local is BEHIND prod (suggesting a
                             stale snapshot). Invoked by deploy-data.sh, or run
                             standalone via `./deploy-data.sh --check`.
+.github/workflows/
+  uptime.yml              — GitHub Actions uptime probes against prod (every
+                            15 min)
 ```
 
 All five deploy artifacts are symlinked from `~/` so existing commands (`flyctl deploy`, `~/fetch.sh`, `~/deploy-data.sh`) still work after the move into `deploy/`.
 
 ## Architecture in 30 seconds
 
-- One Fly machine, one Express process, one read-only SQLite connection per active state (lazily opened; canonical artifacts are immutable snapshots, no WAL).
+- Two Fly machines in ord (since the 2026-07-16 scale-out, RUNBOOK §14 — forked volume, so each machine has its own `/data` copy; one auto-stops when idle), each running one Express process with one read-only SQLite connection per active state (lazily opened; canonical artifacts are immutable snapshots, no WAL). `deploy-data.sh` uploads to every machine, so the volumes never split.
 - **Registry-driven ACTIVE_STATES (2026-07-15 all-states launch):** `server.js` derives `ACTIVE_STATES` from `lakelore-data/registry/states.json` `active:true` flags — no more hand-mirrored literal. All 56 states/provinces (50 US + ON/BC/QC/MB/SK/AB) are active. DB paths resolve `{STATE}_DB_PATH` env → `LAKELORE_DB_DIR/{state}.db` (production sets `LAKELORE_DB_DIR=/data`) → local `../lakelore-data/out/{state}.db`.
 - **Canonical-only serving (P5 cleanup, 2026-07):** every active state is served by the generic registry-driven handlers (`server/canonical.js`) against a canonical-schema DB built by `lakelore-data`'s `normalize.js`. The legacy per-state branches, species maps, SD startup migration (`migrateSd`/`computeSdStockingMetrics`), in-memory stocking metrics, and per-state `../{state}-lake-fish/survival.js` requires were all DELETED from `server.js` (1473 → ~550 lines) after each state was parity-proven (`~/lakelore-data/bin/parity.js`; whitelists + P5 byte-identical replay verification in `~/lakelore-data/reports/PARITY_NOTES.md`). Routes are: validateState → canonical handler, unconditionally. **`../lakelore-data` is a hard startup requirement** — if it's missing the process exits 1 immediately. An active state the registry doesn't mark `canonical: true` is a config error: loud startup log + 503 on its routes (not a crash). The `CANONICAL_STATES` env override no longer exists; rollback = Fly image rollback (`~/RUNBOOK.md` §2/§9b). Startup validates each state's schema (mismatch → that state 503s `state unhealthy`, others unaffected) and `GET /healthz?deep=1` reports per-state `{ok, lakes, generatedAt, ageDays, schemaOk}`.
 - Stocking metrics: `/results` reads the precomputed `lake_stocking_metrics` table baked into each artifact; `/lake/:id` computes "adults per 100 acres" on the fly via the shared `~/lakelore-data/survival` model (equivalence-proven against the retired per-state modules) + registry species resolution.

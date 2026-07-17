@@ -39,10 +39,12 @@ const RC_API_BASE = 'https://api.revenuecat.com/v2';
 //   /api/{state}/pdf/:name    — Nebraska survey PDFs (NE-specific) — hard 402
 //                               (the PDF itself names the lake).
 //
-// Only ACTIVE states appear here. Inactive states (wi, mi for v1) fall through
-// to route validation, which returns 400 (not 402). That keeps the client's
-// SubscriptionRequiredError → paywall flow from firing on states the user can't
-// reach in the first place.
+// Only ACTIVE states appear here — the set is whatever the registry flags
+// `active: true`, so it tracks launches without edits here. States flagged
+// `active: false` (the no-metric holdbacks — az/de/ma/qc/ri/sc as of 2026-07)
+// fall through to route validation, which returns 400 (not 402). That keeps
+// the client's SubscriptionRequiredError → paywall flow from firing on states
+// the user can't reach in the first place.
 //
 // The state list is generated from lakelore-data/registry/states.json (all
 // `active` states — including free MN, which matches and then passes through

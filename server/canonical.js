@@ -443,6 +443,302 @@ function filters(req, res, ctx) {
   }
 }
 
+// ── /api/:state/measures ─────────────────────────────────────────────────────
+// Measure × Gear/Source manifest (DATA_MODEL_PROPOSAL_2026-07-20). Reshapes the
+// prior flat "lens" list into the model the owner's notes describe: a small,
+// stable set of MEASURES (Abundance / Avg Size / Stocking Impact / Presence) is
+// the primary control, and GEAR/SOURCE is a required filter nested under
+// Abundance & Avg Size. This fixes the 07-18 mistake of promoting every gear to
+// a top-level choice (35 for MN pike). Measures are ordered by the default
+// cascade: Abundance → Stocking Impact → Avg Size → Presence. Each source
+// carries the exact (gear | cpueKind, sort, stockingFirst) to send to /results.
+//
+// Additive + parity-safe: NEW route, so /filters and /results goldens untouched.
+
+// Rate/unit label for an abundance source. cpue_kind is authoritative per-row
+// (schema v6), so a state that carries more than one kind (MB gear+relative,
+// WI gear+normalized) yields more than one abundance source.
+function deriveAbundanceUnit(gear, kind) {
+  if (kind === 'relative') return 'index';
+  if (kind === 'creel') return 'angler catch rate';
+  if (kind === 'normalized') return 'norm. rate (all gear)';
+  if (gear) {
+    // Units are embedded in several gear strings, e.g.
+    // "index gill net (fish/100yd net)" — surface the parenthetical rate.
+    const m = gear.match(/\(([^)]*(?:\/|per |net|hr|min|mile|yd|hour|angler)[^)]*)\)\s*$/i);
+    if (m) return m[1].trim();
+  }
+  return 'catch rate';
+}
+
+// Strip a trailing "(...)" unit annotation to get a clean gear display name.
+function gearBaseName(gear) {
+  return gear ? gear.replace(/\s*\([^)]*\)\s*$/, '').trim() : gear;
+}
+
+// The three abundance expressions from the notes, keyed by cpue_kind. Catch/unit
+// and creel both read as a rate; relative/rating are rankings; normalized is its
+// own cross-gear rate.
+const ABUNDANCE_EXPRESSION = {
+  gear: 'catch-per-unit', creel: 'catch-per-unit',
+  relative: 'ranking', normalized: 'normalized',
+};
+const KIND_LABEL = {
+  relative: 'Relative abundance', creel: 'Angler catch rate',
+  normalized: 'Normalized catch rate',
+};
+
+function measures(req, res, ctx) {
+  const { state } = req.params;
+  const db = openDb(state, res, ctx);
+  if (!db) return;
+
+  try {
+    const entry = ctx.getStateEntry(state);
+    const wire = entry.wire || {};
+    const wireResults = wire.results || [];
+    const hasCatch = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='fish_catch'").get();
+
+    // Scope (mirror /filters): optional species + county.
+    const speciesParam = req.query.species ? String(req.query.species) : null;
+    const countyParam = req.query.county ? String(req.query.county) : '';
+    const countyList = countyParam
+      ? countyParam.split(',').map(c => c.trim()).filter(Boolean)
+      : [];
+    const speciesAnd = speciesParam ? 'AND fc.species_native = ?' : '';
+    const countyJoin = countyList.length ? 'JOIN lakes l ON l.id = fc.lake_id' : '';
+    const countyAnd = countyList.length
+      ? `AND l.county IN (${countyList.map(() => '?').join(',')})`
+      : '';
+    const args = [...(speciesParam ? [speciesParam] : []), ...countyList];
+
+    if (!hasCatch) {
+      return res.json({ species: speciesParam, county: countyList, measures: [] });
+    }
+
+    const out = [];
+    const canStock = wireResults.includes('stocked_per_100ac') || wireResults.includes('stocked_adults_est');
+    const sizeField = wireResults.includes('average_weight') ? 'average_weight'
+      : wireResults.includes('average_length') ? 'average_length' : null;
+
+    // ── MEASURE: Abundance (sources = gear-cpue per gear, merged
+    //    relative/creel/normalized per kind, and forecast rating). ──
+    const abSources = [];
+
+    // Gear-rate sources: one per gear_category. The gear/unit IS the
+    // comparability distinction (fish/net-night ≠ fish/min-EF), so they never
+    // merge. Client scopes /results by ?gear=<gear>.
+    for (const r of db.prepare(`
+      SELECT fc.gear_category AS gear,
+             COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
+      FROM fish_catch fc ${countyJoin}
+      WHERE fc.cpue_effective IS NOT NULL AND fc.gear_category IS NOT NULL
+        AND (fc.cpue_kind = 'gear' OR fc.cpue_kind IS NULL)
+        ${speciesAnd} ${countyAnd}
+      GROUP BY fc.gear_category
+    `).all(...args)) {
+      abSources.push({
+        id: `gear:${r.gear}`, gear: r.gear, cpueKind: null,
+        expression: 'catch-per-unit', label: gearBaseName(r.gear),
+        unit: deriveAbundanceUnit(r.gear, 'gear'),
+        sort: 'cpue', sortDir: 'desc', stockingFirst: false,
+        records: r.records, lakes: r.lakes,
+      });
+    }
+    // Merged relative/creel/normalized sources (pseudo-gear isn't a method
+    // distinction). Client scopes /results by ?cpueKind=<kind>.
+    for (const r of db.prepare(`
+      SELECT fc.cpue_kind AS kind,
+             COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
+      FROM fish_catch fc ${countyJoin}
+      WHERE fc.cpue_effective IS NOT NULL
+        AND fc.cpue_kind IN ('relative', 'creel', 'normalized')
+        ${speciesAnd} ${countyAnd}
+      GROUP BY fc.cpue_kind
+    `).all(...args)) {
+      abSources.push({
+        id: `kind:${r.kind}`, gear: null, cpueKind: r.kind,
+        expression: ABUNDANCE_EXPRESSION[r.kind] || 'ranking',
+        label: KIND_LABEL[r.kind] || r.kind,
+        unit: deriveAbundanceUnit(null, r.kind),
+        sort: 'cpue', sortDir: 'desc', stockingFirst: false,
+        records: r.records, lakes: r.lakes,
+      });
+    }
+    // Forecast-rating sources: one per gear_category rating bucket. Rating
+    // states (GA/MO/IL/FL/KY/OK) can layer more than one rating SYSTEM over the
+    // SAME lakes — e.g. GA's curated "Best Bet" list plus the standard "Forecast
+    // Rating" — so a single merged rating source listed the same lake twice
+    // (2026-07-21, GA Largemouth Bass: 43 rows / 29 lakes). Owner call: treat
+    // each rating system exactly like a distinct gear type — its own source,
+    // gear-scoped, one defaulted (most records), switchable via the gear/source
+    // filter. Same-species duplicates disappear because only one bucket serves.
+    for (const r of db.prepare(`
+      SELECT fc.gear_category AS gear,
+             COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
+      FROM fish_catch fc ${countyJoin}
+      WHERE fc.rating_ordinal IS NOT NULL AND fc.gear_category IS NOT NULL
+        ${speciesAnd} ${countyAnd}
+      GROUP BY fc.gear_category
+    `).all(...args)) {
+      abSources.push({
+        id: `gear:${r.gear}`, gear: r.gear, cpueKind: null, expression: 'ranking',
+        label: gearBaseName(r.gear), unit: 'rating',
+        sort: 'rating', sortDir: 'desc', stockingFirst: false,
+        records: r.records, lakes: r.lakes,
+      });
+    }
+    // Rating rows carrying no gear_category bucket still deserve a source.
+    const rtNull = db.prepare(`
+      SELECT COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
+      FROM fish_catch fc ${countyJoin}
+      WHERE fc.rating_ordinal IS NOT NULL AND fc.gear_category IS NULL
+        ${speciesAnd} ${countyAnd}
+    `).get(...args);
+    if (rtNull && rtNull.records > 0) {
+      abSources.push({
+        id: 'rating', gear: null, cpueKind: null, expression: 'ranking',
+        label: 'Forecast rating', unit: 'rating',
+        sort: 'rating', sortDir: 'desc', stockingFirst: false,
+        records: rtNull.records, lakes: rtNull.lakes,
+      });
+    }
+    if (abSources.length) {
+      // Catch-per-unit gears lead, then rankings, then by coverage.
+      const exprRank = { 'catch-per-unit': 0, normalized: 1, ranking: 2 };
+      abSources.sort((a, b) =>
+        (exprRank[a.expression] - exprRank[b.expression]) ||
+        (b.records - a.records) || (b.lakes - a.lakes));
+      out.push({
+        id: 'abundance', label: 'Abundance', requiresSource: true,
+        records: abSources.reduce((s, x) => s + x.records, 0),
+        lakes: Math.max(...abSources.map(x => x.lakes)),
+        sources: abSources,
+      });
+    }
+
+    // ── MEASURE: Stocking Impact (survival-model rollup; own source). ──
+    if (canStock) {
+      const stkCountyJoin = countyList.length ? 'JOIN lakes l ON l.id = m.lake_id' : '';
+      const stkSpeciesAnd = speciesParam ? 'AND m.species_native = ?' : '';
+      const st = db.prepare(`
+        SELECT COUNT(*) AS records, COUNT(DISTINCT m.lake_id) AS lakes,
+               SUM(CASE WHEN m.adults_per_100ac IS NOT NULL THEN 1 ELSE 0 END) AS density
+        FROM lake_stocking_metrics m ${stkCountyJoin}
+        WHERE 1=1 ${stkSpeciesAnd} ${countyAnd}
+      `).get(...args);
+      if (st && st.records > 0) {
+        out.push({
+          id: 'stocking', label: 'Stocking Impact', requiresSource: false,
+          records: st.records, lakes: st.lakes,
+          sources: [{
+            id: 'stocking', gear: null, cpueKind: null, expression: 'stocking',
+            label: 'Stocking Impact',
+            unit: st.density > 0 ? 'adults/100ac' : 'est. adults',
+            sort: 'stocked', sortDir: 'desc', stockingFirst: true,
+            records: st.records, lakes: st.lakes, densityRecords: st.density,
+          }],
+        });
+      }
+    }
+
+    // ── MEASURE: Avg Size (length, or weight for MN; source = gear). ──
+    if (sizeField) {
+      const sizeSources = [];
+      for (const r of db.prepare(`
+        SELECT fc.gear_category AS gear,
+               COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes,
+               SUM(CASE WHEN fc.length_derivation = 'measured' THEN 1 ELSE 0 END) AS measured
+        FROM fish_catch fc ${countyJoin}
+        WHERE fc.${sizeField} IS NOT NULL AND fc.gear_category IS NOT NULL
+          ${speciesAnd} ${countyAnd}
+        GROUP BY fc.gear_category
+      `).all(...args)) {
+        sizeSources.push({
+          id: `gear:${r.gear}`, gear: r.gear, cpueKind: null, expression: 'size',
+          label: gearBaseName(r.gear),
+          unit: sizeField === 'average_weight' ? 'lb' : 'in',
+          sort: sizeField === 'average_weight' ? 'weight' : 'length',
+          sortDir: 'desc', stockingFirst: false,
+          records: r.records, lakes: r.lakes,
+          measuredRecords: sizeField === 'average_length' ? r.measured : undefined,
+        });
+      }
+      // Rows with size but NULL gear_category still deserve a source so the
+      // measure is reachable (a few states carry length off a survey-level gear).
+      const nullGear = db.prepare(`
+        SELECT COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
+        FROM fish_catch fc ${countyJoin}
+        WHERE fc.${sizeField} IS NOT NULL AND fc.gear_category IS NULL
+          ${speciesAnd} ${countyAnd}
+      `).get(...args);
+      if (nullGear && nullGear.records > 0) {
+        sizeSources.push({
+          id: 'gear:__any__', gear: null, cpueKind: null, expression: 'size',
+          label: 'All surveys',
+          unit: sizeField === 'average_weight' ? 'lb' : 'in',
+          sort: sizeField === 'average_weight' ? 'weight' : 'length',
+          sortDir: 'desc', stockingFirst: false,
+          records: nullGear.records, lakes: nullGear.lakes,
+        });
+      }
+      if (sizeSources.length) {
+        sizeSources.sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
+        out.push({
+          id: 'size', label: 'Avg Size', requiresSource: true,
+          records: sizeSources.reduce((s, x) => s + x.records, 0),
+          lakes: Math.max(...sizeSources.map(x => x.lakes)),
+          sources: sizeSources,
+        });
+      }
+    }
+
+    // ── MEASURE: Presence — DERIVED UNION of every lake+species across all
+    //    measures (fish_catch ∪ lake_stocking_metrics), the guaranteed terminal
+    //    fallback. Always present (owner call 2026-07-20). ──
+    {
+      const stkCountyJoin = countyList.length ? 'JOIN lakes l2 ON l2.id = m.lake_id' : '';
+      const stkSpeciesAnd = speciesParam ? 'AND m.species_native = ?' : '';
+      const stkCountyAnd = countyList.length
+        ? `AND l2.county IN (${countyList.map(() => '?').join(',')})` : '';
+      const stkArgs = canStock ? [...(speciesParam ? [speciesParam] : []), ...countyList] : [];
+      const unionSql = `
+        SELECT lake_id, species_native FROM fish_catch fc ${countyJoin}
+        WHERE 1=1 ${speciesAnd} ${countyAnd}
+        ${canStock ? `UNION
+        SELECT m.lake_id, m.species_native FROM lake_stocking_metrics m ${stkCountyJoin}
+        WHERE 1=1 ${stkSpeciesAnd} ${stkCountyAnd}` : ''}`;
+      const pu = db.prepare(`
+        SELECT COUNT(*) AS records, COUNT(DISTINCT lake_id) AS lakes
+        FROM (SELECT DISTINCT lake_id, species_native FROM (${unionSql}))
+      `).get(...args, ...stkArgs);
+      out.push({
+        id: 'presence', label: 'Presence', requiresSource: false,
+        records: pu.records, lakes: pu.lakes,
+        sources: [{
+          id: 'presence', gear: null, cpueKind: null, expression: 'presence',
+          label: 'Presence', unit: null,
+          sort: null, sortDir: 'desc', stockingFirst: false, presenceUnion: true,
+          records: pu.records, lakes: pu.lakes,
+        }],
+      });
+    }
+
+    // Measures already pushed in cascade order (abundance, stocking, size,
+    // presence). The client defaults to the first with records; presence is the
+    // terminal fallback. Stamp each measure's default source (most records).
+    for (const m of out) {
+      m.defaultSourceId = m.sources.slice()
+        .sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes))[0]?.id ?? null;
+    }
+
+    res.json({ species: speciesParam, county: countyList, measures: out });
+  } catch (err) {
+    console.error(`[${state}] /measures error:`, err);
+    res.status(500).json({ error: err.message });
+  }
+}
+
 // ── /api/:state/results ────────────────────────────────────────────────────────
 
 function results(req, res, ctx) {
@@ -475,17 +771,47 @@ function results(req, res, ctx) {
       sortDir = 'desc',
       limit = '100',
       offset = '0',
+      stockingFirst,
+      presenceUnion,
     } = req.query;
 
     // Validate and clamp numeric query params (identical to legacy).
     const limitNum = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
     const offsetNum = Math.max(parseInt(offset, 10) || 0, 0);
 
+    // Presence measure (DATA_MODEL §1): the DERIVED UNION of every lake+species
+    // across all measures — fish_catch ∪ lake_stocking_metrics — so it's the
+    // guaranteed terminal fallback that lists everything we know is present.
+    // Opt-in via ?presenceUnion=1.
+    if (presenceUnion === 'true' || presenceUnion === '1') {
+      return presenceUnionResults(req, res, { db, state, entry, wire,
+        species, county, lakeName, limitNum, offsetNum });
+    }
+
+    // Stocking measure (DATA_MODEL §1 / §5): drive results from
+    // lake_stocking_metrics so stocked-but-unsurveyed lakes surface, with the
+    // most-recent survey row LEFT-joined for any size/abundance we do have.
+    // Opt-in via ?stockingFirst=1 — absent, the legacy fish_catch path below is
+    // byte-identical, so the parity goldens are untouched.
+    if (stockingFirst === 'true' || stockingFirst === '1') {
+      return stockingFirstResults(req, res, { db, state, entry, wire, f,
+        species, county, minStocked, maxStocked, sortDir, limitNum, offsetNum });
+    }
+
     const conditions = [];
     const params = [];
 
     if (species)          { conditions.push('fc.species_native = ?'); params.push(species); }
     if (lakeName?.trim()) { conditions.push('LOWER(l.name) LIKE LOWER(?)'); params.push(`%${lakeName.trim()}%`); }
+
+    // Comparability-class scope (DATA_SERVING_FRAMEWORK): the merged
+    // relative/creel/normalized lenses discriminate by cpue_kind rather than a
+    // real sampling gear (their pseudo-gear isn't a method distinction), so the
+    // client sends ?cpueKind=<kind> to confine a cpue sort to one CC and never
+    // mix, e.g., a 0–5 relative index with a fish/net gear rate. Optional —
+    // absent, the legacy path is byte-identical (parity goldens untouched).
+    const { cpueKind } = req.query;
+    if (cpueKind) { conditions.push('fc.cpue_kind = ?'); params.push(String(cpueKind)); }
 
     if (gear) {
       const gears = gear.split(',').filter(Boolean);
@@ -565,6 +891,12 @@ function results(req, res, ctx) {
           cteParams.push(...gears);
         }
       }
+      // Scope the most-recent computation to the same comparability class as the
+      // outer filter (DATA_MODEL): without this, "most recent survey per lake"
+      // spans all kinds, so a relative/creel/normalized source loses every lake
+      // whose latest survey happened to be a gear row. cpueKind is only sent by
+      // the measure model, so legacy goldens never hit this (parity-safe).
+      if (cpueKind) { subConds.push('fc2.cpue_kind = ?'); cteParams.push(String(cpueKind)); }
       // IA: exclude consolidated rollup rows from the most-recent calculation.
       if (f.mostRecentBy === 'survey_date_not_null') subConds.push('s2.survey_date IS NOT NULL');
 
@@ -709,25 +1041,178 @@ function results(req, res, ctx) {
       rows = rows.filter(r => r.stocked_per_100ac != null && r.stocked_per_100ac <= parseFloat(maxStocked));
     }
 
-    for (const r of rows) coerceWireIds(entry, r);
-
-    // Preview mode (non-subscriber browsing a paid state — flag set by the
-    // entitlement middleware): every metric ships, but lake identity is
-    // withheld server-side so identifying fields never reach an unentitled
-    // device. The client renders a blurred placeholder where the name would
-    // go and drops the county/acres line. lake_id stays on the wire — it
-    // keys rows/scatter dots and the (also-redacted) /lake/:id fetch.
-    if (req.lakeLorePreview) {
-      for (const r of rows) {
-        redactPreviewFields(r, PREVIEW_REDACT_RESULT);
-        if (r.lake_id != null) r.lake_id = previewId(state, String(r.lake_id));
-        if (r.survey_id != null) r.survey_id = previewId(state, String(r.survey_id));
-      }
-      return res.json({ total, preview: true, results: rows });
-    }
-    res.json({ total, results: rows });
+    return finishResults(req, res, state, entry, rows, total);
   } catch (err) {
     console.error(`[${state}] /results (canonical) error:`, err);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// Shared results tail: id coercion + preview redaction. Used by both the legacy
+// fish_catch path and the stocking-first path so identity redaction and id
+// hashing stay in one place.
+function finishResults(req, res, state, entry, rows, total) {
+  for (const r of rows) coerceWireIds(entry, r);
+
+  // Preview mode (non-subscriber browsing a paid state — flag set by the
+  // entitlement middleware): every metric ships, but lake identity is withheld
+  // server-side so identifying fields never reach an unentitled device. The
+  // client renders a blurred placeholder where the name would go and drops the
+  // county/acres line. lake_id stays on the wire — it keys rows/scatter dots
+  // and the (also-redacted) /lake/:id fetch.
+  if (req.lakeLorePreview) {
+    for (const r of rows) {
+      redactPreviewFields(r, PREVIEW_REDACT_RESULT);
+      if (r.lake_id != null) r.lake_id = previewId(state, String(r.lake_id));
+      if (r.survey_id != null) r.survey_id = previewId(state, String(r.survey_id));
+    }
+    return res.json({ total, preview: true, results: rows });
+  }
+  return res.json({ total, results: rows });
+}
+
+// Stocking-lens results (DATA_SERVING_FRAMEWORK §5). Drives from
+// lake_stocking_metrics rather than fish_catch, LEFT-joining the most-recent
+// survey row per lake+species so a stocked-but-unsurveyed lake still appears
+// (with NULL abundance/size) and a surveyed one shows its latest metrics
+// alongside the stocking figure. Ranks density-then-absolute like the legacy
+// stocked sort. Reuses the wire.results projection so the row shape is identical
+// to the normal path; goes through finishResults for preview redaction.
+function stockingFirstResults(req, res, opts) {
+  const { db, state, entry, wire, species, county, minStocked, maxStocked,
+          sortDir, limitNum, offsetNum } = opts;
+  try {
+    const countyList = county
+      ? String(county).split(',').map(c => c.trim()).filter(Boolean)
+      : [];
+    const conds = [];
+    const args = [];
+    if (species) { conds.push('m.species_native = ?'); args.push(String(species)); }
+    if (countyList.length) {
+      conds.push(`l.county IN (${countyList.map(() => '?').join(',')})`);
+      args.push(...countyList);
+    }
+    const whereClause = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+    const dir = sortDir === 'asc' ? 'ASC' : 'DESC';
+
+    // wire.results projection, but sourced from m (stocking) + l (lake) + the
+    // LEFT-joined most-recent fc/s. The stocked_* fields read m.* here.
+    const src = { ...RESULTS_SRC,
+      stocked_per_100ac: 'm.adults_per_100ac AS stocked_per_100ac',
+      stocked_adults_est: 'm.adults_est AS stocked_adults_est',
+      species: 'm.species_native AS species',
+      species_name: 'COALESCE(fc.species_name, m.species_name) AS species_name',
+    };
+    const selectCols = projectCols(wire.results, cpueSrc(src, entry), 'results');
+
+    // At most one fc row (most recent survey) per stocked lake+species.
+    const joins = `
+      FROM lake_stocking_metrics m
+      JOIN lakes l ON l.id = m.lake_id
+      LEFT JOIN fish_catch fc ON fc.id = (
+        SELECT fc2.id FROM fish_catch fc2
+        JOIN surveys s2 ON s2.id = fc2.survey_id
+        WHERE fc2.lake_id = m.lake_id AND fc2.species_native = m.species_native
+        ORDER BY s2.survey_year DESC, fc2.id DESC LIMIT 1)
+      LEFT JOIN surveys s ON s.id = fc.survey_id
+      ${whereClause}`;
+
+    const total = db.prepare(`SELECT COUNT(*) AS n ${joins}`).get(...args).n;
+    let rows = db.prepare(`
+      SELECT ${selectCols} ${joins}
+      ORDER BY (m.adults_per_100ac IS NULL) ASC,
+               COALESCE(m.adults_per_100ac, m.adults_est) ${dir} NULLS LAST,
+               l.name ASC
+      LIMIT ? OFFSET ?
+    `).all(...args, limitNum, offsetNum);
+
+    if (minStocked !== undefined && minStocked !== '') {
+      rows = rows.filter(r => r.stocked_per_100ac != null && r.stocked_per_100ac >= parseFloat(minStocked));
+    }
+    if (maxStocked !== undefined && maxStocked !== '') {
+      rows = rows.filter(r => r.stocked_per_100ac != null && r.stocked_per_100ac <= parseFloat(maxStocked));
+    }
+
+    return finishResults(req, res, state, entry, rows, total);
+  } catch (err) {
+    console.error(`[${state}] /results stockingFirst error:`, err);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// Presence-measure results (DATA_MODEL §1): the derived UNION of every
+// lake+species we know is present — fish_catch (abundance/size/presence rows)
+// ∪ lake_stocking_metrics (stocked, incl. never-surveyed lakes) — one row per
+// lake+species, with the most-recent survey row's metrics LEFT-joined where
+// they exist. This is the guaranteed terminal fallback in the measure cascade.
+// Reuses wire.results so the row shape matches the normal path; preview
+// redaction goes through finishResults.
+function presenceUnionResults(req, res, opts) {
+  const { db, state, entry, wire, species, county, lakeName, limitNum, offsetNum } = opts;
+  try {
+    const wireResults = wire.results || [];
+    const canStock = wireResults.includes('stocked_per_100ac') || wireResults.includes('stocked_adults_est');
+    const countyList = county
+      ? String(county).split(',').map(c => c.trim()).filter(Boolean)
+      : [];
+
+    // Build the union key-set (lake_id, species_native), scoped to species/county.
+    const fcConds = [], fcArgs = [];
+    if (species) { fcConds.push('fc.species_native = ?'); fcArgs.push(String(species)); }
+    const fcWhere = fcConds.length ? 'WHERE ' + fcConds.join(' AND ') : '';
+    const stkConds = [], stkArgs = [];
+    if (species) { stkConds.push('m.species_native = ?'); stkArgs.push(String(species)); }
+    const stkWhere = stkConds.length ? 'WHERE ' + stkConds.join(' AND ') : '';
+
+    const unionKeys = `
+      SELECT DISTINCT lake_id, species_native FROM (
+        SELECT fc.lake_id, fc.species_native FROM fish_catch fc ${fcWhere}
+        ${canStock ? `UNION
+        SELECT m.lake_id, m.species_native FROM lake_stocking_metrics m ${stkWhere}` : ''}
+      )`;
+
+    // Project wire.results from the union, joined to the lake and the most-recent
+    // fc row per key (for any metrics), and the stocking metric row.
+    const src = { ...RESULTS_SRC,
+      lake_id: 'k.lake_id AS lake_id',
+      species: 'k.species_native AS species',
+      species_name: 'COALESCE(fc.species_name, m.species_name) AS species_name',
+      stocked_per_100ac: 'm.adults_per_100ac AS stocked_per_100ac',
+      stocked_adults_est: 'm.adults_est AS stocked_adults_est',
+    };
+    const selectCols = projectCols(wire.results, cpueSrc(src, entry), 'results');
+
+    const outConds = [], outArgs = [];
+    if (lakeName && lakeName.trim()) { outConds.push('LOWER(l.name) LIKE LOWER(?)'); outArgs.push(`%${lakeName.trim()}%`); }
+    if (countyList.length) { outConds.push(`l.county IN (${countyList.map(() => '?').join(',')})`); outArgs.push(...countyList); }
+    const outWhere = outConds.length ? 'WHERE ' + outConds.join(' AND ') : '';
+
+    const joins = `
+      FROM (${unionKeys}) k
+      JOIN lakes l ON l.id = k.lake_id
+      LEFT JOIN fish_catch fc ON fc.id = (
+        SELECT fc2.id FROM fish_catch fc2
+        JOIN surveys s2 ON s2.id = fc2.survey_id
+        WHERE fc2.lake_id = k.lake_id AND fc2.species_native = k.species_native
+        ORDER BY s2.survey_year DESC, fc2.id DESC LIMIT 1)
+      LEFT JOIN surveys s ON s.id = fc.survey_id
+      ${canStock ? 'LEFT JOIN lake_stocking_metrics m ON m.lake_id = k.lake_id AND m.species_native = k.species_native' : ''}
+      ${outWhere}`;
+    // When the state can't stock, there's no m table alias — null the stocked cols.
+    const joinsFixed = canStock ? joins
+      : joins.replace('m.adults_per_100ac', 'NULL').replace('m.adults_est', 'NULL').replace('m.species_name', 'NULL');
+
+    const allArgs = [...fcArgs, ...stkArgs, ...outArgs];
+    const total = db.prepare(`SELECT COUNT(*) AS n ${joinsFixed}`).get(...allArgs).n;
+    const rows = db.prepare(`
+      SELECT ${selectCols} ${joinsFixed}
+      ORDER BY l.name ASC, k.species_native ASC
+      LIMIT ? OFFSET ?
+    `).all(...allArgs, limitNum, offsetNum);
+
+    return finishResults(req, res, state, entry, rows, total);
+  } catch (err) {
+    console.error(`[${state}] /results presenceUnion error:`, err);
     res.status(500).json({ error: err.message });
   }
 }
@@ -871,4 +1356,4 @@ function lakeDetail(req, res, ctx) {
   }
 }
 
-module.exports = { filters, results, lakeDetail };
+module.exports = { filters, measures, results, lakeDetail };

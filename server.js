@@ -765,6 +765,16 @@ app.get('/api/:state/filters', (req, res) => {
   return canonical.filters(req, res, canonicalCtx);
 });
 
+// ── /api/:state/measures ─────────────────────────────────────────────────────
+// Measure × Gear/Source manifest (DATA_MODEL_PROPOSAL_2026-07-20). The app builds
+// its Measure selector + Gear/Source filter from this: a stable set of measures
+// (Abundance / Avg Size / Stocking Impact / Presence) with the gear/source
+// options nested under the ones that require them.
+app.get('/api/:state/measures', (req, res) => {
+  if (!validateState(req, res)) return;
+  return canonical.measures(req, res, canonicalCtx);
+});
+
 // ── /api/:state/results ────────────────────────────────────────────────────────
 
 app.get('/api/:state/results', (req, res) => {

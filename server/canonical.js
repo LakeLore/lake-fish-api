@@ -525,8 +525,30 @@ function measures(req, res, ctx) {
 
     const out = [];
     const canStock = wireResults.includes('stocked_per_100ac') || wireResults.includes('stocked_adults_est');
-    const sizeField = wireResults.includes('average_weight') ? 'average_weight'
-      : wireResults.includes('average_length') ? 'average_length' : null;
+    // Avg Size resolves to length OR weight. Most states carry only one, but a
+    // few carry BOTH on the wire — MI added a weight overlay on top of its
+    // original length data (mostly the same rows); TN/GA creel report weight
+    // alongside sparse/absent length. When both exist, pick the metric with MORE
+    // real coverage in THIS scope — i.e. prefer length unless weight strictly
+    // exceeds it — so we surface the richer metric (MI -> length, TN/GA ->
+    // weight) and stay consistent with the scatter, instead of weight always
+    // winning just because the column is present (the 2026-07-25 MI report).
+    const hasWeightWire = wireResults.includes('average_weight');
+    const hasLengthWire = wireResults.includes('average_length');
+    let sizeField;
+    if (hasWeightWire && hasLengthWire) {
+      const sizeCount = (col) => db.prepare(`
+        SELECT COUNT(*) AS n FROM fish_catch fc ${countyJoin}
+        WHERE fc.${col} IS NOT NULL AND fc.${col} > 0 ${speciesAnd} ${countyAnd}
+      `).get(...args).n;
+      sizeField = sizeCount('average_weight') > sizeCount('average_length') ? 'average_weight' : 'average_length';
+    } else if (hasWeightWire) {
+      sizeField = 'average_weight';
+    } else if (hasLengthWire) {
+      sizeField = 'average_length';
+    } else {
+      sizeField = null;
+    }
 
     // ── MEASURE: Abundance (sources = gear-cpue per gear, merged
     //    relative/creel/normalized per kind, and forecast rating). ──

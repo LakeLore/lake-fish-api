@@ -89,6 +89,13 @@ function resolvePreviewLakeId(state, db, pid) {
   }
   return map.get(pid) || null;
 }
+// Invalidate the cached reverse map for a state. MUST be called whenever the
+// state's DB is swapped without a process restart (POST /reload), or a preview
+// user tapping a lake ADDED by the refresh 404s on /lake/:id until restart —
+// the exact scenario /reload exists to avoid.
+function clearPreviewLakeIdMap(state) {
+  _previewLakeIdMaps.delete(state);
+}
 
 // Map wire field name -> SQL source expression for /results.
 // species maps to species_native (registry speciesWire=native): the exact
@@ -545,14 +552,61 @@ function measures(req, res, ctx) {
         records: r.records, lakes: r.lakes,
       });
     }
-    // Merged relative/creel/normalized sources (pseudo-gear isn't a method
-    // distinction). Client scopes /results by ?cpueKind=<kind>.
+    // Normalized catch rate — the ONE genuinely cross-gear comparable metric
+    // (WI's α-calibrated rate). It is meant to be a single number spanning
+    // gears, so it stays one merged source scoped by ?cpueKind=normalized.
+    for (const r of db.prepare(`
+      SELECT fc.cpue_kind AS kind,
+             COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
+      FROM fish_catch fc ${countyJoin}
+      WHERE fc.cpue_effective IS NOT NULL AND fc.cpue_kind = 'normalized'
+        ${speciesAnd} ${countyAnd}
+      GROUP BY fc.cpue_kind
+    `).all(...args)) {
+      abSources.push({
+        id: `kind:${r.kind}`, gear: null, cpueKind: r.kind,
+        expression: ABUNDANCE_EXPRESSION[r.kind] || 'ranking',
+        label: KIND_LABEL[r.kind] || r.kind,
+        unit: deriveAbundanceUnit(null, r.kind),
+        sort: 'cpue', sortDir: 'desc', stockingFirst: false,
+        records: r.records, lakes: r.lakes,
+      });
+    }
+    // Relative + creel — each distinct gear_category is its OWN source, exactly
+    // like the gear-rate sources above. A LIFA 0–5 rating, a % species
+    // composition, and a historical gill-net index are NOT one comparable thing,
+    // so merging them by cpue_kind produced an incoherent sort and a mixed-unit
+    // list with no gear selected (the MB walleye bug). Each gear_category is
+    // unique to one cpue_kind, so scoping /results by ?gear=<gear_category> is
+    // exact. Default falls to whichever source (gear or relative) has the most
+    // records, per the model.
+    for (const r of db.prepare(`
+      SELECT fc.gear_category AS gear, fc.cpue_kind AS kind,
+             COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
+      FROM fish_catch fc ${countyJoin}
+      WHERE fc.cpue_effective IS NOT NULL
+        AND fc.cpue_kind IN ('relative', 'creel') AND fc.gear_category IS NOT NULL
+        ${speciesAnd} ${countyAnd}
+      GROUP BY fc.gear_category, fc.cpue_kind
+    `).all(...args)) {
+      abSources.push({
+        id: `${r.kind}:${r.gear}`, gear: r.gear, cpueKind: null,
+        expression: ABUNDANCE_EXPRESSION[r.kind] || 'ranking',
+        label: gearBaseName(r.gear),
+        unit: deriveAbundanceUnit(r.gear, r.kind),
+        sort: 'cpue', sortDir: 'desc', stockingFirst: false,
+        records: r.records, lakes: r.lakes,
+      });
+    }
+    // Catch-all: relative/creel rows with NO gear_category can't be gear-scoped,
+    // so keep a merged-by-kind source (scoped by ?cpueKind) so they aren't lost.
+    // Rare — only where a state stored a relative value with no survey label.
     for (const r of db.prepare(`
       SELECT fc.cpue_kind AS kind,
              COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
       FROM fish_catch fc ${countyJoin}
       WHERE fc.cpue_effective IS NOT NULL
-        AND fc.cpue_kind IN ('relative', 'creel', 'normalized')
+        AND fc.cpue_kind IN ('relative', 'creel') AND fc.gear_category IS NULL
         ${speciesAnd} ${countyAnd}
       GROUP BY fc.cpue_kind
     `).all(...args)) {
@@ -582,7 +636,12 @@ function measures(req, res, ctx) {
       GROUP BY fc.gear_category
     `).all(...args)) {
       abSources.push({
-        id: `gear:${r.gear}`, gear: r.gear, cpueKind: null, expression: 'ranking',
+        // `rating:` namespace, NOT `gear:` — a few states (AB/AR/WI) carry BOTH
+        // a real CPUE and a forecast rating in the same gear_category bucket, so
+        // a shared `gear:<g>` id collided with the catch-per-unit source above
+        // (ambiguous defaultSourceId + React key collision). Distinct ids keep
+        // the two abundance expressions for that gear separable.
+        id: `rating:${r.gear}`, gear: r.gear, cpueKind: null, expression: 'ranking',
         label: gearBaseName(r.gear), unit: 'rating',
         sort: 'rating', sortDir: 'desc', stockingFirst: false,
         records: r.records, lakes: r.lakes,
@@ -795,7 +854,7 @@ function results(req, res, ctx) {
     // byte-identical, so the parity goldens are untouched.
     if (stockingFirst === 'true' || stockingFirst === '1') {
       return stockingFirstResults(req, res, { db, state, entry, wire, f,
-        species, county, minStocked, maxStocked, sortDir, limitNum, offsetNum });
+        species, county, lakeName, minStocked, maxStocked, sortDir, limitNum, offsetNum });
     }
 
     const conditions = [];
@@ -804,12 +863,13 @@ function results(req, res, ctx) {
     if (species)          { conditions.push('fc.species_native = ?'); params.push(species); }
     if (lakeName?.trim()) { conditions.push('LOWER(l.name) LIKE LOWER(?)'); params.push(`%${lakeName.trim()}%`); }
 
-    // Comparability-class scope (DATA_SERVING_FRAMEWORK): the merged
-    // relative/creel/normalized lenses discriminate by cpue_kind rather than a
-    // real sampling gear (their pseudo-gear isn't a method distinction), so the
-    // client sends ?cpueKind=<kind> to confine a cpue sort to one CC and never
-    // mix, e.g., a 0–5 relative index with a fish/net gear rate. Optional —
-    // absent, the legacy path is byte-identical (parity goldens untouched).
+    // cpueKind scope (DATA_MODEL_PROPOSAL_2026-07-20): the merged
+    // relative/creel/normalized Abundance sources discriminate by cpue_kind
+    // rather than a real sampling gear (their pseudo-gear isn't a method
+    // distinction), so the client sends ?cpueKind=<kind> to confine a cpue sort
+    // to one kind and never mix, e.g., a 0–5 relative index with a fish/net gear
+    // rate. Optional — absent, the legacy path is byte-identical (parity
+    // goldens untouched).
     const { cpueKind } = req.query;
     if (cpueKind) { conditions.push('fc.cpue_kind = ?'); params.push(String(cpueKind)); }
 
@@ -1071,7 +1131,7 @@ function finishResults(req, res, state, entry, rows, total) {
   return res.json({ total, results: rows });
 }
 
-// Stocking-lens results (DATA_SERVING_FRAMEWORK §5). Drives from
+// Stocking Impact measure results (DATA_MODEL_PROPOSAL_2026-07-20). Drives from
 // lake_stocking_metrics rather than fish_catch, LEFT-joining the most-recent
 // survey row per lake+species so a stocked-but-unsurveyed lake still appears
 // (with NULL abundance/size) and a surveyed one shows its latest metrics
@@ -1079,7 +1139,7 @@ function finishResults(req, res, state, entry, rows, total) {
 // stocked sort. Reuses the wire.results projection so the row shape is identical
 // to the normal path; goes through finishResults for preview redaction.
 function stockingFirstResults(req, res, opts) {
-  const { db, state, entry, wire, species, county, minStocked, maxStocked,
+  const { db, state, entry, wire, species, county, lakeName, minStocked, maxStocked,
           sortDir, limitNum, offsetNum } = opts;
   try {
     const countyList = county
@@ -1088,6 +1148,10 @@ function stockingFirstResults(req, res, opts) {
     const conds = [];
     const args = [];
     if (species) { conds.push('m.species_native = ?'); args.push(String(species)); }
+    // Honor lake-name search on the stocking measure too (the presence-union
+    // path already does). Without this, typing a lake name while on Stocking
+    // Impact returned the unfiltered stocked list — results looked wrong.
+    if (lakeName && lakeName.trim()) { conds.push('LOWER(l.name) LIKE LOWER(?)'); args.push(`%${lakeName.trim()}%`); }
     if (countyList.length) {
       conds.push(`l.county IN (${countyList.map(() => '?').join(',')})`);
       args.push(...countyList);
@@ -1356,4 +1420,4 @@ function lakeDetail(req, res, ctx) {
   }
 }
 
-module.exports = { filters, measures, results, lakeDetail };
+module.exports = { filters, measures, results, lakeDetail, clearPreviewLakeIdMap };

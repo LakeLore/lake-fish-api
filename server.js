@@ -804,6 +804,11 @@ app.post('/api/:state/reload', requireReloadToken, (req, res) => {
     delete _dbs[state];
   }
 
+  // Drop the cached preview-id reverse map: the replaced artifact may have
+  // added lakes, and a stale map 404s /lake/:id for preview users tapping a
+  // new lake until a full restart (defeating /reload's whole purpose).
+  canonical.clearPreviewLakeIdMap(state);
+
   // Clear the unhealthy flag so the reopen re-validates the (possibly
   // replaced) artifact's schema from scratch.
   _canonicalUnhealthy.delete(state);

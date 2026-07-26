@@ -1308,7 +1308,12 @@ function presenceUnionResults(req, res, opts) {
 function lakeDetail(req, res, ctx) {
   const { state } = req.params;
   let { id } = req.params;
-  if (!/^[\w-]+$/.test(id)) return res.status(400).json({ error: 'Invalid lake id' });
+  // Leading/embedded spaces are allowed (2026-07-25): IN carries 15 lakes
+  // whose SOURCE ids are space-prefixed (' -17', ' -149', …) — the old
+  // /^[\w-]+$/ 400'd every detail tap on them for entitled users (preview
+  // users were unaffected via hashed ids). Found by the T3.2 deep-readyz
+  // wire probe. Still no dots/slashes — path-traversal stays impossible.
+  if (!/^[\w -]{1,64}$/.test(id)) return res.status(400).json({ error: 'Invalid lake id' });
   const db = openDb(state, res, ctx);
   if (!db) return;
 

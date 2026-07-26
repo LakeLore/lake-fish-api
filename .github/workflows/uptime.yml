@@ -66,6 +66,36 @@ jobs:
           CODE=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' 'https://lake-fish-api.fly.dev/api/tx/results?species=Largemouth+Bass&limit=1')
           echo "tx results (preview): $CODE"
           [ "$CODE" = "200" ] || { echo "::error::tx /results returned $CODE"; exit 1; }
+      - name: rotating-state probe
+        # (2026-07-25, T3.9-adjacent) mn/tx alone left 54 states' wire paths
+        # unwatched. Rotate through the whole active fleet by run number —
+        # every state gets probed roughly every 12.5 hours. /measures rides
+        # along (the newest endpoint had ZERO probe coverage).
+        run: |
+          STATES=(mn sd nd ia ne wi mi wa mt ks mo il in oh fl ga al tn ky nc va or id wy ut co nm nv ca ok tx ny pa ar la me ct md nh ak ms wv vt on hi nj bc mb sk ab)
+          ST=${STATES[$(( ${{ github.run_number }} % ${#STATES[@]} ))]}
+          echo "probing state: $ST"
+          CODE=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' "https://lake-fish-api.fly.dev/api/$ST/results?limit=1")
+          echo "$ST results: $CODE"
+          [ "$CODE" = "200" ] || { echo "::error::$ST /results returned $CODE"; exit 1; }
+          CODE=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' "https://lake-fish-api.fly.dev/api/$ST/measures")
+          echo "$ST measures: $CODE"
+          [ "$CODE" = "200" ] || { echo "::error::$ST /measures returned $CODE"; exit 1; }
+      - name: client-config
+        # The kill-switch/upgrade lever (T1.1) — if this breaks silently we
+        # lose the one mechanism that reaches shipped binaries.
+        run: |
+          BODY=$(curl -sS --max-time 20 https://lake-fish-api.fly.dev/api/client-config)
+          echo "client-config: $BODY"
+          echo "$BODY" | grep -q killedVersions || { echo "::error::/api/client-config malformed"; exit 1; }
+      - name: entitlement route
+        # Asserts the entitlement path RESPONDS (a full RC-outage probe needs
+        # a known test-subscriber id — plan T3.3). Any 5xx here means the
+        # subscription check itself is broken for everyone.
+        run: |
+          CODE=$(curl -sS -o /dev/null --max-time 20 -H 'X-User-Id: uptime-probe' -w '%{http_code}' https://lake-fish-api.fly.dev/api/me/entitlement)
+          echo "me/entitlement: $CODE"
+          [ "$CODE" = "200" ] || { echo "::error::/api/me/entitlement returned $CODE"; exit 1; }
       - name: marketing site
         run: |
           CODE=$(curl -sS -o /dev/null -L --max-time 20 -w '%{http_code}' https://lakeloreapp.com)

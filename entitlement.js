@@ -263,14 +263,20 @@ function saveLastGoodSoon() {
 
 // Hourly RC-error-rate telemetry: individual failures already warn per
 // request, but a sustained outage should be visible as one summarizable
-// signal in the logs.
+// signal in the logs. Cumulative counters ride /healthz?deep=1 (2026-07-25,
+// T3.3-lite) so the log-buffer's zero retention no longer erases the
+// evidence — a probe can assert "RC errors not climbing" and "webhooks
+// arriving" from outside.
 let _rcErrorCount = 0;
+const stats = { rcErrorsTotal: 0, rcErrorsLastHour: 0, webhooksTotal: 0, lastWebhookAt: null };
 setInterval(() => {
+  stats.rcErrorsLastHour = _rcErrorCount;
   if (_rcErrorCount > 0) {
     console.warn(`[rc] ${_rcErrorCount} RevenueCat lookup errors in the last hour`);
     _rcErrorCount = 0;
   }
 }, 60 * 60 * 1000).unref?.();
+function noteWebhook() { stats.webhooksTotal++; stats.lastWebhookAt = new Date().toISOString(); }
 
 async function checkEntitlement(userId) {
   if (!userId) return { hasAllStates: false, expiresAt: null, source: 'no-user-id' };
@@ -296,6 +302,7 @@ async function checkEntitlement(userId) {
     if (_lastGood.delete(userId)) saveLastGoodSoon();
   } else {
     _rcErrorCount++;
+    stats.rcErrorsTotal++;
     // RC errored. Serve the last-known-good entitlement inside the grace
     // window instead of 402ing a paying customer during an outage.
     const good = _lastGood.get(userId);
@@ -310,6 +317,14 @@ async function checkEntitlement(userId) {
   // we don't hammer RC during a sustained outage.
   const ttl = result.error ? 30_000 : CACHE_TTL_MS;
   _cache.set(userId, { ...result, fetchedAt: now, _ttl: ttl });
+  // Bound the user-keyed cache (2026-07-25, T3.5): keyed by CLIENT-SUPPLIED
+  // X-User-Id, so a caller cycling random ids inside the rate budget grows it
+  // without limit on a 512 MB machine. Map iteration order = insertion order;
+  // evicting the oldest ~10% keeps this O(1) amortized.
+  if (_cache.size > 10_000) {
+    let drop = 1_000;
+    for (const k of _cache.keys()) { _cache.delete(k); if (--drop <= 0) break; }
+  }
   return result;
 }
 
@@ -384,4 +399,6 @@ module.exports = {
   invalidateCache,
   gateByState,
   _resetAllStatesEntitlementId,
+  stats,
+  noteWebhook,
 };

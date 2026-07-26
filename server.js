@@ -31,7 +31,7 @@ const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
 const rateLimit = require('express-rate-limit');
-const { gateByState, checkEntitlement, invalidateCache } = require('./entitlement');
+const { gateByState, checkEntitlement, invalidateCache, stats: entitlementStats, noteWebhook } = require('./entitlement');
 
 // ── Canonical data layer (lakelore-data) — REQUIRED ────────────────────────────
 // The registry (states.json), species map, canonical-schema assertion, and the
@@ -170,7 +170,28 @@ app.get('/healthz', (req, res) => {
     }
     states[state] = entry;
   }
-  res.json({ ok: true, states, sig: { ..._sigStats }, attest: { ...require('./server/attest').stats } });
+  // Observability block (2026-07-25, T3.5/T3.3-lite): the hourly [sig]/[ver]/
+  // [rc] log lines are the documented evidence for the RUNBOOK §16 enforcement
+  // flips — and Fly's log buffer retains none of it. Cumulative counters +
+  // memory/disk/jsonl gauges here make them probe-assertable from outside.
+  let disk = null;
+  try {
+    const s = fs.statfsSync(process.env.LAKELORE_DB_DIR || '/data');
+    disk = { freeMb: Math.round(s.bavail * s.bsize / 1048576), totalMb: Math.round(s.blocks * s.bsize / 1048576) };
+  } catch { /* local dev without /data */ }
+  const jsonl = {};
+  for (const f of ['feedback.jsonl', 'subscribers.jsonl']) {
+    try { jsonl[f] = fs.statSync(path.join(process.env.LAKELORE_DB_DIR || '/data', f)).size; } catch { /* absent */ }
+  }
+  res.json({
+    ok: true, states,
+    sig: { ..._sigStats },
+    ver: Object.fromEntries(_verStats),
+    attest: { ...require('./server/attest').stats },
+    rc: { ...entitlementStats },
+    memRssMb: Math.round(process.memoryUsage().rss / 1048576),
+    disk, jsonl,
+  });
 });
 
 // ── /readyz — data-aware readiness (IMPROVEMENT_PLAN 1.10) ─────────────────
@@ -184,6 +205,35 @@ app.get('/healthz', (req, res) => {
 // corrupts afterward 500s every request for that state while shallow /readyz
 // stays green. Deep results are cached 60 s (56 full COUNT scans over small
 // lakes tables ≈ cheap, but not per-probe cheap); deploy-data.sh polls deep.
+// Execute the REAL results + lake-detail handlers for one lake of one state
+// with a mock req/res (better-sqlite3 is synchronous, so both handlers
+// complete inline). Returns null on success or a short failure tag.
+function _mockRes() {
+  const r = { statusCode: 200, body: null, headersSent: false };
+  r.status = (c) => { r.statusCode = c; return r; };
+  r.json = (b) => { r.body = b; r.headersSent = true; return r; };
+  r.set = () => r; r.setHeader = () => r; r.type = () => r;
+  return r;
+}
+function probeState(state) {
+  const db = getDb(state);
+  if (!db) return 'no-db';
+  // Prefer a lake that actually has catch rows (exercises the full catches
+  // projection), and skip blank/whitespace ids (IN carries a lake with
+  // id=' ' — a raw-source artifact that 400s by design).
+  const lake = db.prepare(`SELECT lake_id AS id FROM fish_catch WHERE length(trim(lake_id)) > 0 LIMIT 1`).get()
+    ?? db.prepare(`SELECT id FROM lakes WHERE length(trim(id)) > 0 LIMIT 1`).get();
+  if (!lake) return 'no-lakes';
+  const mkReq = (params, query) => ({ params, query, get: () => undefined, lakeLorePreview: false, ip: 'probe' });
+  let r = _mockRes();
+  canonical.results(mkReq({ state }, { pageSize: '1' }), r, canonicalCtx);
+  if (r.statusCode !== 200) return `results:${r.statusCode}`;
+  r = _mockRes();
+  canonical.lakeDetail(mkReq({ state, id: String(lake.id) }, {}), r, canonicalCtx);
+  if (r.statusCode !== 200) return `lake:${r.statusCode}`;
+  return null;
+}
+
 let _deepReadyCache = { at: 0, bad: null };
 app.get('/readyz', (req, res) => {
   const deep = req.query.deep === '1';
@@ -198,7 +248,14 @@ app.get('/readyz', (req, res) => {
         const db = getDb(state);
         if (!db) { bad.push(`${state}:no-db`); continue; }
         if (_canonicalUnhealthy.has(state)) { bad.push(`${state}:schema`); continue; }
-        if (deep) db.prepare('SELECT COUNT(*) AS n FROM lakes').get();
+        if (deep) {
+          // Real wire-projection probe (2026-07-25, T3.2 — was COUNT(*)): the
+          // projection assembled from registry wire lists THROWS on any
+          // unmapped field, 500ing /results and /lake while a COUNT stays
+          // green. Execute the actual handlers against one lake per state.
+          const probeErr = probeState(state);
+          if (probeErr) { bad.push(`${state}:${probeErr}`); continue; }
+        }
       } catch (e) {
         bad.push(`${state}:${e.message.slice(0, 40)}`);
       }
@@ -601,6 +658,7 @@ app.post('/webhooks/revenuecat', (req, res) => {
   } else {
     console.warn('[webhook] REVENUECAT_WEBHOOK_AUTH not set — accepting unsigned events (dev only)');
   }
+  noteWebhook();
   const userId = req.body?.event?.app_user_id;
   if (userId) {
     invalidateCache(userId);

@@ -31,6 +31,57 @@ for st in mn tx ga; do
   fi
 done
 
-echo "== 3/3 flyctl deploy =="
+echo "== 3/4 flyctl deploy =="
 cd "$HOME"
-exec "$FLY" deploy --config "$DIR/deploy/fly.toml"
+"$FLY" deploy --config "$DIR/deploy/fly.toml"
+
+# ── 4/4 Post-deploy readiness gate (2026-07-25, T3.1) ────────────────────────
+# Fly's own check is the unconditional /healthz — a code deploy that 500s
+# every state's data path used to pass it and only surface via the 15-min
+# uptime probe. Reuse deploy-data.sh's gate: LB /readyz, then per-machine
+# ?deep=1 (a real query per state), plus the client-config endpoint.
+APP="lake-fish-api"
+echo "== 4/4 post-deploy readiness gate =="
+READY_LB=0
+for i in $(seq 1 30); do
+  BODY=$(curl -s --max-time 10 "https://$APP.fly.dev/readyz" || true)
+  if echo "$BODY" | grep -q '"ready":true'; then
+    echo "READY (LB): $BODY"; READY_LB=1; break
+  fi
+  sleep 5
+done
+if [ "$READY_LB" -eq 0 ]; then
+  echo "❌ NOT READY after 150s: ${BODY:-no response}"
+  echo "   ROLL BACK: $FLY releases --app $APP   → then"
+  echo "             $FLY deploy --app $APP --image <previous image ref>"
+  echo "   (~/RUNBOOK.md §2)"
+  exit 1
+fi
+
+MACHINE_ROWS=$("$FLY" machine list --app "$APP" --json 2>/dev/null \
+  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).map(m=>m.id+':'+m.state).join(' '))}catch(e){process.exit(1)}})")
+DEEP_FAIL=0
+for row in $MACHINE_ROWS; do
+  mid="${row%%:*}"
+  DEEP=$("$FLY" ssh console --app "$APP" --machine "$mid" \
+    -C "wget -qO- -T 30 http://localhost:3100/readyz?deep=1" 2>/dev/null || true)
+  if [ -z "$DEEP" ]; then
+    "$FLY" machine start "$mid" --app "$APP" >/dev/null 2>&1 || true
+    sleep 10
+    DEEP=$("$FLY" ssh console --app "$APP" --machine "$mid" \
+      -C "wget -qO- -T 30 http://localhost:3100/readyz?deep=1" 2>/dev/null || true)
+  fi
+  if echo "$DEEP" | grep -q '"ready":true'; then
+    echo "READY (deep, $mid)"
+  else
+    echo "❌ machine $mid deep check failed: ${DEEP:-no response}"; DEEP_FAIL=1
+  fi
+done
+CFG=$(curl -s --max-time 10 "https://$APP.fly.dev/api/client-config" || true)
+echo "client-config: ${CFG:-no response}"
+echo "$CFG" | grep -q 'killedVersions' || { echo "❌ /api/client-config not serving"; DEEP_FAIL=1; }
+if [ "$DEEP_FAIL" -eq 1 ]; then
+  echo "   ROLL BACK: $FLY releases --app $APP → $FLY deploy --app $APP --image <previous image ref> (~/RUNBOOK.md §2)"
+  exit 1
+fi
+echo "deploy verified: LB ready, all machines deep-ready, client-config serving"

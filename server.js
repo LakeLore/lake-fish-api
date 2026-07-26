@@ -229,6 +229,30 @@ setInterval(() => {
     + (_sigStats.unsigned === 0 && _sigStats.signed > 0 ? ' — unsigned traffic drained; LAKELORE_REQUIRE_USER_SIG=1 is safe if this holds' : ''));
   _sigStats.signed = 0; _sigStats.unsigned = 0; _sigStats.invalid = 0; _sigStats.since = Date.now();
 }, 60 * 60 * 1000).unref();
+// ── Client version histogram (2026-07-25, T1.2) ────────────────────────────
+// 1.1.1+ clients send X-App-Version: <version>+<build> (and X-Update-Id for
+// the OTA bundle). This makes "has the old fleet drained?" measurable — the
+// documented precondition for flipping LAKELORE_REQUIRE_USER_SIG / _TOKEN /
+// _ATTEST — instead of asserted. Hourly summary line, same pattern as [sig].
+const _verStats = new Map();
+let _verNoHeader = 0;
+setInterval(() => {
+  if (_verStats.size > 0 || _verNoHeader > 0) {
+    const top = [..._verStats.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)
+      .map(([v, n]) => `${v}=${n}`).join(' ');
+    console.log(`[ver] last hour: ${top}${_verNoHeader ? ` no-header=${_verNoHeader} (pre-1.1.1 fleet)` : ''}`);
+  }
+  _verStats.clear(); _verNoHeader = 0;
+}, 60 * 60 * 1000).unref();
+app.use((req, res, next) => {
+  if (req.get('x-user-id')) {
+    const v = req.get('x-app-version');
+    if (v) _verStats.set(v, (_verStats.get(v) || 0) + 1);
+    else _verNoHeader++;
+  }
+  next();
+});
+
 app.use((req, res, next) => {
   const userId = req.get('x-user-id');
   if (!userId) return next();
@@ -306,6 +330,26 @@ if (process.env.NODE_ENV === 'production') {
     message: { error: 'Too many requests, please try again later.' },
   }));
 }
+
+// ── GET /api/client-config (2026-07-25, T1.1) ───────────────────────────────
+// The upgrade-nudge / kill-switch lever that did not exist for any shipped
+// version: 1.1.1+ clients fetch this on launch/foreground. All values are env
+// vars so flipping them is `flyctl secrets set` (or `fly machine update -e`) —
+// no image deploy needed.
+//   LAKELORE_MIN_APP_VERSION   e.g. "1.2.0"  → older clients see a dismissible
+//                              "please update" prompt.
+//   LAKELORE_KILLED_VERSIONS   comma list, e.g. "1.1.1" → those exact versions
+//                              see a BLOCKING update screen (bad-release kill switch).
+//   LAKELORE_UPGRADE_MESSAGE   optional custom copy for either prompt.
+app.get('/api/client-config', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=300');
+  res.json({
+    minVersion: process.env.LAKELORE_MIN_APP_VERSION || null,
+    killedVersions: (process.env.LAKELORE_KILLED_VERSIONS || '')
+      .split(',').map(s => s.trim()).filter(Boolean),
+    message: process.env.LAKELORE_UPGRADE_MESSAGE || null,
+  });
+});
 
 // Session-token issuance + bearer verification (helpers defined above).
 // Platform attestation (App Attest / Play Integrity) rides the same route:
@@ -534,14 +578,28 @@ app.get('/api/:state/lakes-index', (req, res) => {
 // waiting for the 5-min cache TTL. Verification: RC sends a configurable
 // Authorization header value, which we compare to REVENUECAT_WEBHOOK_AUTH.
 
+// Constant-time secret comparison (2026-07-25, T3.6). Hash both sides first
+// so the length is not observable either.
+function secretEq(presented, expected) {
+  const h = (s) => nodeCrypto.createHash('sha256').update(String(s)).digest();
+  return nodeCrypto.timingSafeEqual(h(presented), h(expected));
+}
+
 app.post('/webhooks/revenuecat', (req, res) => {
   const expected = process.env.REVENUECAT_WEBHOOK_AUTH;
   if (expected) {
-    if (req.get('authorization') !== expected) {
+    if (!secretEq(req.get('authorization') || '', expected)) {
       return res.status(401).json({ error: 'unauthorized' });
     }
+  } else if (process.env.NODE_ENV === 'production') {
+    // Fail CLOSED (2026-07-25, T3.6 — was warn + accept): with the secret
+    // unset, an unauthenticated caller could force entitlement-cache
+    // invalidations at will. A missing secret in production is a config
+    // error, not a reason to trust the internet.
+    console.error('[webhook] REVENUECAT_WEBHOOK_AUTH not set in production — REJECTING unsigned events (entitlement freshness degrades to the 5-min TTL until the secret is restored)');
+    return res.status(503).json({ error: 'webhook_auth_unconfigured' });
   } else {
-    console.warn('[webhook] REVENUECAT_WEBHOOK_AUTH not set — accepting unsigned events');
+    console.warn('[webhook] REVENUECAT_WEBHOOK_AUTH not set — accepting unsigned events (dev only)');
   }
   const userId = req.body?.event?.app_user_id;
   if (userId) {
@@ -558,10 +616,19 @@ app.post('/webhooks/revenuecat', (req, res) => {
 // stays unauthenticated so fetch.sh keeps working.
 function requireReloadToken(req, res, next) {
   const expected = process.env.RELOAD_TOKEN;
-  if (!expected) return next();
+  if (!expected) {
+    // Fail CLOSED in production (2026-07-25, T3.6 — was fail-open): an
+    // accidental `secrets unset` silently made /reload public before.
+    // Local dev (no token set) stays unauthenticated so fetch.sh works.
+    if (process.env.NODE_ENV === 'production') {
+      console.error('[reload] RELOAD_TOKEN not set in production — refusing /reload');
+      return res.status(503).json({ error: 'reload_token_unconfigured' });
+    }
+    return next();
+  }
   const auth = req.get('authorization') || '';
   const presented = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  if (presented !== expected) {
+  if (!secretEq(presented, expected)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();

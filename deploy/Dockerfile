@@ -1,12 +1,15 @@
 # Build stage — compiles better-sqlite3 (native C++ module)
-FROM node:20-alpine AS builder
+# Node 22 LTS (2026-07-25, T3.4 — node:20 left support April 2026). Keep BOTH
+# FROM lines on the same version: the native module compiles against the
+# builder's ABI and loads in the runtime stage.
+FROM node:22-alpine AS builder
 RUN apk add --no-cache python3 make g++
 WORKDIR /srv/lake-fish-mobile-server
 COPY lake-fish-mobile-server/package.json lake-fish-mobile-server/package-lock.json ./
 RUN npm ci --omit=dev
 
 # Runtime stage — lean image without build tools
-FROM node:20-alpine
+FROM node:22-alpine
 WORKDIR /srv
 
 COPY --from=builder /srv/lake-fish-mobile-server/node_modules ./lake-fish-mobile-server/node_modules

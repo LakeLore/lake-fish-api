@@ -1,0 +1,20 @@
+# CI (2026-07-25, IMPROVEMENT_PLAN_2026-07-25 T3.13): this repo previously had
+# NO automated gate on push — the only checks lived inside deploy.sh on the
+# owner's Mac. The full smoke suite needs the canonical DB artifacts (local
+# only), so CI runs what it can headlessly: install on the production Node
+# line + syntax-check every served file.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run check

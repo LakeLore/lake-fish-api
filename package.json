@@ -6,7 +6,11 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node test/smoke.js"
+    "test": "node test/smoke.js",
+    "check": "node --check server.js && node --check entitlement.js && node --check server/canonical.js && node --check server/attest.js"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "dependencies": {
     "@sentry/node": "^10.52.0",

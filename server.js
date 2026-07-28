@@ -142,6 +142,8 @@ app.use(express.json({ limit: '16kb' }));
 // Healthcheck — independent of any state DB, used by the Fly healthcheck.
 // Kept outside /api so it bypasses rate limiting. Default shape is unchanged;
 // ?deep=1 adds per-state freshness/health details.
+const _deepAuthFails = new Map();
+setInterval(() => _deepAuthFails.clear(), 60 * 60 * 1000).unref();
 app.get('/healthz', (req, res) => {
   if (req.query.deep !== '1') return res.json({ ok: true });
   // Deep mode gated in production (2026-07-28 bug-hunt #3): it leaks
@@ -152,6 +154,13 @@ app.get('/healthz', (req, res) => {
     const auth = req.get('authorization') || '';
     const presented = auth.startsWith('Bearer ') ? auth.slice(7) : '';
     if (!process.env.RELOAD_TOKEN || !secretEq(presented, process.env.RELOAD_TOKEN)) {
+      // Bounded guessing oracle (round-2 B2): /healthz bypasses the /api
+      // limiter by design (Fly's shallow check must never throttle), so cap
+      // failed deep-auth attempts per IP, hourly window.
+      const ip = req.ip || '?';
+      const n = (_deepAuthFails.get(ip) || 0) + 1;
+      if (_deepAuthFails.size < 10_000) _deepAuthFails.set(ip, n);
+      if (n > 30) return res.status(429).json({ error: 'too_many_attempts' });
       return res.status(401).json({ error: 'deep_healthz_requires_token' });
     }
   }
@@ -246,14 +255,19 @@ function probeState(state) {
   r = _mockRes();
   canonical.lakeDetail(mkReq({ state, id: String(lake.id) }, {}), r, canonicalCtx);
   if (r.statusCode !== 200) return `lake:${r.statusCode}`;
-  // Preview projection is the DEFAULT path for every non-subscriber — probe
-  // it too (bug-hunt #5: redaction allowlists are registry-coupled code that
-  // can throw exactly like the wire lists).
+  // Preview projections are the DEFAULT path for every non-subscriber —
+  // probe BOTH (round-2 B3 added the results leg; redaction allowlists are
+  // registry-coupled code that can throw exactly like the wire lists).
   r = _mockRes();
   const previewReq = mkReq({ state, id: String(lake.id) }, {});
   previewReq.lakeLorePreview = true;
   canonical.lakeDetail(previewReq, r, canonicalCtx);
   if (r.statusCode !== 200) return `lake-preview:${r.statusCode}`;
+  r = _mockRes();
+  const previewResultsReq = mkReq({ state }, { limit: '1' });
+  previewResultsReq.lakeLorePreview = true;
+  canonical.results(previewResultsReq, r, canonicalCtx);
+  if (r.statusCode !== 200) return `results-preview:${r.statusCode}`;
   return null;
 }
 
@@ -591,6 +605,7 @@ app.post('/api/feedback', (req, res) => {
     version: version ?? null,
     build: build ?? null,
     message: message.trim(),
+    updateId: typeof updateId === 'string' ? updateId.slice(0, 64) : null, // OTA bundle id (round-2 B7b — destructure landed without this)
   };
   appendJsonlCapped(FEEDBACK_LOG_PATH, entry)
     .then(() => res.json({ ok: true }))

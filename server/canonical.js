@@ -985,8 +985,14 @@ function results(req, res, ctx) {
       const subWhere = subConds.length ? 'WHERE ' + subConds.join(' AND ') : '';
 
       if (f.mostRecentBy === 'survey_date' || f.mostRecentBy === 'survey_date_not_null') {
+        // Presence checklists must not define "most recent" (credibility #1,
+        // 2026-07-28): a species list stamped with the scrape year hid a
+        // lake's genuine surveys behind mostRecentOnly. Real rows win; lakes
+        // with ONLY presence rows fall back so they still appear.
         ctePrefix = `WITH _most_recent AS (
-          SELECT s2.lake_id, MAX(s2.survey_date) AS max_date
+          SELECT s2.lake_id, COALESCE(
+            MAX(CASE WHEN fc2.gear_category IS NULL OR fc2.gear_category != 'Presence Only' THEN s2.survey_date END),
+            MAX(s2.survey_date)) AS max_date
           FROM surveys s2 JOIN fish_catch fc2 ON fc2.survey_id = s2.id ${subWhere}
           GROUP BY s2.lake_id
         )`;
@@ -996,7 +1002,9 @@ function results(req, res, ctx) {
         mostRecentJoin = 'CROSS JOIN _most_recent mr ON mr.lake_id = l.id AND s.survey_date = mr.max_date';
       } else {
         ctePrefix = `WITH _most_recent AS (
-          SELECT s2.lake_id, MAX(s2.survey_year) AS max_year
+          SELECT s2.lake_id, COALESCE(
+            MAX(CASE WHEN fc2.gear_category IS NULL OR fc2.gear_category != 'Presence Only' THEN s2.survey_year END),
+            MAX(s2.survey_year)) AS max_year
           FROM surveys s2 JOIN fish_catch fc2 ON fc2.survey_id = s2.id ${subWhere}
           GROUP BY s2.lake_id
         )`;
@@ -1006,8 +1014,10 @@ function results(req, res, ctx) {
 
     const whereClause = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
-    // Output projected EXACTLY per registry wire.results.
-    const selectCols = projectCols(wire.results, cpueSrc(RESULTS_SRC, entry), 'results');
+    // Output projected EXACTLY per registry wire.results — plus a hidden
+    // fc.gear_category (stripped in finishResults) that drives the
+    // presence-row year-nulling below.
+    const selectCols = projectCols(wire.results, cpueSrc(RESULTS_SRC, entry), 'results') + ", fc.gear_category AS _gcat";
 
     // Canonical DBs precompute lake_stocking_metrics for EVERY state, so the
     // stocked sort/JOIN is SQL always (no JS post-sort branch).
@@ -1135,6 +1145,16 @@ function results(req, res, ctx) {
 // hashing stay in one place.
 function finishResults(req, res, state, entry, rows, total) {
   for (const r of rows) coerceWireIds(entry, r);
+
+  // Presence rows are species lists, not surveys — serving the SCRAPE year
+  // as survey_year was the fleet's #1 credibility lie (a "2026" checklist
+  // outranked genuine 2025 gill-net surveys in ~40 states). The app renders
+  // a null year as "no survey date". Ratings keep their year (a 2026
+  // forecast is honestly a 2026 forecast).
+  for (const r of rows) {
+    if (r._gcat === 'Presence Only') { r.survey_year = null; r.survey_date = null; }
+    delete r._gcat;
+  }
 
   // Preview mode (non-subscriber browsing a paid state — flag set by the
   // entitlement middleware): every metric ships, but lake identity is withheld

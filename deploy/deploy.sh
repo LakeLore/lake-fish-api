@@ -17,6 +17,30 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 FLY="${FLY:-$HOME/.fly/bin/flyctl}"
 
+# ── 0/4 Provenance gate (2026-07-28) ─────────────────────────────────────────
+# Deploys ship the WORKING TREE (build context ~/, which COPYs this repo AND
+# lakelore-data's registry/species/schema/survival). A dirty or unpushed tree
+# means production runs code no commit describes — unbisectable, unreviewable,
+# and invisible to CI. Refuse both repos unless explicitly overridden:
+#   DEPLOY_ALLOW_DIRTY=1 ./deploy/deploy.sh   # emergencies only; say why in the incident note
+if [[ "${DEPLOY_ALLOW_DIRTY:-0}" != "1" ]]; then
+  for repo in "$DIR" "$HOME/lakelore-data"; do
+    name="$(basename "$repo")"
+    if [[ -n "$(git -C "$repo" status --porcelain)" ]]; then
+      echo "❌ $name has uncommitted changes — commit (or DEPLOY_ALLOW_DIRTY=1 for an emergency):"
+      git -C "$repo" status --short | head -10
+      exit 1
+    fi
+    branch="$(git -C "$repo" symbolic-ref -q --short HEAD || echo '?')"
+    if [[ -n "$(git -C "$repo" log "origin/$branch..HEAD" --oneline 2>/dev/null | head -1)" ]]; then
+      echo "❌ $name has unpushed commits on $branch — push first so the deploy is reproducible:"
+      git -C "$repo" log "origin/$branch..HEAD" --oneline | head -5
+      exit 1
+    fi
+  done
+  echo "provenance: both repos clean + pushed"
+fi
+
 echo "== 1/3 server smoke tests =="
 (cd "$DIR" && npm test)
 

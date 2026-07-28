@@ -1313,7 +1313,7 @@ function lakeDetail(req, res, ctx) {
   // /^[\w-]+$/ 400'd every detail tap on them for entitled users (preview
   // users were unaffected via hashed ids). Found by the T3.2 deep-readyz
   // wire probe. Still no dots/slashes — path-traversal stays impossible.
-  if (!/^[\w -]{1,64}$/.test(id)) return res.status(400).json({ error: 'Invalid lake id' });
+  if (!/^[\w -]{1,128}$/.test(id)) return res.status(400).json({ error: 'Invalid lake id' });
   const db = openDb(state, res, ctx);
   if (!db) return;
 

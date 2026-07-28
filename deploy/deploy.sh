@@ -40,7 +40,8 @@ cd "$HOME"
 # every state's data path used to pass it and only surface via the 15-min
 # uptime probe. Reuse deploy-data.sh's gate: LB /readyz, then per-machine
 # ?deep=1 (a real query per state), plus the client-config endpoint.
-APP="lake-fish-api"
+APP=$(sed -n "s/^app = ['\"]\(.*\)['\"]$/\1/p" "$DIR/deploy/fly.toml" | head -1)
+[ -n "$APP" ] || APP="lake-fish-api"
 echo "== 4/4 post-deploy readiness gate =="
 READY_LB=0
 for i in $(seq 1 30); do
@@ -58,18 +59,20 @@ if [ "$READY_LB" -eq 0 ]; then
   exit 1
 fi
 
-MACHINE_ROWS=$("$FLY" machine list --app "$APP" --json 2>/dev/null \
-  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).map(m=>m.id+':'+m.state).join(' '))}catch(e){process.exit(1)}})")
+MACHINE_ROWS=$("$FLY" machine list --app "$APP" --json \
+  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).map(m=>m.id+':'+m.state).join(' '))}catch(e){process.exit(1)}})") || true
+# Empty enumeration = INCONCLUSIVE gate, never a vacuous pass (bug-hunt #2).
+[ -n "$MACHINE_ROWS" ] || { echo "❌ could not enumerate machines — gate INCONCLUSIVE, treat as failed"; exit 1; }
 DEEP_FAIL=0
 for row in $MACHINE_ROWS; do
   mid="${row%%:*}"
   DEEP=$("$FLY" ssh console --app "$APP" --machine "$mid" \
-    -C "wget -qO- -T 30 http://localhost:3100/readyz?deep=1" 2>/dev/null || true)
+    -C "node -e \"fetch('http://localhost:3100/readyz?deep=1').then(r=>r.text()).then(t=>console.log(t)).catch(()=>process.exit(1))\"" 2>/dev/null || true)
   if [ -z "$DEEP" ]; then
     "$FLY" machine start "$mid" --app "$APP" >/dev/null 2>&1 || true
     sleep 10
     DEEP=$("$FLY" ssh console --app "$APP" --machine "$mid" \
-      -C "wget -qO- -T 30 http://localhost:3100/readyz?deep=1" 2>/dev/null || true)
+      -C "node -e \"fetch('http://localhost:3100/readyz?deep=1').then(r=>r.text()).then(t=>console.log(t)).catch(()=>process.exit(1))\"" 2>/dev/null || true)
   fi
   if echo "$DEEP" | grep -q '"ready":true'; then
     echo "READY (deep, $mid)"

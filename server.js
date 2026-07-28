@@ -144,6 +144,17 @@ app.use(express.json({ limit: '16kb' }));
 // ?deep=1 adds per-state freshness/health details.
 app.get('/healthz', (req, res) => {
   if (req.query.deep !== '1') return res.json({ ok: true });
+  // Deep mode gated in production (2026-07-28 bug-hunt #3): it leaks
+  // operational internals (subscriber-file size, RC health, disk) and runs an
+  // uncached 50-state sweep — world-readable was both an info leak and a
+  // cheap DoS lever. Same bearer token as /reload.
+  if (process.env.NODE_ENV === 'production') {
+    const auth = req.get('authorization') || '';
+    const presented = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    if (!process.env.RELOAD_TOKEN || !secretEq(presented, process.env.RELOAD_TOKEN)) {
+      return res.status(401).json({ error: 'deep_healthz_requires_token' });
+    }
+  }
   const states = {};
   for (const state of ACTIVE_STATES) {
     const entry = { ok: false, lakes: null, generatedAt: null, ageDays: null };
@@ -186,7 +197,7 @@ app.get('/healthz', (req, res) => {
   res.json({
     ok: true, states,
     sig: { ..._sigStats },
-    ver: Object.fromEntries(_verStats),
+    ver: Object.fromEntries([..._verStats.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)),
     attest: { ...require('./server/attest').stats },
     rc: { ...entitlementStats },
     memRssMb: Math.round(process.memoryUsage().rss / 1048576),
@@ -221,16 +232,28 @@ function probeState(state) {
   // Prefer a lake that actually has catch rows (exercises the full catches
   // projection), and skip blank/whitespace ids (IN carries a lake with
   // id=' ' — a raw-source artifact that 400s by design).
-  const lake = db.prepare(`SELECT lake_id AS id FROM fish_catch WHERE length(trim(lake_id)) > 0 LIMIT 1`).get()
-    ?? db.prepare(`SELECT id FROM lakes WHERE length(trim(id)) > 0 LIMIT 1`).get();
+  let lake = null;
+  try { lake = db.prepare(`SELECT lake_id AS id FROM fish_catch WHERE length(trim(lake_id)) > 0 LIMIT 1`).get(); }
+  catch { /* fish_catch absent — fall through (results() tolerates it too) */ }
+  lake = lake ?? db.prepare(`SELECT id FROM lakes WHERE length(trim(id)) > 0 LIMIT 1`).get();
   if (!lake) return 'no-lakes';
   const mkReq = (params, query) => ({ params, query, get: () => undefined, lakeLorePreview: false, ip: 'probe' });
   let r = _mockRes();
-  canonical.results(mkReq({ state }, { pageSize: '1' }), r, canonicalCtx);
+  // limit (not pageSize — results() reads `limit`; bug-hunt #4: the old param
+  // silently ran the default-100 unindexed scan per state, per machine wake).
+  canonical.results(mkReq({ state }, { limit: '1' }), r, canonicalCtx);
   if (r.statusCode !== 200) return `results:${r.statusCode}`;
   r = _mockRes();
   canonical.lakeDetail(mkReq({ state, id: String(lake.id) }, {}), r, canonicalCtx);
   if (r.statusCode !== 200) return `lake:${r.statusCode}`;
+  // Preview projection is the DEFAULT path for every non-subscriber — probe
+  // it too (bug-hunt #5: redaction allowlists are registry-coupled code that
+  // can throw exactly like the wire lists).
+  r = _mockRes();
+  const previewReq = mkReq({ state, id: String(lake.id) }, {});
+  previewReq.lakeLorePreview = true;
+  canonical.lakeDetail(previewReq, r, canonicalCtx);
+  if (r.statusCode !== 200) return `lake-preview:${r.statusCode}`;
   return null;
 }
 
@@ -304,8 +327,13 @@ setInterval(() => {
 app.use((req, res, next) => {
   if (req.get('x-user-id')) {
     const v = req.get('x-app-version');
-    if (v) _verStats.set(v, (_verStats.get(v) || 0) + 1);
-    else _verNoHeader++;
+    // Bounded (2026-07-28 bug-hunt #1): the header is attacker-controlled and
+    // this middleware runs OUTSIDE the /api rate limiter — uncapped keys were
+    // an unauthenticated OOM vector on a 512 MB machine.
+    if (v) {
+      const k = String(v).slice(0, 32);
+      if (_verStats.size < 200 || _verStats.has(k)) _verStats.set(k, (_verStats.get(k) || 0) + 1);
+    } else _verNoHeader++;
   }
   next();
 });
@@ -545,7 +573,7 @@ async function appendJsonlCapped(p, entry) {
 
 app.post('/api/feedback', (req, res) => {
   const userId = req.get('x-user-id') || null;
-  const { message, lakeId, lakeName, state, species, tab, version, build } = req.body || {};
+  const { message, lakeId, lakeName, state, species, tab, version, build, updateId } = req.body || {};
   if (typeof message !== 'string' || message.trim().length === 0) {
     return res.status(400).json({ error: 'message_required' });
   }
@@ -929,6 +957,8 @@ app.post('/api/:state/reload', requireReloadToken, (req, res) => {
     delete _dbs[state];
   }
 
+  // A fixed state must not keep reporting not-ready for 60 s (bug-hunt #9).
+  _deepReadyCache = { at: 0, bad: null };
   // Drop the cached preview-id reverse map: the replaced artifact may have
   // added lakes, and a stale map 404s /lake/:id for preview users tapping a
   // new lake until a full restart (defeating /reload's whole purpose).

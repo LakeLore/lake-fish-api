@@ -278,6 +278,20 @@ setInterval(() => {
 }, 60 * 60 * 1000).unref?.();
 function noteWebhook() { stats.webhooksTotal++; stats.lastWebhookAt = new Date().toISOString(); }
 
+// Bounded LRU set (2026-07-28 bug-hunt #6/#7): delete-before-set moves a
+// refreshed key to the Map tail (plain .set keeps original position — the old
+// sweep evicted the LONGEST-SERVING subscribers first while attacker-minted
+// fresh ids survived at the tail); the bound is enforced on EVERY insert path
+// including grace (which previously returned before the check).
+function _setBounded(userId, entry) {
+  if (_cache.has(userId)) _cache.delete(userId);
+  _cache.set(userId, entry);
+  if (_cache.size > 10_000) {
+    let drop = 1_000;
+    for (const k of _cache.keys()) { _cache.delete(k); if (--drop <= 0) break; }
+  }
+}
+
 async function checkEntitlement(userId) {
   if (!userId) return { hasAllStates: false, expiresAt: null, source: 'no-user-id' };
 
@@ -309,22 +323,14 @@ async function checkEntitlement(userId) {
     if (good && (now - good.seenAt) < GRACE_MS) {
       console.warn(`[entitlement] RC error for known subscriber ${userId.slice(0, 8)}… — serving grace entitlement`);
       const grace = { hasAllStates: true, expiresAt: good.expiresAt, source: 'grace' };
-      _cache.set(userId, { ...grace, fetchedAt: now, _ttl: 30_000 });
+      _setBounded(userId, { ...grace, fetchedAt: now, _ttl: 30_000 });
       return grace;
     }
   }
   // Cache successful lookups for the full TTL; cache errors briefly so
   // we don't hammer RC during a sustained outage.
   const ttl = result.error ? 30_000 : CACHE_TTL_MS;
-  _cache.set(userId, { ...result, fetchedAt: now, _ttl: ttl });
-  // Bound the user-keyed cache (2026-07-25, T3.5): keyed by CLIENT-SUPPLIED
-  // X-User-Id, so a caller cycling random ids inside the rate budget grows it
-  // without limit on a 512 MB machine. Map iteration order = insertion order;
-  // evicting the oldest ~10% keeps this O(1) amortized.
-  if (_cache.size > 10_000) {
-    let drop = 1_000;
-    for (const k of _cache.keys()) { _cache.delete(k); if (--drop <= 0) break; }
-  }
+  _setBounded(userId, { ...result, fetchedAt: now, _ttl: ttl });
   return result;
 }
 

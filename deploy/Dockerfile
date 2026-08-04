@@ -38,7 +38,6 @@ WORKDIR /srv/lake-fish-mobile-server
 # covers the whole fleet ({state}.db per active registry state); a per-state
 # {STATE}_DB_PATH env var still overrides it if ever needed.
 ENV LAKELORE_DB_DIR=/data \
-    NE_PDF_DIR=/data/pdfs \
     NODE_ENV=production
 
 EXPOSE 3100

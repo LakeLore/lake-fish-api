@@ -50,7 +50,9 @@ const RC_API_BASE = 'https://api.revenuecat.com/v2';
 //                               full CPUE/stocking detail with the same
 //                               identity fields redacted, plus report ids and
 //                               source-PDF links withheld. Never 402s.
-//   /api/{state}/pdf/:name    — Nebraska survey PDFs (NE-specific) — hard 402
+//   /api/{state}/pdf/:name    — ROUTE REMOVED 2026-08-04 (NE legal hold; it mirrored
+//                               agency PDF expression). The 'pdf' alternation below is a
+//                               harmless dead branch: unentitled hits 402, entitled 404.
 //                               (the PDF itself names the lake).
 //
 // Only ACTIVE states appear here — the set is whatever the registry flags

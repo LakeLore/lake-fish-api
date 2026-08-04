@@ -735,9 +735,6 @@ function requireReloadToken(req, res, next) {
   next();
 }
 
-const NE_PDF_DIR = process.env.NE_PDF_DIR ||
-  path.join(__dirname, '..', 'ne-lake-fish', 'data', 'pdfs');
-
 // ── Species resolution (registry) ──────────────────────────────────────────────
 // species_native -> canonical code via lakelore-data/registry/species.json.
 
@@ -1000,17 +997,13 @@ app.post('/api/:state/reload', requireReloadToken, (req, res) => {
   }
 });
 
-// ── /api/ne/pdf/:name ──────────────────────────────────────────────────────────
-// Nebraska survey PDFs are stored locally; proxy them through the API.
-
-app.get('/api/ne/pdf/:name', (req, res) => {
-  const name = path.basename(req.params.name); // prevent path traversal
-  const filePath = path.join(NE_PDF_DIR, name);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'PDF not found' });
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `inline; filename="${name}"`);
-  fs.createReadStream(filePath).pipe(res);
-});
+// ── /api/ne/pdf/:name — REMOVED (2026-08-04) ──────────────────────────────────
+// The route streamed NGPC survey PDFs verbatim to subscribers. That mirrors the
+// agency's protected EXPRESSION (layout, prose, tables) — the one thing the
+// facts-aren't-copyrightable defence does not cover — against an agency whose
+// terms require written permission for reproduction. Removed as part of the
+// 2026-08-04 legal holds (~/DATA_LICENSING_AUDIT_2026-07-28.md); NE itself is
+// registry active:false. Old clients get the standard 404.
 
 // ── Sentry Express error handler ───────────────────────────────────────────────
 // Must be registered AFTER all routes. No-ops if Sentry wasn't initialized.

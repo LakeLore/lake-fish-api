@@ -1262,7 +1262,14 @@ function stockingFirstResults(req, res, opts) {
       stocked_per_100ac: 'm.adults_per_100ac AS stocked_per_100ac',
       stocked_adults_est: 'm.adults_est AS stocked_adults_est',
       species: 'm.species_native AS species',
-      species_name: 'COALESCE(fc.species_name, m.species_name) AS species_name',
+      // lake_stocking_metrics has NO species_name column — the old
+      // COALESCE(fc.species_name, m.species_name) threw SQLITE_ERROR for the
+      // two wires that project species_name (nd, wi), 500ing their Stocking
+      // Impact list view since the measure model shipped (2026-08-12,
+      // owner-found; goldens never covered stockingFirst). Stocking-only rows
+      // serve NULL and the app's generated species map renders the display
+      // name from `species` — its designed fleet-wide fallback.
+      species_name: 'fc.species_name AS species_name',
     };
     const selectCols = projectCols(wire.results, cpueSrc(src, entry), 'results');
 
@@ -1337,7 +1344,10 @@ function presenceUnionResults(req, res, opts) {
     const src = { ...RESULTS_SRC,
       lake_id: 'k.lake_id AS lake_id',
       species: 'k.species_native AS species',
-      species_name: 'COALESCE(fc.species_name, m.species_name) AS species_name',
+      // Same lake_stocking_metrics-has-no-species_name bug as stockingFirst
+      // above (2026-08-12): 500'd presenceUnion for the nd/wi wires. Rows
+      // without a survey serve NULL; the app renders from `species`.
+      species_name: 'fc.species_name AS species_name',
       stocked_per_100ac: 'm.adults_per_100ac AS stocked_per_100ac',
       stocked_adults_est: 'm.adults_est AS stocked_adults_est',
     };

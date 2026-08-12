@@ -433,20 +433,45 @@ function filters(req, res, ctx) {
         GROUP BY fc.gear_category
       `).all(...gearArgs);
       gearCpueCounts = Object.fromEntries(gearCpueRows.map(r => [r.gear, r.n]));
-      // Latest-aware per-gear counts (2026-08-11, owner report): the Filters
-      // modal showed all-history row counts ("Standard gill nets: 333") while
-      // the list under mostRecentOnly showed 43 — the toggle changes what a
-      // gear WOULD return, so the modal needs both numbers. Under
-      // mostRecentOnly a single-gear query returns exactly one row per lake
-      // that has that gear (its most recent), so the latest-aware count is
-      // COUNT(DISTINCT lake_id) — verified 43/46 against the MN test scope.
-      const gearLatestRows = db.prepare(`
-        SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS n
-        FROM fish_catch fc ${countyJoin}
-        WHERE fc.gear_category IS NOT NULL ${speciesAnd} ${countyAnd}
-        GROUP BY fc.gear_category
-      `).all(...gearArgs);
-      gearLatestCounts = Object.fromEntries(gearLatestRows.map(r => [r.gear, r.n]));
+      // Latest-aware per-gear counts (2026-08-11, owner report; REWRITTEN
+      // 2026-08-12 after the 39-state sweep): the Filters modal showed
+      // all-history row counts ("Standard gill nets: 333") while the list
+      // under mostRecentOnly showed 43. v1 used COUNT(DISTINCT lake_id),
+      // which is only correct when a species scopes the query — without one,
+      // "latest" collapses per LAKE and the outer query returns every species
+      // row of that survey, so no distinct-count matches. The count is now
+      // computed with the SAME per-(gear,lake) most-recent semantics as
+      // /results — and emitted ONLY under a species scope (the modal's real
+      // case: the app requires a species to search; without one it falls
+      // back to all-history counts). Date expression mirrors mostRecentBy,
+      // including the null-date COALESCE fallback (the WA fix below).
+      if (speciesParam && f.mostRecentBy !== 'stations') {
+        const byDate = f.mostRecentBy === 'survey_date' || f.mostRecentBy === 'survey_date_not_null';
+        const dateExpr = (a) => f.mostRecentBy === 'survey_date'
+          ? `COALESCE(${a}.survey_date, CAST(${a}.survey_year AS TEXT))`
+          : byDate ? `${a}.survey_date` : `${a}.survey_year`;
+        const iaNotNull = f.mostRecentBy === 'survey_date_not_null' ? 'AND s2.survey_date IS NOT NULL' : '';
+        const countyJoin2 = countyList.length > 0 ? 'JOIN lakes l2 ON l2.id = fc2.lake_id' : '';
+        const countyAnd2 = countyList.length > 0
+          ? `AND l2.county IN (${countyList.map(() => '?').join(',')})` : '';
+        const gearLatestRows = db.prepare(`
+          WITH _gear_recent AS (
+            SELECT fc2.gear_category AS gear, fc2.lake_id AS lake_id, MAX(${dateExpr('s2')}) AS mx
+            FROM surveys s2 JOIN fish_catch fc2 ON fc2.survey_id = s2.id ${countyJoin2}
+            WHERE fc2.gear_category IS NOT NULL AND fc2.species_native = ? ${countyAnd2} ${iaNotNull}
+            GROUP BY fc2.gear_category, fc2.lake_id
+          )
+          SELECT fc.gear_category AS gear, COUNT(*) AS n
+          FROM fish_catch fc
+          JOIN surveys s ON s.id = fc.survey_id
+          JOIN _gear_recent gr ON gr.gear = fc.gear_category AND gr.lake_id = fc.lake_id
+            AND ${dateExpr('s')} = gr.mx
+          ${countyJoin}
+          WHERE fc.species_native = ? ${countyAnd}
+          GROUP BY fc.gear_category
+        `).all(speciesParam, ...countyList, speciesParam, ...countyList);
+        gearLatestCounts = Object.fromEntries(gearLatestRows.map(r => [r.gear, r.n]));
+      }
     }
 
     const result = { species, gearTypes, gearTypeCounts, counties, yearRange };
@@ -1005,17 +1030,31 @@ function results(req, res, ctx) {
         // 2026-07-28): a species list stamped with the scrape year hid a
         // lake's genuine surveys behind mostRecentOnly. Real rows win; lakes
         // with ONLY presence rows fall back so they still appear.
+        //
+        // Null-date surveys rank by YEAR (2026-08-12, 39-state sweep): under
+        // plain 'survey_date', a NULL date never equals max_date, so a survey
+        // carrying only survey_year was UNRANKABLE — WA's entire warmwater
+        // overlay (347 of 593 surveys) was invisible under mostRecentOnly,
+        // the app's default view, since it shipped. COALESCE to the bare year
+        // string: 'YYYY' sorts before any 'YYYY-MM-DD' of the same year (a
+        // dated survey beats a year-only one in-year) and after every prior
+        // year — sane, deterministic ordering. IA's 'survey_date_not_null'
+        // keeps excluding null dates on purpose (consolidated rollups), and
+        // MN/MT carry zero null dates, so their bytes cannot change.
+        const dExpr = (a) => f.mostRecentBy === 'survey_date'
+          ? `COALESCE(${a}.survey_date, CAST(${a}.survey_year AS TEXT))`
+          : `${a}.survey_date`;
         ctePrefix = `WITH _most_recent AS (
           SELECT s2.lake_id, COALESCE(
-            MAX(CASE WHEN fc2.gear_category IS NULL OR fc2.gear_category != 'Presence Only' THEN s2.survey_date END),
-            MAX(s2.survey_date)) AS max_date
+            MAX(CASE WHEN fc2.gear_category IS NULL OR fc2.gear_category != 'Presence Only' THEN ${dExpr('s2')} END),
+            MAX(${dExpr('s2')})) AS max_date
           FROM surveys s2 JOIN fish_catch fc2 ON fc2.survey_id = s2.id ${subWhere}
           GROUP BY s2.lake_id
         )`;
         // CROSS JOIN pins mr LAST (legacy planner joined the materialized CTE
         // last via an automatic index; canonical's ANALYZE stats made it the
         // driver, permuting tie order).
-        mostRecentJoin = 'CROSS JOIN _most_recent mr ON mr.lake_id = l.id AND s.survey_date = mr.max_date';
+        mostRecentJoin = `CROSS JOIN _most_recent mr ON mr.lake_id = l.id AND ${dExpr('s')} = mr.max_date`;
       } else {
         ctePrefix = `WITH _most_recent AS (
           SELECT s2.lake_id, COALESCE(

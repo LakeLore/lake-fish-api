@@ -370,6 +370,7 @@ function filters(req, res, ctx) {
     let gearTypes = [];
     let gearTypeCounts = undefined;
     let gearCpueCounts = undefined;
+    let gearLatestCounts = undefined;
     let defaultGear = undefined;
     if (gearMode === 'stations' && hasCatch) {
       // IA: gear chips derive from station-presence columns on surveys (EF/FN/HN)
@@ -432,10 +433,25 @@ function filters(req, res, ctx) {
         GROUP BY fc.gear_category
       `).all(...gearArgs);
       gearCpueCounts = Object.fromEntries(gearCpueRows.map(r => [r.gear, r.n]));
+      // Latest-aware per-gear counts (2026-08-11, owner report): the Filters
+      // modal showed all-history row counts ("Standard gill nets: 333") while
+      // the list under mostRecentOnly showed 43 — the toggle changes what a
+      // gear WOULD return, so the modal needs both numbers. Under
+      // mostRecentOnly a single-gear query returns exactly one row per lake
+      // that has that gear (its most recent), so the latest-aware count is
+      // COUNT(DISTINCT lake_id) — verified 43/46 against the MN test scope.
+      const gearLatestRows = db.prepare(`
+        SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS n
+        FROM fish_catch fc ${countyJoin}
+        WHERE fc.gear_category IS NOT NULL ${speciesAnd} ${countyAnd}
+        GROUP BY fc.gear_category
+      `).all(...gearArgs);
+      gearLatestCounts = Object.fromEntries(gearLatestRows.map(r => [r.gear, r.n]));
     }
 
     const result = { species, gearTypes, gearTypeCounts, counties, yearRange };
     if (gearCpueCounts !== undefined) result.gearCpueCounts = gearCpueCounts;
+    if (gearLatestCounts !== undefined) result.gearLatestCounts = gearLatestCounts;
     if (defaultGear !== undefined) result.defaultGear = defaultGear;
 
     if (f.surveyTypes) {

@@ -643,6 +643,15 @@ function measures(req, res, ctx) {
     // unique to one cpue_kind, so scoping /results by ?gear=<gear_category> is
     // exact. Default falls to whichever source (gear or relative) has the most
     // records, per the model.
+    // Size-QUALITY rankings misfiled as abundance (2026-08-12, owner-found):
+    // MB's "LIFA trophy rating (0-5)" is a how-big-they-run signal, not a
+    // how-many signal — a 2026-08-12 fleet sweep of every relative/creel gear
+    // and rating bucket across all 39 states found it to be the ONLY such
+    // case (SK's Fish Facts weight tiers would be the other, but SK is held).
+    // The gear label itself names the semantics, so the detector is the name.
+    // These divert to the Avg Size measure as ranking-expression sources.
+    const SIZE_RANK_GEAR = /trophy/i;
+    const sizeRankSources = [];
     for (const r of db.prepare(`
       SELECT fc.gear_category AS gear, fc.cpue_kind AS kind,
              COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
@@ -652,14 +661,19 @@ function measures(req, res, ctx) {
         ${speciesAnd} ${countyAnd}
       GROUP BY fc.gear_category, fc.cpue_kind
     `).all(...args)) {
-      abSources.push({
+      const src = {
         id: `${r.kind}:${r.gear}`, gear: r.gear, cpueKind: null,
         expression: ABUNDANCE_EXPRESSION[r.kind] || 'ranking',
         label: gearBaseName(r.gear),
         unit: deriveAbundanceUnit(r.gear, r.kind),
         sort: 'cpue', sortDir: 'desc', stockingFirst: false,
         records: r.records, lakes: r.lakes,
-      });
+      };
+      if (SIZE_RANK_GEAR.test(r.gear)) {
+        sizeRankSources.push({ ...src, expression: 'ranking', unit: 'index' });
+      } else {
+        abSources.push(src);
+      }
     }
     // Catch-all: relative/creel rows with NO gear_category can't be gear-scoped,
     // so keep a merged-by-kind source (scoped by ?cpueKind) so they aren't lost.
@@ -804,6 +818,9 @@ function measures(req, res, ctx) {
           records: nullGear.records, lakes: nullGear.lakes,
         });
       }
+      // Diverted size-quality rankings (LIFA trophy) join the measured-size
+      // sources; ranking expressions sort after measurements within a measure.
+      sizeSources.push(...sizeRankSources);
       if (sizeSources.length) {
         sizeSources.sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
         out.push({
@@ -813,6 +830,16 @@ function measures(req, res, ctx) {
           sources: sizeSources,
         });
       }
+    } else if (sizeRankSources.length) {
+      // No measured size anywhere, but size-quality rankings exist (would be
+      // orphaned inside the sizeField block above): they ARE the size measure.
+      sizeRankSources.sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
+      out.push({
+        id: 'size', label: 'Avg Size', requiresSource: true,
+        records: sizeRankSources.reduce((s, x) => s + x.records, 0),
+        lakes: Math.max(...sizeRankSources.map(x => x.lakes)),
+        sources: sizeRankSources,
+      });
     }
 
     // ── MEASURE: Presence — DERIVED UNION of every lake+species across all

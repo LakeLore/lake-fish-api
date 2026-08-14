@@ -117,12 +117,23 @@ upload() {
         # Atomic swap (2026-07-17, B11): upload to <dest>.new and mv into
         # place. The old rm-then-put left the live path MISSING for the whole
         # transfer — an auto-started machine mid-upload 503'd that state.
-        "$FLY" ssh console --app "$APP" --machine "$mid" -C "rm -f ${dest}.new" >/dev/null 2>&1 || true
         echo "→ uploading $state -> $mid: $src"
-        if ! "$FLY" sftp put "$src" "${dest}.new" --app "$APP" --machine "$mid"; then
-          echo "   retrying after wake ($mid)"
+        # Up to 3 attempts, and rm the partial before EVERY one: flyctl sftp
+        # refuses to overwrite an existing file, so a connection dropped
+        # mid-transfer (2026-08-14, twice at ~17MB into mn.db) left a partial
+        # ${dest}.new that wedged the old single-retry path permanently.
+        _put_ok=""
+        for _attempt in 1 2 3; do
+          "$FLY" ssh console --app "$APP" --machine "$mid" -C "rm -f ${dest}.new" >/dev/null 2>&1 || true
+          if "$FLY" sftp put "$src" "${dest}.new" --app "$APP" --machine "$mid"; then
+            _put_ok=1; break
+          fi
+          echo "   attempt $_attempt failed ($mid); waking and retrying"
           wake "$mid"
-          "$FLY" sftp put "$src" "${dest}.new" --app "$APP" --machine "$mid"
+        done
+        if [ -z "$_put_ok" ]; then
+          echo "✗ $state -> $mid: upload failed after 3 attempts"
+          exit 1
         fi
         if ! "$FLY" ssh console --app "$APP" --machine "$mid" -C "sh -c 'rm -f ${dest}-shm ${dest}-wal && mv -f ${dest}.new ${dest}'"; then
           wake "$mid"

@@ -875,10 +875,19 @@ function measures(req, res, ctx) {
 
     // Measures already pushed in cascade order (abundance, stocking, size,
     // presence). The client defaults to the first with records; presence is the
-    // terminal fallback. Stamp each measure's default source (most records).
+    // terminal fallback. Stamp each measure's default source: most records
+    // among PRIMARY quantitative sources first (sort 'cpue' — a measured,
+    // relative, or normalized catch rate), ranking/fallback sources only when
+    // no quantitative source exists (the rating-tier states). This mirrors the
+    // legacy client's defaultGearFor rule (gearCpueCounts before
+    // gearTypeCounts) — most-records alone let WI's 1,147-lake coarse Forecast
+    // Rating outrank its 330-row measured electrofishing corpus (2026-08-14).
+    // Only Abundance mixes the two kinds, so other measures are unaffected.
     for (const m of out) {
-      m.defaultSourceId = m.sources.slice()
-        .sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes))[0]?.id ?? null;
+      const ranked = m.sources.slice()
+        .sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
+      const primary = ranked.filter(s => s.sort === 'cpue');
+      m.defaultSourceId = (primary[0] ?? ranked[0])?.id ?? null;
     }
 
     res.json({ species: speciesParam, county: countyList, measures: out });

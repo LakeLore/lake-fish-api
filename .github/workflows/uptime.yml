@@ -69,10 +69,16 @@ jobs:
       - name: rotating-state probe
         # (2026-07-25, T3.9-adjacent) mn/tx alone left 54 states' wire paths
         # unwatched. Rotate through the whole active fleet by run number —
-        # every state gets probed roughly every 12.5 hours. /measures rides
+        # every state gets probed roughly every 9.5 hours. /measures rides
         # along (the newest endpoint had ZERO probe coverage).
+        #
+        # ACTIVE states only (2026-08-25): the pre-hold 50-state list kept
+        # probing the 11 legal-hold states after 2026-08-04 — a held state
+        # 400s BY DESIGN, so ~1 in 4 runs failed and emailed for three weeks
+        # while production was healthy. This list must track registry
+        # `active` flips (see the ~/CLAUDE.md trigger table).
         run: |
-          STATES=(mn sd nd ia ne wi mi wa mt ks mo il in oh fl ga al tn ky nc va or id wy ut co nm nv ca ok tx ny pa ar la me ct md nh ak ms wv vt on hi nj bc mb sk ab)
+          STATES=(al ar ca co ct fl ga ia id il in la md me mn mo ms mt nc nd nh nj nm nv ny oh ok or pa sd tn tx ut va wa wi wv wy)
           ST=${STATES[$(( ${{ github.run_number }} % ${#STATES[@]} ))]}
           echo "probing state: $ST"
           CODE=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' "https://lake-fish-api.fly.dev/api/$ST/results?limit=1")

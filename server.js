@@ -861,11 +861,7 @@ function getCanonicalDb(state) {
   // would attempt a write.
   const db = new Database(dbPath, { readonly: true });
   try {
-    // allowV6 (2026-08-25): schema-v7 transition shim — this image serves both
-    // v6 and v7 artifacts so the 56-DB data rollout needs no downtime window.
-    // Drop the flag once every production volume carries v7 (assert-schema.js
-    // documents the shim).
-    const problems = assertCanonicalSchema(db, { allowV6: true });
+    const problems = assertCanonicalSchema(db);
     if (problems.length) {
       _canonicalUnhealthy.add(state);
       console.error(`[${state}] canonical schema mismatch (${problems.length} problem${problems.length === 1 ? '' : 's'}) at ${dbPath}:`);

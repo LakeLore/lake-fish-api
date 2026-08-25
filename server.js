@@ -208,7 +208,15 @@ app.get('/healthz', (req, res) => {
     sig: { ..._sigStats },
     ver: Object.fromEntries([..._verStats.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)),
     attest: { ...require('./server/attest').stats },
-    rc: { ...entitlementStats },
+    // webhookAgeHours: numeric webhook-silence age so external probes can
+    // assert freshness without parsing timestamps (null = none since boot;
+    // lastWebhookAt is process-local, so a restart resets it).
+    rc: {
+      ...entitlementStats,
+      webhookAgeHours: entitlementStats.lastWebhookAt
+        ? Math.round((Date.now() - Date.parse(entitlementStats.lastWebhookAt)) / 36e5 * 10) / 10
+        : null,
+    },
     memRssMb: Math.round(process.memoryUsage().rss / 1048576),
     disk, jsonl,
   });

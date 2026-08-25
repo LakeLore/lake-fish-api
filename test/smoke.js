@@ -79,6 +79,27 @@ const get = async (p) => {
       if (r.status !== 400) fail(`inactive ${st} /status expected 400, got ${r.status}`);
     }
 
+    // lastWebhookAt assertion (post-launch item, 2026-08-25): a webhook POST
+    // must land in the rc stats — the entitlement-freshness path's only
+    // heartbeat. Regression here = renewals silently degrade to the 5-min
+    // cache TTL with no evidence anywhere. Unsigned POST is accepted outside
+    // production (NODE_ENV=test here), so no secret is needed.
+    {
+      const before = await get('/healthz?deep=1');
+      const wh = await fetch(BASE + '/webhooks/revenuecat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: { app_user_id: 'smoke-test-user', type: 'TEST' } }),
+      });
+      if (wh.status !== 200) fail(`/webhooks/revenuecat ${wh.status}`);
+      const after = await get('/healthz?deep=1');
+      const rc = after.body?.rc;
+      if (!rc?.lastWebhookAt) fail('rc.lastWebhookAt not set after webhook POST');
+      else if (Date.parse(rc.lastWebhookAt) < Date.now() - 60_000) fail(`rc.lastWebhookAt stale: ${rc.lastWebhookAt}`);
+      if (!((rc?.webhooksTotal ?? 0) > (before.body?.rc?.webhooksTotal ?? 0))) fail('rc.webhooksTotal did not increment');
+      if (typeof rc?.webhookAgeHours !== 'number') fail('rc.webhookAgeHours missing from deep healthz');
+    }
+
     console.log(failures === 0
       ? `SMOKE OK — ${ACTIVE.length} active states clean, ${INACTIVE.length} inactive 400`
       : `${failures} failures`);

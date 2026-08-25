@@ -819,10 +819,14 @@ function measures(req, res, ctx) {
         });
       }
       // Diverted size-quality rankings (LIFA trophy) join the measured-size
-      // sources; ranking expressions sort after measurements within a measure.
+      // sources; ranking expressions sort AFTER measurements within the measure
+      // (post-launch minor: this comment used to promise that ordering while
+      // the sort below ignored expression — MB-only in practice, but now true).
       sizeSources.push(...sizeRankSources);
       if (sizeSources.length) {
-        sizeSources.sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
+        sizeSources.sort((a, b) =>
+          ((a.expression === 'ranking' ? 1 : 0) - (b.expression === 'ranking' ? 1 : 0)) ||
+          (b.records - a.records) || (b.lakes - a.lakes));
         out.push({
           id: 'size', label: 'Avg Size', requiresSource: true,
           records: sizeSources.reduce((s, x) => s + x.records, 0),
@@ -882,11 +886,17 @@ function measures(req, res, ctx) {
     // legacy client's defaultGearFor rule (gearCpueCounts before
     // gearTypeCounts) — most-records alone let WI's 1,147-lake coarse Forecast
     // Rating outrank its 330-row measured electrofishing corpus (2026-08-14).
-    // Only Abundance mixes the two kinds, so other measures are unaffected.
+    // Size mixes kinds too since the 2026-08-12 LIFA-trophy diversion: its
+    // diverted ranking sources kept sort 'cpue' (that IS their /results sort
+    // param), so the sort-based primary filter would have PREFERRED the trophy
+    // ranking over measured sizes — size instead prefers non-ranking
+    // expressions (MB-only in practice; measured-size-only states unchanged).
     for (const m of out) {
       const ranked = m.sources.slice()
         .sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
-      const primary = ranked.filter(s => s.sort === 'cpue');
+      const primary = m.id === 'size'
+        ? ranked.filter(s => s.expression !== 'ranking')
+        : ranked.filter(s => s.sort === 'cpue');
       m.defaultSourceId = (primary[0] ?? ranked[0])?.id ?? null;
     }
 

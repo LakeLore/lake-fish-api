@@ -75,14 +75,16 @@ def _local_path(state: str):
 
 
 def _registry_states():
-    """All states in the lakelore-data registry (falls back to the legacy
-    seven if the registry isn't present)."""
+    """ACTIVE states in the lakelore-data registry (falls back to the legacy
+    seven if the registry isn't present). Active-only since 2026-08-25:
+    deploy-data.sh no longer uploads held/inactive states, so comparing them
+    would fail against volumes that (correctly) don't carry their DBs."""
     reg = ROOT / "lakelore-data" / "registry" / "states.json"
     if not reg.exists():
         return list(LEGACY_PATHS.keys())
     import json
     with open(reg) as f:
-        return list(json.load(f)["states"].keys())
+        return [s for s, e in json.load(f)["states"].items() if e.get("active")]
 
 
 LOCAL_PATHS = {s: _local_path(s) for s in _registry_states()}

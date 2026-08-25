@@ -1456,6 +1456,16 @@ function lakeDetail(req, res, ctx) {
     const real = resolvePreviewLakeId(state, db, id);
     if (!real) return res.status(404).json({ error: 'Lake not found' });
     id = real;
+  } else if (req.lakeLorePreview) {
+    // Preview requests may only address lakes by hashed preview ids
+    // (2026-08-25 pre-ad review): the public /lakes-index carries real ids +
+    // names for SEO pages, so serving a preview payload for a RAW id let an
+    // unauthenticated caller join identity to the full redacted metrics and
+    // scrape the entire paid dataset. App preview flows only ever hold hashed
+    // ids (preview /results), so real clients never hit this; a lapsed
+    // subscriber tapping a stale entitled-era row gets the paywall, which is
+    // the correct prompt.
+    return res.status(402).json({ error: 'subscription_required', state });
   }
 
   try {
@@ -1578,4 +1588,7 @@ function lakeDetail(req, res, ctx) {
   }
 }
 
-module.exports = { filters, measures, results, lakeDetail, clearPreviewLakeIdMap };
+// previewIdFor: exported for the deep-readyz probe, whose preview leg must
+// address the lake the way a real preview client does (hashed id) now that
+// raw ids 402 in preview mode.
+module.exports = { filters, measures, results, lakeDetail, clearPreviewLakeIdMap, previewIdFor: previewId };

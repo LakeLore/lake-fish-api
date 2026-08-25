@@ -49,6 +49,19 @@ else
   STATE_ARG="${POSITIONAL[*]}"
 fi
 
+# ── Pipeline lock (2026-08-25) ────────────────────────────────────────────
+# A human deploy racing a scheduled refresh's deploy step meant two uploaders
+# to the same machine, each rm-ing the other's in-flight ${dest}.new partial.
+# refresh.sh already holds the lock when it invokes us (it exports
+# LAKELORE_PIPELINE_LOCK_HELD=1 after acquiring), so only standalone runs
+# acquire here.
+if [ -z "$LAKELORE_PIPELINE_LOCK_HELD" ]; then
+  ROOT="$HOME/lakelore-data"
+  # shellcheck source=/dev/null
+  source "$ROOT/bin/_lock.sh"
+  acquire_pipeline_lock "deploy-data" 3600 || { echo "❌ could not acquire pipeline lock (another refresh/deploy is running)"; exit 1; }
+fi
+
 # ── Drift check ───────────────────────────────────────────────────────────
 # Runs first so it can short-circuit a bad upload. Exits 2 when local is
 # behind prod somewhere; we honor that unless --force is set. Always print
@@ -97,6 +110,24 @@ for row in $MACHINE_ROWS; do
   MACHINE_IDS="$MACHINE_IDS $mid"
 done
 echo "machines:$MACHINE_IDS"
+
+# Keep-warm pingers (2026-08-25, folds in the 2026-08-14 manual workaround):
+# ssh/sftp sessions don't count as LB activity, so a machine can auto-stop
+# mid-sftp (machine 2869604c695d68 did, repeatedly). Ping each machine's
+# /healthz with fly-force-instance-id every 20s for the duration of the
+# upload. Self-terminating (45 min ceiling) so a failure exit under set -e
+# can't orphan an infinite loop; killed explicitly on the normal path.
+KEEPWARM_PIDS=""
+for mid in $MACHINE_IDS; do
+  (
+    for _i in $(seq 1 135); do
+      curl -s -o /dev/null --max-time 5 -H "fly-force-instance-id: $mid" "https://$APP.fly.dev/healthz" || true
+      sleep 20
+    done
+  ) &
+  KEEPWARM_PIDS="$KEEPWARM_PIDS $!"
+done
+stop_keepwarm() { for p in $KEEPWARM_PIDS; do kill "$p" 2>/dev/null || true; done; KEEPWARM_PIDS=""; }
 
 # A machine can AUTO-STOP mid-run (ssh/sftp sessions don't count as LB
 # activity — a fleet-wide upload takes long enough to hit the idle stop, which
@@ -180,10 +211,25 @@ legacy_src() {
   esac
 }
 
-ALL_REGISTRY_STATES=$(python3 -c "import json,os; print(' '.join(json.load(open(os.path.expanduser('~/lakelore-data/registry/states.json')))['states'].keys()))")
-for st in $ALL_REGISTRY_STATES; do
+# ACTIVE states only (2026-08-25 pre-ad review): this loop used to iterate
+# every registry state, which put held-state DBs (AK "may not reproduce or
+# distribute", AB Non-Commercial Licence, SK Crown copyright, …) on a
+# third-party host's volume even though serving correctly 400s them. Held
+# states never upload; remove any already-present held DBs from the volumes
+# via the one-time cleanup in ~/RUNBOOK.md. Explicitly naming a held state on
+# the command line still refuses (the filter is on the loop, not the arg —
+# an inactive state simply isn't in the loop).
+ACTIVE_REGISTRY_STATES=$(python3 -c "import json,os; s=json.load(open(os.path.expanduser('~/lakelore-data/registry/states.json')))['states']; print(' '.join(k for k,v in s.items() if v.get('active')))")
+for st in $ACTIVE_REGISTRY_STATES; do
   upload "$(src_for "$st" "$(legacy_src "$st")")" "/data/$st.db" "$st"
 done
+for st in $STATE_ARG; do
+  if [ "$st" != "all" ] && ! [[ " $ACTIVE_REGISTRY_STATES " == *" $st "* ]]; then
+    echo "⚠  $st: not an active state (held/inactive in the registry) — not uploaded"
+  fi
+done
+
+stop_keepwarm
 
 if [ "$NO_RESTART" -eq 1 ]; then
   # Schema-bump mode (2026-07-17): upload only, no restart. Running processes

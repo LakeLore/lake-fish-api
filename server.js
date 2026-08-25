@@ -105,6 +105,7 @@ const PORT = process.env.PORT || 3100;
 const STOCKING_CUTOFF_YEAR = new Date().getFullYear() - 10;
 
 const app = express();
+app.disable('x-powered-by');
 
 // Trust the Fly.io proxy so req.ip is the real client IP (not the edge IP)
 // — required for per-IP rate limiting to work correctly behind a load balancer.
@@ -136,8 +137,32 @@ app.use(cors({
 // feedback (≤2000-char message), subscribe (an email), and session attestation
 // proofs (iOS App Attest CBOR ≈ 5-6 KB raw → ~8 KB base64, the sizing floor
 // here). The express default of 100 KB let an unauthenticated writer grow the
-// jsonl volume 6x faster than needed.
-app.use(express.json({ limit: '16kb' }));
+// jsonl volume 6x faster than needed. The RC webhook gets its own 64 KB cap
+// (2026-08-25): RC events are normally 2-5 KB but large subscriber-attribute
+// payloads exist, and a 413 there silently degrades entitlement freshness to
+// the 5-min TTL.
+const _jsonSmall = express.json({ limit: '16kb' });
+const _jsonWebhook = express.json({ limit: '64kb' });
+app.use((req, res, next) =>
+  (req.path === '/webhooks/revenuecat' ? _jsonWebhook : _jsonSmall)(req, res, next));
+
+// Query params are a scalar contract (2026-08-25 pre-ad review): Express's
+// parser yields arrays for repeated keys (?species=A&species=B — retry
+// libraries do this) and objects for bracket syntax (lakeName[a]=x), and the
+// handlers bind values straight into better-sqlite3, which throws a 500 with
+// a driver-internal message. Flatten arrays to their first value and drop
+// non-string values before any handler runs; plain string params are
+// untouched, so golden replays are byte-identical.
+app.use('/api', (req, res, next) => {
+  const q = req.query;
+  for (const k of Object.keys(q)) {
+    const v = q[k];
+    if (typeof v === 'string') continue;
+    if (Array.isArray(v) && typeof v[0] === 'string') q[k] = v[0];
+    else delete q[k];
+  }
+  next();
+});
 
 // Healthcheck — independent of any state DB, used by the Fly healthcheck.
 // Kept outside /api so it bypasses rate limiting. Default shape is unchanged;
@@ -267,7 +292,10 @@ function probeState(state) {
   // probe BOTH (round-2 B3 added the results leg; redaction allowlists are
   // registry-coupled code that can throw exactly like the wire lists).
   r = _mockRes();
-  const previewReq = mkReq({ state, id: String(lake.id) }, {});
+  // Hashed id, like a real preview client: raw ids 402 in preview mode
+  // (2026-08-25 lakes-index join fix), and the hashed path also exercises the
+  // reverse-map resolution.
+  const previewReq = mkReq({ state, id: canonical.previewIdFor(state, String(lake.id)) }, {});
   previewReq.lakeLorePreview = true;
   canonical.lakeDetail(previewReq, r, canonicalCtx);
   if (r.statusCode !== 200) return `lake-preview:${r.statusCode}`;
@@ -933,20 +961,57 @@ app.get('/api/:state/status', (req, res) => {
 
 // ── /api/:state/filters ────────────────────────────────────────────────────────
 
-app.get('/api/:state/filters', (req, res) => {
-  if (!validateState(req, res)) return;
-  return canonical.filters(req, res, canonicalCtx);
-});
+// Response cache for the two public, entitlement-independent, deterministic
+// endpoints (2026-08-25 pre-ad review): the unfiltered MN /filters and
+// /measures each cost ~1s of SYNCHRONOUS better-sqlite3 CPU (397k-row
+// aggregate scans), and every new-user session pays both — under an
+// ad-driven install spike this is the first thing that saturates a
+// shared-cpu-1x machine, and it's an unauthenticated CPU lever. Bodies are
+// deterministic per immutable artifact, so cache per (path + sorted query)
+// with an LRU cap (junk-param cache-busting just evicts, degrading to
+// today's behavior) and drop a state's entries on /reload. Only 200s are
+// cached. The deep-readyz probe calls the handlers directly, so a broken
+// projection can't hide behind this cache.
+const _pubCache = new Map(); // key -> { at, body }
+const PUB_CACHE_MAX = 150;
+const PUB_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+function cachedStateRoute(handler) {
+  return (req, res) => {
+    if (!validateState(req, res)) return;
+    const qs = Object.keys(req.query).sort()
+      .map(k => `${k}=${String(req.query[k])}`).join('&');
+    const key = `${req.path}?${qs}`;
+    const hit = _pubCache.get(key);
+    if (hit && Date.now() - hit.at < PUB_CACHE_TTL_MS) {
+      _pubCache.delete(key); _pubCache.set(key, hit); // LRU touch
+      return res.json(hit.body);
+    }
+    const realJson = res.json.bind(res);
+    res.json = (body) => {
+      if (res.statusCode === 200) {
+        _pubCache.set(key, { at: Date.now(), body });
+        if (_pubCache.size > PUB_CACHE_MAX) _pubCache.delete(_pubCache.keys().next().value);
+      }
+      return realJson(body);
+    };
+    return handler(req, res, canonicalCtx);
+  };
+}
+function clearPubCache(state) {
+  const prefix = `/api/${state}/`;
+  for (const key of _pubCache.keys()) {
+    if (key.startsWith(prefix)) _pubCache.delete(key);
+  }
+}
+
+app.get('/api/:state/filters', cachedStateRoute(canonical.filters));
 
 // ── /api/:state/measures ─────────────────────────────────────────────────────
 // Measure × Gear/Source manifest (DATA_MODEL_PROPOSAL_2026-07-20). The app builds
 // its Measure selector + Gear/Source filter from this: a stable set of measures
 // (Abundance / Avg Size / Stocking Impact / Presence) with the gear/source
 // options nested under the ones that require them.
-app.get('/api/:state/measures', (req, res) => {
-  if (!validateState(req, res)) return;
-  return canonical.measures(req, res, canonicalCtx);
-});
+app.get('/api/:state/measures', cachedStateRoute(canonical.measures));
 
 // ── /api/:state/results ────────────────────────────────────────────────────────
 
@@ -983,6 +1048,12 @@ app.post('/api/:state/reload', requireReloadToken, (req, res) => {
   // added lakes, and a stale map 404s /lake/:id for preview users tapping a
   // new lake until a full restart (defeating /reload's whole purpose).
   canonical.clearPreviewLakeIdMap(state);
+  // Drop the SEO lakes-index cache and the filters/measures response cache
+  // for this state (2026-08-25): both are keyed to the artifact contents, and
+  // a stale index serves refreshed data's predecessor for up to 6 h —
+  // defeating /reload the same way the preview map did.
+  _lakesIndexCache.delete(state);
+  clearPubCache(state);
 
   // Clear the unhealthy flag so the reopen re-validates the (possibly
   // replaced) artifact's schema from scratch.

@@ -1150,8 +1150,13 @@ function results(req, res, ctx) {
     // "7 fish, rate unknown". The CASE guard confines the total_catch tiebreak
     // to the null-cpue block, so rows with a real cpue keep their exact prior
     // order (no tie-order regression for the legacy-parity states).
+    // Density-rank clamp (2026-08-26, pre-ad review Tier-1): a real 0.01-acre
+    // kids' pond at 7.8M adults/100ac is honest DATA but absurd as a #1
+    // RANKING. Sub-1-acre lakes keep their displayed density and rank by
+    // absolute adults_est instead (the NULL-density path that acreage-less
+    // lakes already take). Display values are untouched.
     const sortExpr = sortBy === 'stocked'
-      ? `(lsm.adults_per_100ac IS NULL) ASC, COALESCE(lsm.adults_per_100ac, lsm.adults_est) ${dir} NULLS LAST`
+      ? `(CASE WHEN l.area_acres >= 1 THEN lsm.adults_per_100ac END IS NULL) ASC, COALESCE(CASE WHEN l.area_acres >= 1 THEN lsm.adults_per_100ac END, lsm.adults_est) ${dir} NULLS LAST`
       : sortBy === 'cpue'
       ? `(fc.cpue_effective IS NULL) ASC, fc.cpue_effective ${dir}, (CASE WHEN fc.cpue_effective IS NULL THEN fc.total_catch END) DESC`
       : null;
@@ -1334,8 +1339,8 @@ function stockingFirstResults(req, res, opts) {
     const total = db.prepare(`SELECT COUNT(*) AS n ${joins}`).get(...args).n;
     let rows = db.prepare(`
       SELECT ${selectCols} ${joins}
-      ORDER BY (m.adults_per_100ac IS NULL) ASC,
-               COALESCE(m.adults_per_100ac, m.adults_est) ${dir} NULLS LAST,
+      ORDER BY (CASE WHEN l.area_acres >= 1 THEN m.adults_per_100ac END IS NULL) ASC,
+               COALESCE(CASE WHEN l.area_acres >= 1 THEN m.adults_per_100ac END, m.adults_est) ${dir} NULLS LAST,
                l.name ASC
       LIMIT ? OFFSET ?
     `).all(...args, limitNum, offsetNum);

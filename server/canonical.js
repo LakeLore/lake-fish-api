@@ -141,6 +141,11 @@ const RESULTS_SRC = {
   psd: 'fc.psd', psd_p: 'fc.psd_p', wr: 'fc.wr',
   wr_sq: 'fc.wr_sq', wr_qp: 'fc.wr_qp', wr_pm: 'fc.wr_pm', wr_m: 'fc.wr_m',
   n_sq: 'fc.n_sq', n_qp: 'fc.n_qp', n_pm: 'fc.n_pm', n_m: 'fc.n_m',
+  // Trophy Abundance (schema v8, 2026-09-10): catch rate of fish at/above the
+  // species' Gabelhouse preferred/memorable length, same unit as the row's
+  // cpue; trophy_derivation = measured | published | psd_scaled | apportioned.
+  cpue_preferred: 'fc.cpue_preferred', cpue_memorable: 'fc.cpue_memorable',
+  trophy_derivation: 'fc.trophy_derivation',
   ef_stations: 's.ef_stations', hn_stations: 's.hn_stations', fn_stations: 's.fn_stations',
   stocked_per_100ac: 'lsm.adults_per_100ac AS stocked_per_100ac',
   // Absolute estimated surviving adults — the metric for stocked lakes with
@@ -200,6 +205,9 @@ const LAKE_CATCHES_SRC = {
   psd: 'fc.psd', psd_p: 'fc.psd_p', wr: 'fc.wr',
   wr_sq: 'fc.wr_sq', wr_qp: 'fc.wr_qp', wr_pm: 'fc.wr_pm', wr_m: 'fc.wr_m',
   n_sq: 'fc.n_sq', n_qp: 'fc.n_qp', n_pm: 'fc.n_pm', n_m: 'fc.n_m',
+  // Trophy Abundance (schema v8) — see RESULTS_SRC note.
+  cpue_preferred: 'fc.cpue_preferred', cpue_memorable: 'fc.cpue_memorable',
+  trophy_derivation: 'fc.trophy_derivation',
   ef_stations: 's.ef_stations', hn_stations: 's.hn_stations', fn_stations: 's.fn_stations',
   // Agency forecast rating (schema v4) — without these on the /lake wire, the
   // ratings-tier states' HEADLINE metric appears in /results but vanishes on
@@ -846,6 +854,51 @@ function measures(req, res, ctx) {
       });
     }
 
+    // ── MEASURE: Trophy Abundance (schema v8, 2026-09-10): catch rate of fish
+    //    at/above the species' Gabelhouse PREFERRED / MEMORABLE length, in the
+    //    same unit as the gear's cpue (ND measured per-fish counts; SD
+    //    cpue×PSD-P; KS/VA agency-published tier rates — trophy_derivation on
+    //    the wire says which). Sources are gear × tier, exactly like
+    //    abundance's gear sources: the client scopes /results by ?gear= and
+    //    sorts by cpue_preferred / cpue_memorable. Sits after Avg Size in the
+    //    cascade so it never captures a state's default measure. NOTE: MB's
+    //    'LIFA trophy rating (0-5)' stays a diverted Avg Size ranking (see
+    //    SIZE_RANK_GEAR above) — it is a how-big-they-run RATING, not a catch
+    //    rate, and MB carries no tier columns (owner can revisit at MB
+    //    reactivation).
+    if (wireResults.includes('cpue_preferred')) {
+      const trophySources = [];
+      for (const [tier, col] of [['memorable', 'cpue_memorable'], ['preferred', 'cpue_preferred']]) {
+        for (const r of db.prepare(`
+          SELECT fc.gear_category AS gear, MAX(fc.cpue_kind) AS kind,
+                 COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
+          FROM fish_catch fc ${countyJoin}
+          WHERE fc.${col} IS NOT NULL AND fc.gear_category IS NOT NULL
+            ${speciesAnd} ${countyAnd}
+          GROUP BY fc.gear_category
+        `).all(...args)) {
+          trophySources.push({
+            id: `trophy:${tier}:${r.gear}`, gear: r.gear, cpueKind: null,
+            expression: r.kind === 'relative' ? 'ranking' : 'catch-per-unit',
+            tier,
+            label: `${gearBaseName(r.gear)} · ${tier === 'memorable' ? 'Memorable+' : 'Preferred+'}`,
+            unit: deriveAbundanceUnit(r.gear, r.kind || 'gear'),
+            sort: col, sortDir: 'desc', stockingFirst: false,
+            records: r.records, lakes: r.lakes,
+          });
+        }
+      }
+      if (trophySources.length) {
+        trophySources.sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
+        out.push({
+          id: 'trophy', label: 'Trophy Abundance', requiresSource: true,
+          records: trophySources.reduce((s, x) => s + x.records, 0),
+          lakes: Math.max(...trophySources.map(x => x.lakes)),
+          sources: trophySources,
+        });
+      }
+    }
+
     // ── MEASURE: Presence — DERIVED UNION of every lake+species across all
     //    measures (fish_catch ∪ lake_stocking_metrics), the guaranteed terminal
     //    fallback. Always present (owner call 2026-07-20). ──
@@ -894,8 +947,13 @@ function measures(req, res, ctx) {
     for (const m of out) {
       const ranked = m.sources.slice()
         .sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
+      // Trophy prefers the MEMORABLE tier (the truer "trophy" signal) from a
+      // measured/published rate; SD (preferred-only) and KS (relative-only)
+      // fall through to most-records.
       const primary = m.id === 'size'
         ? ranked.filter(s => s.expression !== 'ranking')
+        : m.id === 'trophy'
+        ? ranked.filter(s => s.tier === 'memorable' && s.expression !== 'ranking')
         : ranked.filter(s => s.sort === 'cpue');
       m.defaultSourceId = (primary[0] ?? ranked[0])?.id ?? null;
     }
@@ -1137,6 +1195,9 @@ function results(req, res, ctx) {
       rating: 'fc.rating_ordinal',
       psd: 'fc.psd', psd_p: 'fc.psd_p', wr: 'fc.wr',
       wr_sq: 'fc.wr_sq', wr_qp: 'fc.wr_qp', wr_pm: 'fc.wr_pm', wr_m: 'fc.wr_m',
+      // Trophy Abundance (schema v8): tier catch rates; NULLS LAST via the
+      // default sort expression keeps tier-less rows at the bottom.
+      cpue_preferred: 'fc.cpue_preferred', cpue_memorable: 'fc.cpue_memorable',
     };
     const sortCol = SORT_COLS[sortBy] ?? 'fc.cpue_effective';
     const dir = sortDir === 'asc' ? 'ASC' : 'DESC';

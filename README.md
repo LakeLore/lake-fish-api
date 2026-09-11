@@ -15,12 +15,17 @@ lake-fish-mobile-server/
   server/
     canonical.js       — generic registry-driven filters/results/lake handlers
     attest.js          — App Attest / Play Integrity verification for POST /api/session
+    ask.js             — Ask LakeLore agent (POST /api/:state/ask; off unless LAKELORE_ASK_ENABLED=1)
+  bin/
+    ask.js             — terminal chat harness for the ask route (not shipped in the image)
   package.json         — better-sqlite3, express, cors, express-rate-limit,
                          @sentry/node, appattest-checker-node
   deploy/
     Dockerfile         — two-stage Alpine build (compiles native sqlite, slim runtime)
     fly.toml           — Fly app config (2 machines in ord since the 2026-07-16
                          scale-out — RUNBOOK §14; 512 MB each, /healthz check)
+    fly.staging.toml   — STAGING app `lake-fish-api-staging` (2026-09-11): same image,
+                         own volume, idles to zero, LAKELORE_ASK_ENABLED=1 — RUNBOOK §19
     .dockerignore      — strict allow-list (server files + the lakelore-data
                          runtime files the Dockerfile COPYs — nothing else)
     fetch.sh           — local: scrape one state and POST /reload to dev server
@@ -68,6 +73,13 @@ State databases (drift-check → per-machine upload → restart → `/readyz` ga
 ~/deploy-data.sh mn sd     # several states
 ```
 
+**Staging** (2026-09-11 — `lake-fish-api-staging`, RUNBOOK §19): the same two scripts, retargeted by one variable each; production defaults are unchanged when the variable is unset.
+
+```bash
+FLY_CONFIG=deploy/fly.staging.toml ~/lake-fish-mobile-server/deploy/deploy.sh   # image (same gates)
+LAKELORE_FLY_APP=lake-fish-api-staging ~/deploy-data.sh mn                     # data (drift check vs staging)
+```
+
 ## Secrets
 
 Fly secrets currently set in production: `RELOAD_TOKEN`, `REVENUECAT_SECRET_KEY`, `REVENUECAT_PROJECT_ID`, `REVENUECAT_WEBHOOK_AUTH`, `SENTRY_DSN`, `LAKELORE_JWT_SECRET` (+ `PLAY_INTEGRITY_SA_JSON` pending Play console steps). Full purpose-by-purpose table: `./CLAUDE.md` "Fly secrets currently set"; storage locations and rotation: `~/APP_OPS.md`.
@@ -99,6 +111,7 @@ echo "$NEW" > ~/.lakelore_reload_token && chmod 600 ~/.lakelore_reload_token
 | `GET /api/session/challenge` | Attestation challenge for session issuance | Requires `X-User-Id` + valid `X-User-Sig`. Stateless HMAC nonce bound to the userId, 10-min TTL — verifies on either Fly machine. |
 | `POST /api/session` | Mint a 7-day HS256 session token | Requires `X-User-Id` + valid `X-User-Sig`. Optional JSON body `{platform, challenge, keyId?, attestation?, token?}` carries an App Attest (iOS) / Play Integrity (Android) proof — verified server-side (`server/attest.js`), stamps `att: ios\|android\|none` on the token and `attested` on the response. Unattested issuance still succeeds until `LAKELORE_REQUIRE_ATTEST=1` (RUNBOOK §16). Telemetry: hourly `[attest]` log + `attest` in `/healthz?deep=1`. |
 | `POST /api/feedback` | Capture in-app feedback | Appends one JSON line per submission to `/data/feedback.jsonl` on the volume. `message` 1–2000 chars, all other fields optional. Bodies capped at 16 KB (global `express.json` limit); the jsonl file is capped at 50 MB (503 `storage_full` beyond — truncate after export to recover). |
+| `POST /api/:state/ask` | **Ask LakeLore** — natural-language lake search (2026-09-10, dev-only so far) | A Claude tool-use loop (`server/ask.js`, Anthropic SDK `toolRunner`, model `claude-opus-5`, effort `medium`, both env-overridable via `LAKELORE_ASK_MODEL` / `LAKELORE_ASK_EFFORT`) over the SAME canonical handlers: the model can only call `search_lakes` (→ `canonical.results`, trimmed rows, ≤25) and `get_lake` (→ `canonical.lakeDetail`, summarized), so every lake it names is one a tool returned this turn. Body `{messages:[{role,content}]}` (≤20 alternating turns, ≤2000 chars each, ≤12k total; the client resends the whole conversation — the server is stateless). Response `{answer, answer_text, lakes[], usage}`: `answer` carries `[[lake_id\|Name]]` markers the app renders as tappable lake cards from `lakes[]`; `answer_text` is the marker-free form the client sends back as history. **Route is registered only when `LAKELORE_ASK_ENABLED=1`** (503 `ask_unavailable` otherwise — production does not set it yet). Paid states require the entitlement outright (402, no preview mode). Per-user cap 40/h (`LAKELORE_ASK_PER_HOUR`) on top of the global limiter. Credentials: SDK default resolution (`ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → `ant auth login` profile); no credential → 503 `ask_unconfigured`. Refusal fallbacks on (`fallbacks: "default"`). Per-state system prompt (~3.4k tokens for MN: species table, counties, measure/source ids) is prompt-cached 1 h and dropped on `/reload`. Each ask logs one `[ask]` line + a JSONL record to `LAKELORE_ASK_LOG` (default `$LAKELORE_DB_DIR/ask.jsonl`, capped 50 MB). Dev servers also accept `{tool:{name,input}}` to run one tool with no model call. Terminal harness: `node bin/ask.js mn --base http://localhost:3100`. **Measured 2026-09-11 (Opus 5, effort medium):** ~$0.03–0.05 per ask with a warm cache (2–3 model calls, 1–2 tools, 11–12 s), ~$0.01 for a no-tool reply, ~$0.10 for the first ask per state per hour (cache write of the ~8.5k-token system prompt + tool schemas). Sonnet 5 on the same probes: about ⅓ the cost ($0.01–0.04) and 7–11 s, with slightly weaker judgment on sample size/recency and gear units — model choice still an owner decision. |
 | `POST /api/subscribe` | Marketing-site email capture | Appends `{ts, email, state, source}` to `/data/subscribers.jsonl` on the volume **of whichever machine served the request** — with two machines the full list only exists as the union. Export/backup via `~/lakelore-data/bin/backup-userdata.sh` (pulls BOTH machines, merges+dedupes, syncs to B2 `userdata/`; runs inside the weekly backup sweep). Do NOT use a single-machine `fly ssh console -C cat` — it silently undercounts. Email format-validated (≤320 chars), other fields truncated. **Public unauthenticated write surface** — only the global rate limit stands between it and the disk. |
 | `GET /api/:state/lakes-index` | Public SEO index for the marketing site | Lake names + per-lake survey/species/stocking **counts** only, no metrics — powers lakeloreapp.com's programmatic per-lake pages. Deliberately NOT in the entitlement gate (the lake name is the search term; the numbers stay behind the sub). 6-hour in-memory cache per state. |
 | `POST /webhooks/revenuecat` | RevenueCat purchase-event webhook | Invalidates the per-user entitlement cache so `/api/me/entitlement` sees changes before the 5-min TTL. Auth: `Authorization` header compared byte-for-byte to `REVENUECAT_WEBHOOK_AUTH`; if the secret is unset, accepts unsigned events with a warning log. |

@@ -18,7 +18,11 @@
 
 set -e
 
-APP="lake-fish-api"
+# Target app. Default = production. Staging (2026-09-11):
+#   LAKELORE_FLY_APP=lake-fish-api-staging ~/deploy-data.sh mn
+# Everything downstream (machine enumeration, sftp, restart, /readyz gate,
+# drift check) keys off $APP, so a staging upload can never touch production.
+APP="${LAKELORE_FLY_APP:-lake-fish-api}"
 FLY="$HOME/.fly/bin/fly"
 # $0 is usually invoked via the ~/deploy-data.sh symlink, so plain dirname
 # points at $HOME. Resolve the real path so the sibling helper is found.

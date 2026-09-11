@@ -1,0 +1,42 @@
+# fly.staging.toml — STAGING app (2026-09-11). Same image and Dockerfile as
+# production (deploy.sh passes this file via FLY_CONFIG), different app name and
+# volume, so nothing here can reach lake-fish-api. Exists so a TestFlight build
+# on the `staging` EAS profile can exercise unreleased server code + data
+# (first use: the Ask LakeLore agent + schema v8 Trophy Abundance).
+#
+# Deploy image:  FLY_CONFIG=deploy/fly.staging.toml ./deploy/deploy.sh
+# Upload data:   LAKELORE_FLY_APP=lake-fish-api-staging ~/deploy-data.sh
+# Secrets:       see ~/APP_OPS.md "Fly secrets — staging"
+app = 'lake-fish-api-staging'
+primary_region = 'ord'
+
+[build]
+
+[env]
+  NODE_ENV = 'production'
+  # The Ask route only registers when this is set (server/ask.js). Production
+  # does not set it; staging does so the TestFlight build can reach it.
+  LAKELORE_ASK_ENABLED = '1'
+
+[http_service]
+  internal_port = 3100
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0   # staging idles to zero — cold start on first tap is fine
+
+  [[http_service.checks]]
+    grace_period = '30s'
+    interval = '30s'
+    method = 'GET'
+    path = '/healthz'
+    timeout = '10s'
+
+[[mounts]]
+  source = 'lake_fish_data_staging'
+  destination = '/data'
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1

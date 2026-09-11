@@ -37,7 +37,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-APP = "lake-fish-api"
+import os
+# Target app — mirrors deploy-data.sh's LAKELORE_FLY_APP override (2026-09-11)
+# so a staging upload compares against staging, never against production.
+APP = os.environ.get("LAKELORE_FLY_APP", "lake-fish-api")
 ROOT = Path(__file__).resolve().parents[2]  # ~ (project root)
 FLY = str(Path.home() / ".fly" / "bin" / "fly")
 

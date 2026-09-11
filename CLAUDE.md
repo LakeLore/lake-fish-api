@@ -24,6 +24,12 @@ server/canonical.js       — generic registry-driven filters/results/lake handl
 server/attest.js          — App Attest (iOS) / Play Integrity (Android) proof
                             verification for POST /api/session; challenge HMAC
                             derived from LAKELORE_JWT_SECRET
+server/ask.js             — POST /api/:state/ask "Ask LakeLore" agent (2026-09-10,
+                            dev-only: route exists only under LAKELORE_ASK_ENABLED=1).
+                            Anthropic SDK toolRunner over the canonical handlers —
+                            tools search_lakes/get_lake call canonical.results /
+                            canonical.lakeDetail in-process; see README endpoint row
+bin/ask.js                — terminal chat harness for that route (no app needed)
 entitlement.js            — RC v2 entitlement gate + cache
 package.json              — express, cors, better-sqlite3, express-rate-limit,
                             @sentry/node
@@ -37,6 +43,10 @@ deploy/
                             Build context is ~/ (so cross-folder COPY works).
   fly.toml                — two machines in ord (2026-07-16 scale-out, RUNBOOK
                             §14), 512 MB each, /healthz check
+  fly.staging.toml        — STAGING app lake-fish-api-staging (2026-09-11): same
+                            Dockerfile, own volume, idles to zero, ask route on.
+                            deploy.sh takes FLY_CONFIG=…, deploy-data.sh takes
+                            LAKELORE_FLY_APP=… (RUNBOOK §19)
   .dockerignore           — strict allow-list
   fetch.sh                — local: scrape one state and POST /reload to dev server
   deploy-data.sh          — production: drift-check, sftp state DBs to EVERY
@@ -64,6 +74,7 @@ All five deploy artifacts are symlinked from `~/` so existing commands (`flyctl 
 - 5-min per-user entitlement cache (in-memory; error results 30 s via per-entry `_ttl`). Invalidated by RC webhook events at `POST /webhooks/revenuecat`. `FREE_STATES` derives from registry `free:true` flags (2026-07-17). **RC-outage grace (72 h)**: last-positive entitlements per user persist write-through to `/data/entitlement-lastgood.json` per machine (2026-07-17), so a restart/failover mid-outage no longer wipes the grace map; `/api/me/entitlement` returns `source`, and the 1.1.0 client treats `rc-error` as "fall back to the on-device RC SDK receipt" instead of an authoritative false.
 - **Important — RC v2 active_entitlements gotcha:** the `/v2/projects/{id}/customers/{user_id}/active_entitlements` endpoint returns items that carry only `entitlement_id` (`entl_xxx`), never `lookup_key`. We resolve `LakeLore All-States` → its `entl_xxx` ID once at process startup (`_resolveAllStatesEntitlementId`) and match on the internal ID. If the entitlement is ever recreated in the RC dashboard, restart the server to pick up the new ID.
 - Rate limit 600 req / 15 min per IP via `express-rate-limit`. `app.set('trust proxy', 1)` for real client IP behind Fly's edge.
+- **Ask LakeLore agent (2026-09-10, NOT in production yet):** `POST /api/:state/ask` runs a Claude tool-use loop (`server/ask.js`) whose only tools are the canonical `results`/`lakeDetail` handlers, so the model can't name a lake a query didn't return; the per-state system prompt (species natives, counties, measure/source ids from `/filters` + `/measures`) is prompt-cached and cleared on `/reload`. Off unless `LAKELORE_ASK_ENABLED=1`; needs an Anthropic credential on the machine (local: `ant auth login` personal profile — **dev/testing only**; production must use a Console API key as a Fly secret, which is also a new-secret + privacy-policy trigger in `~/CLAUDE.md`). Paid states 402 without entitlement (no preview mode); 40 asks/user/hour. The mobile entry point is dev-only (`lake-fish-mobile/src/askFeature.ts`).
 
 ## Deploy
 
@@ -74,7 +85,13 @@ All five deploy artifacts are symlinked from `~/` so existing commands (`flyctl 
 
 # Raw escape hatch (skips the gates — emergencies only):
 cd ~ && ~/.fly/bin/flyctl deploy --config ~/lake-fish-mobile-server/deploy/fly.toml
+
+# STAGING (2026-09-11): same gates, different app — production untouched.
+FLY_CONFIG=deploy/fly.staging.toml ~/lake-fish-mobile-server/deploy/deploy.sh
+LAKELORE_FLY_APP=lake-fish-api-staging ~/deploy-data.sh          # data to staging
 ```
+
+The Dockerfile + `.dockerignore` are strict allow-lists: a NEW server file must be added to BOTH or the image silently ships without it (`server/ask.js` was added 2026-09-11; `bin/` is deliberately not shipped).
 
 A deliberate wire change fails the parity gate by design — re-record the
 goldens (`node ~/lakelore-data/bin/parity.js <st> --record golden/<st>/`)

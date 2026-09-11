@@ -16,6 +16,12 @@
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 FLY="${FLY:-$HOME/.fly/bin/flyctl}"
+# Which Fly config (and therefore which app) to deploy. Default = production.
+# Staging (2026-09-11): FLY_CONFIG=deploy/fly.staging.toml ./deploy/deploy.sh
+# — same gates, same image, different app name/volume; production untouched.
+FLY_CONFIG="${FLY_CONFIG:-$DIR/deploy/fly.toml}"
+case "$FLY_CONFIG" in /*) ;; *) FLY_CONFIG="$DIR/$FLY_CONFIG" ;; esac
+[ -f "$FLY_CONFIG" ] || { echo "❌ FLY_CONFIG not found: $FLY_CONFIG"; exit 1; }
 
 # ── 0/4 Provenance gate (2026-07-28) ─────────────────────────────────────────
 # Deploys ship the WORKING TREE (build context ~/, which COPYs this repo AND
@@ -57,14 +63,14 @@ done
 
 echo "== 3/4 flyctl deploy =="
 cd "$HOME"
-"$FLY" deploy --config "$DIR/deploy/fly.toml"
+"$FLY" deploy --config "$FLY_CONFIG"
 
 # ── 4/4 Post-deploy readiness gate (2026-07-25, T3.1) ────────────────────────
 # Fly's own check is the unconditional /healthz — a code deploy that 500s
 # every state's data path used to pass it and only surface via the 15-min
 # uptime probe. Reuse deploy-data.sh's gate: LB /readyz, then per-machine
 # ?deep=1 (a real query per state), plus the client-config endpoint.
-APP=$(sed -n "s/^app = ['\"]\(.*\)['\"]$/\1/p" "$DIR/deploy/fly.toml" | head -1)
+APP=$(sed -n "s/^app = ['\"]\(.*\)['\"]$/\1/p" "$FLY_CONFIG" | head -1)
 [ -n "$APP" ] || APP="lake-fish-api"
 echo "== 4/4 post-deploy readiness gate =="
 READY_LB=0

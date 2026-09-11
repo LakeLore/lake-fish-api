@@ -17,6 +17,7 @@ COPY lake-fish-mobile-server/server.js                         ./lake-fish-mobil
 COPY lake-fish-mobile-server/entitlement.js                    ./lake-fish-mobile-server/entitlement.js
 COPY lake-fish-mobile-server/server/canonical.js               ./lake-fish-mobile-server/server/canonical.js
 COPY lake-fish-mobile-server/server/attest.js                  ./lake-fish-mobile-server/server/attest.js
+COPY lake-fish-mobile-server/server/ask.js                     ./lake-fish-mobile-server/server/ask.js
 
 # Canonical data layer: registry + schema assertion + shared survival model.
 # server.js requires it via ../lakelore-data and exits at startup if missing;

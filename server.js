@@ -31,7 +31,7 @@ const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
 const rateLimit = require('express-rate-limit');
-const { gateByState, checkEntitlement, invalidateCache, stats: entitlementStats, noteWebhook } = require('./entitlement');
+const { gateByState, checkEntitlement, invalidateCache, stats: entitlementStats, noteWebhook, isPaidState } = require('./entitlement');
 
 // ── Canonical data layer (lakelore-data) — REQUIRED ────────────────────────────
 // The registry (states.json), species map, canonical-schema assertion, and the
@@ -1027,6 +1027,42 @@ app.get('/api/:state/lake/:id', (req, res) => {
   return canonical.lakeDetail(req, res, canonicalCtx);
 });
 
+// ── POST /api/:state/ask (2026-09-10) ─────────────────────────────────────────
+// "Tell me where to fish" — a Claude tool-use loop over the canonical
+// handlers (server/ask.js). OFF unless LAKELORE_ASK_ENABLED=1 so a deploy
+// without credentials can't expose it. Paid states require the entitlement
+// outright (no preview mode — a redacted-identity answer is useless), and
+// every ask counts against a per-user hourly cap on top of the global
+// per-IP limiter, because each call costs real money upstream.
+const ASK_ENABLED = process.env.LAKELORE_ASK_ENABLED === '1';
+const askAgent = ASK_ENABLED ? require('./server/ask') : null;
+if (ASK_ENABLED) console.log(`[ask] enabled — model=${askAgent.MODEL} effort=${askAgent.EFFORT}`);
+const askLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: Number(process.env.LAKELORE_ASK_PER_HOUR || 40),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.get('x-user-id') || req.ip,
+  message: { error: 'ask_quota', message: 'You have used the assistant a lot this hour — try again later.' },
+});
+app.post('/api/:state/ask', askLimiter, async (req, res) => {
+  if (!ASK_ENABLED) return res.status(503).json({ error: 'ask_unavailable' });
+  if (!validateState(req, res)) return;
+  const { state } = req.params;
+  if (isPaidState(state)) {
+    const userId = req.get('x-user-id');
+    if (!userId) return res.status(402).json({ error: 'subscription_required', state });
+    let ent;
+    try { ent = await checkEntitlement(userId); }
+    catch (err) {
+      console.warn('[ask] entitlement error:', err);
+      return res.status(500).json({ error: 'entitlement_check_failed' });
+    }
+    if (!ent.hasAllStates) return res.status(402).json({ error: 'subscription_required', state, expiresAt: ent.expiresAt });
+  }
+  return askAgent.ask(req, res, { ...canonicalCtx, canonical, lakeloreData });
+});
+
 // ── /api/:state/reload ────────────────────────────────────────────────────────
 // Drops and reopens the DB connection for one state so fresh data is served
 // immediately after a normalize + upload — no server restart needed.
@@ -1054,6 +1090,7 @@ app.post('/api/:state/reload', requireReloadToken, (req, res) => {
   // defeating /reload the same way the preview map did.
   _lakesIndexCache.delete(state);
   clearPubCache(state);
+  if (askAgent) askAgent.clearAskCache(state);
 
   // Clear the unhealthy flag so the reopen re-validates the (possibly
   // replaced) artifact's schema from scratch.

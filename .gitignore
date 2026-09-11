@@ -8,3 +8,6 @@ node_modules/
 .env.local
 .lakelore_reload_token
 deploy/__pycache__/
+
+# runtime write-through of last-good entitlements when the server runs locally (prod writes /data)
+.entitlement-lastgood.json

@@ -854,39 +854,42 @@ function measures(req, res, ctx) {
       });
     }
 
-    // ── MEASURE: Trophy Abundance (schema v8, 2026-09-10): catch rate of fish
-    //    at/above the species' Gabelhouse PREFERRED / MEMORABLE length, in the
-    //    same unit as the gear's cpue (ND measured per-fish counts; SD
-    //    cpue×PSD-P; KS/VA agency-published tier rates — trophy_derivation on
-    //    the wire says which). Sources are gear × tier, exactly like
-    //    abundance's gear sources: the client scopes /results by ?gear= and
-    //    sorts by cpue_preferred / cpue_memorable. Sits after Avg Size in the
-    //    cascade so it never captures a state's default measure. NOTE: MB's
+    // ── MEASURE: Trophy Abundance (schema v8, 2026-09-10): catch rate of
+    //    TRUE TROPHY fish — at/above the species' Gabelhouse MEMORABLE length
+    //    — in the same unit as the gear's cpue (ND measured per-fish counts;
+    //    VA/KS agency-published rates — trophy_derivation on the wire says
+    //    which). One source per gear, scoped by ?gear=, sorted by
+    //    cpue_memorable. Sits after Avg Size in the cascade so it never
+    //    captures a state's default measure. NOTE: MB's
     //    'LIFA trophy rating (0-5)' stays a diverted Avg Size ranking (see
     //    SIZE_RANK_GEAR above) — it is a how-big-they-run RATING, not a catch
     //    rate, and MB carries no tier columns (owner can revisit at MB
     //    reactivation).
-    if (wireResults.includes('cpue_preferred')) {
+    // SINGLE TIER (owner call 2026-09-11): true trophies only — the MEMORABLE
+    // class and up ("the equivalent of a 25-inch-plus walleye"; LMB 20in, NOP
+    // 34in). cpue_preferred stays in the artifacts and on the wire but is NOT
+    // a measure — no tier choice, one source per gear like every other
+    // measure. SD consequently carries no Trophy measure (its only clean
+    // derivation was preferred-plus via PSD-P; the n_*-count memorable route
+    // is grain-defective — see adapters/sd.js).
+    if (wireResults.includes('cpue_memorable')) {
       const trophySources = [];
-      for (const [tier, col] of [['memorable', 'cpue_memorable'], ['preferred', 'cpue_preferred']]) {
-        for (const r of db.prepare(`
-          SELECT fc.gear_category AS gear, MAX(fc.cpue_kind) AS kind,
-                 COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
-          FROM fish_catch fc ${countyJoin}
-          WHERE fc.${col} IS NOT NULL AND fc.gear_category IS NOT NULL
-            ${speciesAnd} ${countyAnd}
-          GROUP BY fc.gear_category
-        `).all(...args)) {
-          trophySources.push({
-            id: `trophy:${tier}:${r.gear}`, gear: r.gear, cpueKind: null,
-            expression: r.kind === 'relative' ? 'ranking' : 'catch-per-unit',
-            tier,
-            label: `${gearBaseName(r.gear)} · ${tier === 'memorable' ? 'Memorable+' : 'Preferred+'}`,
-            unit: deriveAbundanceUnit(r.gear, r.kind || 'gear'),
-            sort: col, sortDir: 'desc', stockingFirst: false,
-            records: r.records, lakes: r.lakes,
-          });
-        }
+      for (const r of db.prepare(`
+        SELECT fc.gear_category AS gear, MAX(fc.cpue_kind) AS kind,
+               COUNT(*) AS records, COUNT(DISTINCT fc.lake_id) AS lakes
+        FROM fish_catch fc ${countyJoin}
+        WHERE fc.cpue_memorable IS NOT NULL AND fc.gear_category IS NOT NULL
+          ${speciesAnd} ${countyAnd}
+        GROUP BY fc.gear_category
+      `).all(...args)) {
+        trophySources.push({
+          id: `trophy:${r.gear}`, gear: r.gear, cpueKind: null,
+          expression: r.kind === 'relative' ? 'ranking' : 'catch-per-unit',
+          label: gearBaseName(r.gear),
+          unit: deriveAbundanceUnit(r.gear, r.kind || 'gear'),
+          sort: 'cpue_memorable', sortDir: 'desc', stockingFirst: false,
+          records: r.records, lakes: r.lakes,
+        });
       }
       if (trophySources.length) {
         trophySources.sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
@@ -947,13 +950,10 @@ function measures(req, res, ctx) {
     for (const m of out) {
       const ranked = m.sources.slice()
         .sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
-      // Trophy prefers the MEMORABLE tier (the truer "trophy" signal) from a
-      // measured/published rate; SD (preferred-only) and KS (relative-only)
-      // fall through to most-records.
-      const primary = m.id === 'size'
+      // Trophy (single memorable tier since 2026-09-11) prefers a
+      // measured/published rate over KS's relative-basis ranking.
+      const primary = m.id === 'size' || m.id === 'trophy'
         ? ranked.filter(s => s.expression !== 'ranking')
-        : m.id === 'trophy'
-        ? ranked.filter(s => s.tier === 'memorable' && s.expression !== 'ranking')
         : ranked.filter(s => s.sort === 'cpue');
       m.defaultSourceId = (primary[0] ?? ranked[0])?.id ?? null;
     }

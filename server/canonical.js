@@ -984,6 +984,7 @@ function results(req, res, ctx) {
     const {
       species, lakeName, gear,
       minCpue, maxCpue,
+      minTrophy, maxTrophy,
       minYear, maxYear,
       county, minAcres, maxAcres,
       minStocked, maxStocked,
@@ -1056,6 +1057,12 @@ function results(req, res, ctx) {
 
     if (minCpue !== undefined && minCpue !== '') { conditions.push('fc.cpue_effective >= ?'); params.push(parseFloat(minCpue)); }
     if (maxCpue !== undefined && maxCpue !== '') { conditions.push('fc.cpue_effective <= ?'); params.push(parseFloat(maxCpue)); }
+
+    // Trophy Abundance range (2026-09-14, additive + parity-safe): filters on
+    // the trophy-class rate (schema v8 cpue_memorable). Absent → byte-identical
+    // legacy path. Rows without a trophy rate never match a bounded range.
+    if (minTrophy !== undefined && minTrophy !== '') { conditions.push('fc.cpue_memorable >= ?'); params.push(parseFloat(minTrophy)); }
+    if (maxTrophy !== undefined && maxTrophy !== '') { conditions.push('fc.cpue_memorable <= ?'); params.push(parseFloat(maxTrophy)); }
     if (minYear !== undefined && minYear !== '') { conditions.push('s.survey_year >= ?'); params.push(parseInt(minYear, 10)); }
     if (maxYear !== undefined && maxYear !== '') { conditions.push('s.survey_year <= ?'); params.push(parseInt(maxYear, 10)); }
 

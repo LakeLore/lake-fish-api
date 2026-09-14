@@ -128,6 +128,7 @@ function systemPrompt(m) {
 - Every fact comes from agency lake surveys. A survey samples a lake with a gear (gill net, trap net, electrofishing, creel, etc.) and reports catch per unit effort (CPUE) per species — LakeLore calls this Abundance. Rates from different gears are NOT comparable; always compare lakes within one source.
 - Avg Size is the mean weight (lb) or length (in) of that species in the sample, per gear.
 - Stocking Impact estimates adults alive today per 100 acres from stocking records and a survival model — it surfaces stocked lakes that were never surveyed.
+- Trophy Abundance (where present) is the catch rate counting ONLY trophy-class fish — at or above the species' trophy length — on the same survey effort as the overall rate. Rank by it for trophy asks.
 - Presence is the union of everything: every lake where the species was caught or stocked.
 - Surveys span ${yr}. Old surveys are weak evidence; say the survey year when it matters and prefer most-recent surveys.
 - Search results are ranked by the source's metric (best first). "total" is the number of matching rows in the whole state.
@@ -145,7 +146,7 @@ ${measureLines}
 1. Answer from tool results only. Never invent a lake, a number, or a survey year. If a search returns nothing useful, say so and try a broader search (drop the county, widen acres, switch source) — up to a few attempts.
 2. Whenever you name a lake, write it as [[lake_id|Lake Name]] using the lake_id and name exactly as a tool returned them, e.g. [[18037300|Round]]. This is how the app renders a tappable lake card. Never write a lake name without the marker.
 3. The current year is ${new Date().getFullYear()}. For abundance and size searches pass min_year about 15 years back unless the angler asks about history; a decades-old survey with a single net is not a recommendation. Relax min_year only if a search comes back nearly empty, and say so.
-4. Translate the angler's words into filters: a place name → its county (you know the state's geography; a town may be near several counties — search the obvious one, then neighbors); "big fish" → the size measure; "lots of fish" / "numbers" → abundance; "stocked" → stocking; "small lake" → max_acres; "family / kids / shore fishing" → prefer panfish abundance and note you can't judge shore access.
+4. Translate the angler's words into filters: a place name → its county (you know the state's geography; a town may be near several counties — search the obvious one, then neighbors); "trophy", "trophies", "trophy fish" → the trophy measure where this state has it (trophy_rate = catch rate of fish at/above the species' trophy length — e.g. a 25″ walleye), NOT the size measure; "big fish" without "trophy" → the size measure (or trophy if the angler clearly means exceptional fish); "lots of fish" / "numbers" → abundance; "stocked" → stocking; "small lake" → max_acres; "family / kids / shore fishing" → prefer panfish abundance and note you can't judge shore access.
 5. Requests the data can't answer (boat ramps, ice conditions, regulations, weather, lodging, exact spots on a lake) — say plainly that LakeLore doesn't have that and offer what you can do.
 6. Rank by evidence before the raw number. A recent survey with a real sample (total_catch or gear_count that isn't tiny) outranks an old one, and an average built on one or two fish is not a recommendation — leave it out or mention it only as an aside after the list. The tool returns rows sorted by the metric, but the ORDER OF YOUR LIST IS YOUR RECOMMENDATION: put the lake you would actually send the angler to first, and re-sort the tool's rows by evidence strength before writing. Ask for more rows (limit 25) when the top of the raw list is thin-sample noise.
 7. Always state the unit the source uses and never mix units in one list: gill nets and trap nets are fish per net; electrofishing is fish per hour; creel is fish per angler-hour or per trip; relative indexes and ratings are not catch rates. Sizes are average pounds or average inches as returned.
@@ -174,6 +175,7 @@ function trimResultRow(r, m) {
     gear_count: num(r.gear_count),
     avg_weight_lb: num(r.average_weight),
     avg_length_in: num(r.average_length),
+    trophy_rate: num(r.cpue_memorable),
     length_derivation: r.length_derivation ?? undefined,
     rating: r.rating ?? undefined,
     psd: num(r.psd) ?? undefined,
@@ -201,7 +203,7 @@ function summarizeLakeDetail(body, m) {
     .slice(0, 40)
     .map(c => {
       const o = { species: nameOf(c.species), gear: c.gear, survey_year: c.survey_year,
-        cpue: num(c.cpue), total_catch: num(c.total_catch), avg_weight_lb: num(c.average_weight),
+        cpue: num(c.cpue), trophy_rate: num(c.cpue_memorable), total_catch: num(c.total_catch), avg_weight_lb: num(c.average_weight),
         avg_length_in: num(c.average_length), rating: c.rating ?? null,
         psd: num(c.psd), wr: num(c.wr) };
       for (const k of Object.keys(o)) if (o[k] == null) delete o[k];
@@ -241,8 +243,8 @@ function makeTools(ctx, m, seen, trace) {
     description: 'Search and rank lakes in this state. Returns up to `limit` rows (one row = one lake×species survey result) ranked best-first by the chosen measure/source, plus the total match count. Use the exact species native value, county spelling, and source id from the system prompt.',
     inputSchema: z.object({
       species: z.string().optional().describe('Exact species native value (e.g. "WAE"). Omit only for lake-name lookups.'),
-      measure: z.enum(['abundance', 'size', 'stocking', 'presence']).default('abundance')
-        .describe('abundance = catch rate; size = average weight/length; stocking = stocked adults per 100 acres; presence = every lake with the species'),
+      measure: z.enum(['abundance', 'size', 'stocking', 'trophy', 'presence']).default('abundance')
+        .describe('abundance = catch rate; size = average weight/length; stocking = stocked adults per 100 acres; trophy = catch rate of trophy-class fish ONLY (at/above the species\' trophy length — use for trophy asks); presence = every lake with the species'),
       source_id: z.string().optional().describe('Source id for abundance/size (e.g. "gear:Standard gill nets"). Defaults to the measure\'s default source.'),
       county: z.string().optional().describe('One county, or several comma-separated, exact spelling.'),
       lake_name: z.string().optional().describe('Substring match on the lake name.'),

@@ -235,6 +235,7 @@ def main():
     print("  " + "─" * 56)
 
     any_drift = False
+    schema_mismatch = []
     any_local_behind = False
     any_content_drift = False
     behind_details = []
@@ -254,7 +255,18 @@ def main():
         # uploaded artifact's user_version must match what we're shipping.
         lv, pv_ver = local.get("_user_version"), p.get("_user_version")
         if pv_ver is not None and lv is not None and lv != pv_ver:
-            print(f"  {state:<6} schema user_version local {lv} vs prod {pv_ver} (expected when shipping a schema bump WITH a new image)")
+            if os.environ.get("LAKELORE_ALLOW_SCHEMA_BUMP") == "1":
+                print(f"  {state:<6} schema user_version local {lv} vs prod {pv_ver} (schema-bump mode: allowed — pair with the image deploy)")
+            else:
+                # HARD abort (2026-09-15): a version-mismatched artifact 503s the
+                # state the moment the machine restarts onto it (startup schema
+                # assert). This fired for real: monthly scheduled refreshes were
+                # armed by a fresh flyctl login while local artifacts were v8 and
+                # the production image v7. Schema bumps go through --no-restart +
+                # an image deploy (RUNBOOK "Schema-bump deploys pair data+image");
+                # NOT overridable by --force.
+                print(f"  {state:<6} ⛔ schema user_version local {lv} vs prod {pv_ver} — REFUSING: this artifact would 503 on the deployed image. Use --no-restart + the paired image deploy (RUNBOOK).")
+                schema_mismatch.append(state)
         for t in TABLES:
             l = local.get(t)
             pv = p.get(t)
@@ -294,6 +306,10 @@ def main():
     if not any_drift and not any_content_drift:
         print("  All counts and content match. Production is in sync.")
         return 0
+
+    if schema_mismatch and os.environ.get("LAKELORE_ALLOW_SCHEMA_BUMP") != "1":
+        print(f"  ⛔ Schema-version mismatch for: {', '.join(schema_mismatch)} — upload refused (not overridable by --force).")
+        return 3
 
     if any_local_behind:
         print("  ⚠  Local is BEHIND production for at least one table:")

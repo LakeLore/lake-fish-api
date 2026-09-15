@@ -71,6 +71,10 @@ fi
 # behind prod somewhere; we honor that unless --force is set. Always print
 # the table whether or not we proceed.
 set +e
+# Schema-bump mode: --no-restart is the documented paired-deploy path, so it
+# alone may carry a version-mismatched artifact (the follow-up image deploy
+# restarts onto the pair). Everything else hard-refuses a mismatch (rc=3).
+[ "$NO_RESTART" -eq 1 ] && export LAKELORE_ALLOW_SCHEMA_BUMP=1
 python3 "$DRIFT_CHECK" "${POSITIONAL[@]}"
 DRIFT_RC=$?
 set -e
@@ -83,6 +87,13 @@ if [ "$DRIFT_RC" -eq 2 ] && [ "$FORCE" -eq 0 ]; then
   echo
   echo "Aborting upload. Re-run with --force if you really mean to do this."
   exit 2
+fi
+
+if [ "$DRIFT_RC" -eq 3 ]; then
+  echo
+  echo "⛔ Schema-version mismatch — deploy-data refuses (would 503 the state on restart)."
+  echo "   Schema bumps: ./deploy-data.sh --no-restart …  then  deploy/deploy.sh  (RUNBOOK)."
+  exit 3
 fi
 
 if [ "$DRIFT_RC" -ne 0 ] && [ "$DRIFT_RC" -ne 2 ]; then

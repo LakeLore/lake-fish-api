@@ -1,6 +1,6 @@
 # lake-fish-api
 
-*Last reconciled with code: 2026-07-17.*
+*Last reconciled with code: 2026-09-18 (v8 production deploy).*
 
 The unified Express + SQLite API server behind the **LakeLore** mobile app and marketing site, deployed to Fly.io as `lake-fish-api` (https://lake-fish-api.fly.dev).
 

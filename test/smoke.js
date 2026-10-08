@@ -9,6 +9,9 @@
 //
 //   npm test        (exits nonzero on any failure)
 const { spawn } = require('child_process');
+const path = require('path');
+const Database = require('better-sqlite3');
+const OUT_DIR = path.join(__dirname, '..', '..', 'lakelore-data', 'out');
 
 const PORT = 3199;
 const BASE = `http://localhost:${PORT}`;
@@ -54,6 +57,10 @@ const get = async (p) => {
       const rows = results.body?.results ?? [];
       if (FREE.has(st)) {
         if (rows[0] && rows[0].lake_name == null) fail(`${st} free state missing lake_name`);
+        const idx = await get(`/api/${st}/lakes-index`);
+        if (idx.status !== 200 || !(idx.body?.lakes?.length > 0)) fail(`${st} free-state /lakes-index ${idx.status}`);
+        const byName = await get(`/api/${st}/results?lakeName=lake&limit=1`);
+        if (byName.status !== 200) fail(`${st} free-state lakeName search ${byName.status}`);
         continue;
       }
       // Paid state, no user id -> preview with identity redacted + hashed ids.
@@ -77,9 +84,31 @@ const get = async (p) => {
         }
       }
       // A RAW lake id must 402 in preview on every path shape.
-      const index = await get(`/api/${st}/lakes-index`);
-      const rawId = (index.body?.lakes ?? index.body ?? [])[0]?.id;
-      if (rawId == null) fail(`${st} /lakes-index gave no raw id to probe with`);
+      // Raw ids + names come straight from the artifact: /lakes-index is
+      // subscriber-only for paid states since 2026-10-07.
+      const sdb = new Database(path.join(OUT_DIR, `${st}.db`), { readonly: true });
+      const sample = sdb.prepare("SELECT id, name FROM lakes WHERE name IS NOT NULL AND length(name) >= 4 ORDER BY id LIMIT 1").get();
+      sdb.close();
+      const rawId = sample?.id;
+      for (const p of [`/api/${st}/lakes-index`, `/api/${st}/Lakes-Index`, `/api/${encSt}/lakes-index`]) {
+        const v = await get(p);
+        if (v.status !== 402) fail(`${st} ${p} expected 402 without entitlement, got ${v.status}`);
+      }
+      // Naming a lake in preview is subscriber-only (identity oracle).
+      if (sample) for (const base of [`/api/${st}/results`, `/api/${st}/Results`, `/api/${encSt}/results`]) {
+        for (const extra of ['', '&presenceUnion=1', '&stockingFirst=true']) {
+          const v = await get(`${base}?lakeName=${encodeURIComponent(sample.name)}${extra}`);
+          if (v.status !== 402) fail(`${st} ${base}?lakeName=…${extra} expected 402 in preview, got ${v.status}`);
+        }
+      }
+      // Name-ordered preview pages must come back in keyed-id order, not name order.
+      for (const q of ['presenceUnion=1&limit=50', 'sortBy=lake&sortDir=asc&limit=50']) {
+        const v = await get(`/api/${st}/results?${q}`);
+        const ids = (v.body?.results ?? []).map(r => String(r.lake_id));
+        if (v.status !== 200) fail(`${st} /results?${q} ${v.status}`);
+        else if (ids.some((id, i) => i > 0 && id < ids[i - 1])) fail(`${st} /results?${q} preview rows not in keyed-id order`);
+      }
+      if (rawId == null) fail(`${st} artifact gave no raw id to probe with`);
       else for (const base of [`/api/${st}/lake`, `/api/${st}/Lake`, `/api/${st}/LAKE`, `/api/${encSt}/lake`]) {
         const v = await get(`${base}/${encodeURIComponent(rawId)}`);
         if (v.status !== 402) fail(`${st} ${base}/<raw id> expected 402 without entitlement, got ${v.status}`);

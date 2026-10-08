@@ -67,7 +67,7 @@ const RC_API_BASE = 'https://api.revenuecat.com/v2';
 // inside gateByState via FREE_STATES). When the registry is unavailable
 // (e.g. Docker image without lakelore-data), we fall back to the legacy
 // 5-state literal so the original launch states are never served ungated.
-const LEGACY_GATED_SOURCE = '^\\/api\\/(mn|sd|nd|ia|ne)\\/(results|lake|pdf)(?:\\/|\\?|$)';
+const LEGACY_GATED_SOURCE = '^\\/api\\/(mn|sd|nd|ia|ne)\\/(results|lakes-index|lake|pdf)(?:\\/|\\?|$)';
 const GATED_PATH_RE = (() => {
   const fallback = new RegExp(LEGACY_GATED_SOURCE);
   try {
@@ -75,7 +75,7 @@ const GATED_PATH_RE = (() => {
     const reg = loadRegistry();
     const active = Object.keys(reg.states).filter(s => reg.states[s].active === true);
     if (!active.length) throw new Error('registry lists no active states');
-    const generated = `^\\/api\\/(${active.join('|')})\\/(results|lake|pdf)(?:\\/|\\?|$)`;
+    const generated = `^\\/api\\/(${active.join('|')})\\/(results|lakes-index|lake|pdf)(?:\\/|\\?|$)`;
     console.log(`[entitlement] gate covers ${active.length} active states (registry-generated)`);
     return new RegExp(generated);
   } catch (err) {
@@ -366,7 +366,7 @@ function gateByState(req, res, next) {
   const m = req.path.toLowerCase().match(GATED_PATH_RE);
   if (!m) return next();
   const state = m[1];
-  const endpoint = m[2]; // 'results' | 'lake' | 'pdf'
+  const endpoint = m[2]; // 'results' | 'lake' (preview-capable) | 'lakes-index' | 'pdf' (hard 402)
   if (!isPaidState(state)) return next();
 
   const userId = req.get('x-user-id');

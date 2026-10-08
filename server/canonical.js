@@ -77,6 +77,18 @@ function previewId(state, id) {
   return 'p' + crypto.createHmac('sha256', PREVIEW_ID_SECRET)
     .update(`${state}:${id}`).digest('hex').slice(0, 15);
 }
+// Preview ordering (2026-10-07). A name- or acreage-ordered preview page is an
+// identity oracle: lake names are public, so row N of an alphabetical page IS
+// the Nth name. In preview those sorts order by the keyed preview id instead —
+// stable across pages, meaningless without the server-only secret. Registered
+// as a SQL function so LIMIT/OFFSET paging still happens in SQLite.
+const _previewKeyDbs = new WeakSet();
+function ensurePreviewKeyFn(db, state) {
+  if (_previewKeyDbs.has(db)) return;
+  db.function('ll_preview_key', { deterministic: true }, (id) => previewId(state, String(id)));
+  _previewKeyDbs.add(db);
+}
+const IDENTITY_SORTS = new Set(['lake', 'acres']);
 const _previewLakeIdMaps = new Map(); // state -> Map(previewId -> real lake id)
 function resolvePreviewLakeId(state, db, pid) {
   let map = _previewLakeIdMaps.get(state);
@@ -1218,7 +1230,11 @@ function results(req, res, ctx) {
     // "7 fish, rate unknown". The CASE guard confines the total_catch tiebreak
     // to the null-cpue block, so rows with a real cpue keep their exact prior
     // order (no tie-order regression for the legacy-parity states).
-    const sortExpr = sortBy === 'stocked'
+    const previewIdentitySort = req.lakeLorePreview && IDENTITY_SORTS.has(sortBy);
+    if (previewIdentitySort) ensurePreviewKeyFn(db, state);
+    const sortExpr = previewIdentitySort
+      ? 'll_preview_key(fc.lake_id) ASC, fc.id ASC'
+      : sortBy === 'stocked'
       ? `(lsm.adults_per_100ac IS NULL) ASC, COALESCE(lsm.adults_per_100ac, lsm.adults_est) ${dir} NULLS LAST`
       : sortBy === 'cpue'
       ? `(fc.cpue_effective IS NULL) ASC, fc.cpue_effective ${dir}, (CASE WHEN fc.cpue_effective IS NULL THEN fc.total_catch END) DESC`
@@ -1235,7 +1251,7 @@ function results(req, res, ctx) {
     // canonical planner. Species queries keep the species-index arrival (their
     // own pin); legacy uses idx_fish_catch_species there too.
     let orderSuffix = '';
-    if (f.mostRecentOrderPin && mostRecentOnly === 'true' && !species) {
+    if (f.mostRecentOrderPin && mostRecentOnly === 'true' && !species && !previewIdentitySort) {
       const lakeKey = (entry.idWireType || 'text') === 'integer'
         ? 'CAST(fc.lake_id AS INTEGER)' : 'fc.lake_id';
       orderSuffix = `, ${lakeKey}, fc.id`;
@@ -1489,9 +1505,12 @@ function presenceUnionResults(req, res, opts) {
 
     const allArgs = [...fcArgs, ...stkArgs, ...outArgs];
     const total = db.prepare(`SELECT COUNT(*) AS n ${joinsFixed}`).get(...allArgs).n;
+    // Presence has no ranking, so it lists by name — except in preview, where
+    // name order would reveal which lake each row is (see ensurePreviewKeyFn).
+    if (req.lakeLorePreview) ensurePreviewKeyFn(db, state);
     const rows = db.prepare(`
       SELECT ${selectCols} ${joinsFixed}
-      ORDER BY l.name ASC, k.species_native ASC
+      ORDER BY ${req.lakeLorePreview ? 'll_preview_key(l.id) ASC' : 'l.name ASC'}, k.species_native ASC
       LIMIT ? OFFSET ?
     `).all(...allArgs, limitNum, offsetNum);
 

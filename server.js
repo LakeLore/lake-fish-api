@@ -687,6 +687,13 @@ const _lakesIndexCache = new Map(); // state -> { at, body }
 app.get('/api/:state/lakes-index', (req, res) => {
   if (!validateState(req, res)) return;
   const { state } = req.params;
+  // Names + counties + raw ids for a paid state are the join key for every
+  // preview response — subscriber-only since 2026-10-07 (was public; its only
+  // public consumer, the marketing site's per-lake pages, was removed 09-12).
+  // gateByState already 402s this path; this is the handler-level fail-closed.
+  if (isPaidState(state) && !req.entitlement?.hasAllStates) {
+    return res.status(402).json({ error: 'subscription_required', state });
+  }
   const cached = _lakesIndexCache.get(state);
   if (cached && Date.now() - cached.at < 6 * 60 * 60 * 1000) return res.json(cached.body);
   try {
@@ -1023,9 +1030,28 @@ function enforcePreview(req) {
   if (isPaidState(req.params.state) && !req.entitlement?.hasAllStates) req.lakeLorePreview = true;
 }
 
+// Filters that NAME a lake are subscriber-only (2026-10-07). Preview redacts
+// identity, but `lakeName=Monticello` returned that lake's metrics under its
+// hashed id — one request per public lake name re-identified the whole paid
+// dataset. A 402 routes every client version to the paywall (the same typed
+// path a hard-gated endpoint uses), rather than silently ignoring the filter.
+// minAcres/maxAcres are deliberately NOT here (owner decision 2026-10-07): the
+// acreage slider stays usable in preview, accepting that a size range narrows
+// toward a redacted field. County filtering is the core of preview browsing.
+const PREVIEW_BLOCKED_FILTERS = ['lakeName'];
+function previewBlockedFilter(req) {
+  if (!req.lakeLorePreview) return null;
+  return PREVIEW_BLOCKED_FILTERS.find(k => typeof req.query[k] === 'string' && req.query[k].trim() !== '') ?? null;
+}
+
 app.get('/api/:state/results', (req, res) => {
   if (!validateState(req, res)) return;
   enforcePreview(req);
+  const blocked = previewBlockedFilter(req);
+  if (blocked) {
+    return res.status(402).json({ error: 'subscription_required', state: req.params.state, filter: blocked,
+      message: 'Searching by lake identity requires the LakeLore All-States subscription.' });
+  }
   return canonical.results(req, res, canonicalCtx);
 });
 

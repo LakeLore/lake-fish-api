@@ -360,7 +360,10 @@ function invalidateCache(userId) {
  * document itself names the lake.
  */
 function gateByState(req, res, next) {
-  const m = req.path.match(GATED_PATH_RE);
+  // Match on the LOWERCASED path: Express routes case-insensitively, so
+  // /api/tx/Results reaches the /results handler — a case-sensitive match here
+  // let it through ungated with full lake identity (found 2026-10-07).
+  const m = req.path.toLowerCase().match(GATED_PATH_RE);
   if (!m) return next();
   const state = m[1];
   const endpoint = m[2]; // 'results' | 'lake' | 'pdf'

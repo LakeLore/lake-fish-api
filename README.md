@@ -33,7 +33,8 @@ lake-fish-mobile-server/
                          machine's volume, restart, poll /readyz
     _drift_check.py    — pre-upload safety: aborts if local row counts are BEHIND prod
   .github/workflows/
-    uptime.yml         — GitHub Actions uptime probes (every 15 min)
+    uptime.yml         — GitHub Actions uptime probes (scheduled every 15 min; GitHub
+                         actually runs it roughly every 4 h — see RUNBOOK §1)
   test/                — smoke tests (test/smoke.js)
 ```
 

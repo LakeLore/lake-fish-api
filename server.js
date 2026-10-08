@@ -1015,8 +1015,17 @@ app.get('/api/:state/measures', cachedStateRoute(canonical.measures));
 
 // ── /api/:state/results ────────────────────────────────────────────────────────
 
+// Fail closed (2026-10-07): gateByState decides entitlement by matching the
+// URL path, so any path shape that reaches these handlers without matching it
+// (the /Results case bypass) used to serve full identity. A paid state with no
+// verified entitlement is ALWAYS preview here, whatever the gate concluded.
+function enforcePreview(req) {
+  if (isPaidState(req.params.state) && !req.entitlement?.hasAllStates) req.lakeLorePreview = true;
+}
+
 app.get('/api/:state/results', (req, res) => {
   if (!validateState(req, res)) return;
+  enforcePreview(req);
   return canonical.results(req, res, canonicalCtx);
 });
 
@@ -1024,6 +1033,7 @@ app.get('/api/:state/results', (req, res) => {
 
 app.get('/api/:state/lake/:id', (req, res) => {
   if (!validateState(req, res)) return;
+  enforcePreview(req);
   return canonical.lakeDetail(req, res, canonicalCtx);
 });
 

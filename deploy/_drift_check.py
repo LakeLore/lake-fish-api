@@ -183,10 +183,21 @@ def prod_counts_all(states):
     """.replace("__FP__", fp_js)
     # Use the remote shell to run node with our script + args
     cmd = f"node -e {sh_squote(node_script)} -- " + " ".join(states)
-    result = subprocess.run(
-        [FLY, "ssh", "console", "--app", APP, "-C", cmd],
-        capture_output=True, text=True, timeout=90,
-    )
+    def _ssh():
+        return subprocess.run(
+            [FLY, "ssh", "console", "--app", APP, "-C", cmd],
+            capture_output=True, text=True, timeout=90,
+        )
+    result = _ssh()
+    if result.returncode != 0:
+        # An idle app (staging: min_machines_running = 0) has no started
+        # machine to ssh into. A plain request auto-starts one; retry once.
+        try:
+            import urllib.request
+            urllib.request.urlopen(f"https://{APP}.fly.dev/healthz", timeout=30).read()
+        except Exception:
+            pass
+        result = _ssh()
     if result.returncode != 0:
         print(f"  ⚠  flyctl ssh failed: {result.stderr.strip()}", file=sys.stderr)
         return {}
@@ -229,6 +240,17 @@ def main():
 
     print(f"Drift check vs production ({APP})…", flush=True)
     prod = prod_counts_all(states)
+    prod_unreadable = not prod
+    if not prod and os.environ.get("LAKELORE_ALLOW_UNREADABLE_PROD") != "1":
+        # Production was unreadable (expired flyctl login, machine down, bad
+        # output). Without this the table printed blank PROD columns followed
+        # by "Production is in sync." (2026-09-11 nh/nj) — say so and error.
+        # The one legitimate case is the first data upload to a FRESH app
+        # (RUNBOOK §19: nothing to read yet) — set the env var for that run.
+        print("  ⛔ Could not read production — drift NOT checked. "
+              "If the line above says 'no access token', run: fly auth login. "
+              "First upload to an empty app: LAKELORE_ALLOW_UNREADABLE_PROD=1.", file=sys.stderr)
+        return 4
 
     print()
     print(f"  {'STATE':<6} {'TABLE':<14} {'LOCAL':>10} {'PROD':>10} {'DRIFT':>10}")
@@ -304,6 +326,9 @@ def main():
         print()
 
     if not any_drift and not any_content_drift:
+        if prod_unreadable:
+            print("  ⚠  Production was NOT read (LAKELORE_ALLOW_UNREADABLE_PROD=1) — drift unchecked, proceeding.")
+            return 0
         print("  All counts and content match. Production is in sync.")
         return 0
 

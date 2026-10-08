@@ -62,6 +62,28 @@ const get = async (p) => {
         for (const f of REDACTED) if (r[f] != null) fail(`${st} preview leak ${f}=${r[f]}`);
         if (r.lake_id != null && !HASHED_ID.test(String(r.lake_id))) fail(`${st} raw lake_id ${r.lake_id}`);
       }
+      // Path-shape variants must stay gated (2026-10-07: /Results skipped the
+      // case-sensitive gate and served full identity with no credentials).
+      // %-encoded state: Express decodes :state but req.path stays encoded, so
+      // the path gate never matches — only the handlers' enforcePreview covers it.
+      const encSt = '%' + st.charCodeAt(0).toString(16) + st[1];
+      for (const variant of [`/api/${st}/Results`, `/api/${st}/RESULTS`, `/api/${st}/results/`, `/API/${st}/results`, `/api/${encSt}/results`]) {
+        const v = await get(`${variant}?limit=2&sortBy=cpue&sortDir=desc&mostRecentOnly=true`);
+        if (v.status !== 200) continue; // not routed at all is fine
+        if (v.body?.preview !== true) fail(`${st} ${variant} not preview`);
+        for (const r of v.body?.results ?? []) {
+          for (const f of REDACTED) if (r[f] != null) fail(`${st} ${variant} leak ${f}=${r[f]}`);
+          if (r.lake_id != null && !HASHED_ID.test(String(r.lake_id))) fail(`${st} ${variant} raw lake_id`);
+        }
+      }
+      // A RAW lake id must 402 in preview on every path shape.
+      const index = await get(`/api/${st}/lakes-index`);
+      const rawId = (index.body?.lakes ?? index.body ?? [])[0]?.id;
+      if (rawId == null) fail(`${st} /lakes-index gave no raw id to probe with`);
+      else for (const base of [`/api/${st}/lake`, `/api/${st}/Lake`, `/api/${st}/LAKE`, `/api/${encSt}/lake`]) {
+        const v = await get(`${base}/${encodeURIComponent(rawId)}`);
+        if (v.status !== 402) fail(`${st} ${base}/<raw id> expected 402 without entitlement, got ${v.status}`);
+      }
       if (rows[0]) {
         const lake = await get(`/api/${st}/lake/${rows[0].lake_id}?metricsV2=1`);
         if (lake.status !== 200 || lake.body?.preview !== true) fail(`${st} /lake preview ${lake.status}`);

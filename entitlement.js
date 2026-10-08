@@ -34,6 +34,13 @@ const FREE_STATES = (() => {
 })();
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const RC_API_BASE = 'https://api.revenuecat.com/v2';
+// A slow RevenueCat must not hold paid-state requests open: every gated
+// request for a user with no fresh cache entry waits on this call, and Node's
+// fetch has no default deadline. On timeout the lookup takes the same path as
+// any RC error (known subscribers get the grace entitlement, others preview),
+// cached 30 s.
+const RC_TIMEOUT_MS = Number(process.env.REVENUECAT_TIMEOUT_MS) || 5_000;
+const { reportError } = require('./server/report');
 
 // Match only the *data-bearing* endpoints. /status and /filters are public
 // metadata (lake counts, species lists, county lists) — they're shown on
@@ -111,7 +118,10 @@ async function _resolveAllStatesEntitlementId() {
   _allStatesEntitlementIdPromise = (async () => {
     try {
       const url = `${RC_API_BASE}/projects/${projectId}/entitlements?limit=100`;
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${key}` } });
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(RC_TIMEOUT_MS),
+      });
       if (!res.ok) throw new Error(`RC entitlements list HTTP ${res.status}`);
       const data = await res.json();
       const items = Array.isArray(data?.items) ? data.items : [];
@@ -167,6 +177,7 @@ async function fetchEntitlementFromRevenueCat(userId) {
     const url = `${RC_API_BASE}/projects/${projectId}/customers/${encodeURIComponent(userId)}/active_entitlements`;
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(RC_TIMEOUT_MS),
     });
     if (res.status === 404) {
       // RC returns 404 for users it has never seen — they haven't subscribed.
@@ -185,6 +196,11 @@ async function fetchEntitlementFromRevenueCat(userId) {
       || e?.lookup_key === ALL_STATES_ENTITLEMENT
     );
     if (!ent) {
+      // Without the resolved entitlement id (its lookup failed or timed out)
+      // "no match" proves nothing: items carry only the internal id. Treat it
+      // as an RC error — 30 s cache, grace kept — not as an authoritative
+      // "not subscribed" that is cached 5 min and deletes the grace record.
+      if (!targetId && items.length) throw new Error('entitlement id unresolved');
       return { hasAllStates: false, expiresAt: null, source: 'rc' };
     }
     // RC's "active_entitlements" endpoint already filters out expired ones,
@@ -419,6 +435,7 @@ function gateByState(req, res, next) {
     });
   }).catch(err => {
     console.warn('[entitlement] middleware error:', err);
+    reportError(err, req);
     res.status(500).json({ error: 'entitlement_check_failed' });
   });
 }

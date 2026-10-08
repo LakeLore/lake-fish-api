@@ -22,6 +22,7 @@ const fs = require('fs');
 const Anthropic = require('@anthropic-ai/sdk');
 const { betaZodTool } = require('@anthropic-ai/sdk/helpers/beta/zod');
 const { z } = require('zod');
+const { reportError } = require('./report');
 
 const MODEL = process.env.LAKELORE_ASK_MODEL || 'claude-opus-5';
 const EFFORT = process.env.LAKELORE_ASK_EFFORT || 'medium';
@@ -406,6 +407,13 @@ async function ask(req, res, ctx) {
   const v = validateMessages(req.body?.messages);
   if (v.error) return res.status(400).json({ error: 'bad_request', message: v.error });
 
+  // Daily ceiling (server.js): counted HERE, after validation, so only asks
+  // that are about to reach the model spend it. Counted earlier, 500 empty
+  // bodies shut the assistant off for everyone until midnight.
+  if (ctx.askBudgetExhausted?.()) {
+    return res.status(503).json({ error: 'ask_unavailable', message: 'The assistant is resting for today — try again tomorrow.' });
+  }
+
   let final;
   // Usage is per API call; sum every iteration of the loop so the log line
   // reflects what the whole ask cost, not just the final answer call.
@@ -455,6 +463,7 @@ async function ask(req, res, ctx) {
       return res.status(502).json({ error: 'ask_upstream', message: `Assistant error (${err.status}).` });
     }
     console.error(`[ask] ${state} failed after ${ms}ms:`, err);
+    reportError(err, req);
     return res.status(500).json({ error: 'ask_failed', message: 'Assistant failed.' });
   }
 

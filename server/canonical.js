@@ -61,6 +61,7 @@ function redactPreviewFields(row, fields) {
 // references stay consistent between /results and /lake payloads. /lake/:id
 // resolves hashed ids back through a lazily-built per-state reverse map.
 const crypto = require('crypto');
+const { reportError } = require('./report');
 // Key precedence: explicit PREVIEW_ID_SECRET → derived from the server-only
 // JWT secret (HMAC, so the JWT key itself is never reused directly) → the dev
 // literal. The middle tier matters: without it, production quietly ran on the
@@ -105,6 +106,30 @@ function resolvePreviewLakeId(state, db, pid) {
 // state's DB is swapped without a process restart (POST /reload), or a preview
 // user tapping a lake ADDED by the refresh 404s on /lake/:id until restart —
 // the exact scenario /reload exists to avoid.
+// /results runs its join twice: once for the page, once to COUNT the matches.
+// The count depends only on the artifact and the filters, so it is remembered
+// per (state, SQL, params) until that state's artifact is reloaded. Paging and
+// repeat searches then pay for one pass instead of two (MN, 2026-10-08:
+// species search 100 ms -> see IMPROVEMENT_PLAN Round 22 for the measurement).
+const _totalCache = new Map(); // state -> Map(key -> n), insertion-ordered
+const TOTAL_CACHE_MAX = 400;   // per state
+function cachedTotal(state, db, sql, args) {
+  let m = _totalCache.get(state);
+  if (!m) { m = new Map(); _totalCache.set(state, m); }
+  // JSON turns NaN and Infinity both into null, but SQLite binds them
+  // differently — never cache a query with a non-finite argument.
+  if (args.some(a => typeof a === 'number' && !Number.isFinite(a))) return db.prepare(sql).get(...args).n;
+  // Hashed: filters are caller-supplied and unbounded in length.
+  const key = crypto.createHash('sha1').update(sql).update('\u0000').update(JSON.stringify(args)).digest('base64');
+  const hit = m.get(key);
+  if (hit !== undefined) { m.delete(key); m.set(key, hit); return hit; }
+  const n = db.prepare(sql).get(...args).n;
+  m.set(key, n);
+  if (m.size > TOTAL_CACHE_MAX) m.delete(m.keys().next().value);
+  return n;
+}
+function clearTotalCache(state) { _totalCache.delete(state); }
+
 function clearPreviewLakeIdMap(state) {
   _previewLakeIdMaps.delete(state);
 }
@@ -507,6 +532,7 @@ function filters(req, res, ctx) {
 
     res.json(result);
   } catch (err) {
+    reportError(err, req);
     res.status(500).json({ error: err.message });
   }
 }
@@ -973,6 +999,7 @@ function measures(req, res, ctx) {
     res.json({ species: speciesParam, county: countyList, measures: out });
   } catch (err) {
     console.error(`[${state}] /measures error:`, err);
+    reportError(err, req);
     res.status(500).json({ error: err.message });
   }
 }
@@ -1301,7 +1328,7 @@ function results(req, res, ctx) {
     `;
 
     const allParams = [...cteParams, ...params];
-    const total = db.prepare(`${ctePrefix} SELECT COUNT(*) as n ${joinsSql}`).get(allParams).n;
+    const total = cachedTotal(state, db, `${ctePrefix} SELECT COUNT(*) as n ${joinsSql}`, allParams);
 
     let rows = db.prepare(`
       ${ctePrefix}
@@ -1321,6 +1348,7 @@ function results(req, res, ctx) {
     return finishResults(req, res, state, entry, rows, total);
   } catch (err) {
     console.error(`[${state}] /results (canonical) error:`, err);
+    reportError(err, req);
     res.status(500).json({ error: err.message });
   }
 }
@@ -1415,7 +1443,7 @@ function stockingFirstResults(req, res, opts) {
       LEFT JOIN surveys s ON s.id = fc.survey_id
       ${whereClause}`;
 
-    const total = db.prepare(`SELECT COUNT(*) AS n ${joins}`).get(...args).n;
+    const total = cachedTotal(state, db, `SELECT COUNT(*) AS n ${joins}`, args);
     let rows = db.prepare(`
       SELECT ${selectCols} ${joins}
       ORDER BY (m.adults_per_100ac IS NULL) ASC,
@@ -1434,6 +1462,7 @@ function stockingFirstResults(req, res, opts) {
     return finishResults(req, res, state, entry, rows, total);
   } catch (err) {
     console.error(`[${state}] /results stockingFirst error:`, err);
+    reportError(err, req);
     res.status(500).json({ error: err.message });
   }
 }
@@ -1504,7 +1533,7 @@ function presenceUnionResults(req, res, opts) {
       : joins.replace('m.adults_per_100ac', 'NULL').replace('m.adults_est', 'NULL').replace('m.species_name', 'NULL');
 
     const allArgs = [...fcArgs, ...stkArgs, ...outArgs];
-    const total = db.prepare(`SELECT COUNT(*) AS n ${joinsFixed}`).get(...allArgs).n;
+    const total = cachedTotal(state, db, `SELECT COUNT(*) AS n ${joinsFixed}`, allArgs);
     // Presence has no ranking, so it lists by name — except in preview, where
     // name order would reveal which lake each row is (see ensurePreviewKeyFn).
     if (req.lakeLorePreview) ensurePreviewKeyFn(db, state);
@@ -1517,6 +1546,7 @@ function presenceUnionResults(req, res, opts) {
     return finishResults(req, res, state, entry, rows, total);
   } catch (err) {
     console.error(`[${state}] /results presenceUnion error:`, err);
+    reportError(err, req);
     res.status(500).json({ error: err.message });
   }
 }
@@ -1671,6 +1701,7 @@ function lakeDetail(req, res, ctx) {
     res.json({ lake, surveys, catches, stocking, metrics, metrics_by_year, latest_stocking_report_id });
   } catch (err) {
     console.error(`[${state}] /lake/${id} (canonical) error:`, err);
+    reportError(err, req);
     res.status(500).json({ error: err.message });
   }
 }
@@ -1678,4 +1709,4 @@ function lakeDetail(req, res, ctx) {
 // previewIdFor: exported for the deep-readyz probe, whose preview leg must
 // address the lake the way a real preview client does (hashed id) now that
 // raw ids 402 in preview mode.
-module.exports = { filters, measures, results, lakeDetail, clearPreviewLakeIdMap, previewIdFor: previewId };
+module.exports = { filters, measures, results, lakeDetail, clearPreviewLakeIdMap, clearTotalCache, previewIdFor: previewId };

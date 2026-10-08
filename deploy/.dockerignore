@@ -7,6 +7,7 @@
 !lake-fish-mobile-server/server/canonical.js
 !lake-fish-mobile-server/server/attest.js
 !lake-fish-mobile-server/server/ask.js
+!lake-fish-mobile-server/server/report.js
 !lake-fish-mobile-server/package.json
 !lake-fish-mobile-server/package-lock.json
 

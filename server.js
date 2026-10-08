@@ -31,6 +31,7 @@ const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
 const rateLimit = require('express-rate-limit');
+const { reportError } = require('./server/report');
 const { gateByState, checkEntitlement, invalidateCache, stats: entitlementStats, noteWebhook, isPaidState } = require('./entitlement');
 
 // ── Canonical data layer (lakelore-data) — REQUIRED ────────────────────────────
@@ -590,6 +591,7 @@ app.get('/api/me/entitlement', async (req, res) => {
       source: result.source,
     });
   } catch (err) {
+    reportError(err, req);
     res.status(500).json({ error: err.message });
   }
 });
@@ -717,6 +719,7 @@ app.get('/api/:state/lakes-index', (req, res) => {
     res.json(body);
   } catch (err) {
     console.error(`[${state}] /lakes-index error:`, err.message);
+    reportError(err, req);
     res.status(500).json({ error: err.message });
   }
 });
@@ -968,6 +971,7 @@ app.get('/api/:state/status', (req, res) => {
     const catches = hasCatch   ? db.prepare('SELECT COUNT(*) as n FROM fish_catch').get().n : 0;
     res.json({ ready: true, lakes, surveys, catches });
   } catch (err) {
+    reportError(err, req);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1079,16 +1083,49 @@ app.get('/api/:state/lake/:id', (req, res) => {
 const ASK_ENABLED = process.env.LAKELORE_ASK_ENABLED === '1';
 const askAgent = ASK_ENABLED ? require('./server/ask') : null;
 if (ASK_ENABLED) console.log(`[ask] enabled — model=${askAgent.MODEL} effort=${askAgent.EFFORT}`);
+// Three bounds on spend, because X-User-Id is whatever the caller sends:
+//   1. Per-IP hourly limit. (Keyed on X-User-Id until 2026-10-08 — rotating
+//      the header reset the quota, so the limit bounded nothing.)
+//   2. LAKELORE_ASK_TOKEN: in production the route is CLOSED unless this
+//      secret is set and the caller presents it as X-Ask-Token. Free-state
+//      asks need no subscription, so without it anyone who found the staging
+//      URL could spend on the model key. LAKELORE_ASK_PUBLIC=1 is the explicit
+//      opt-out for a real public launch.
+//   3. A per-machine daily ceiling on asks, whoever is asking.
+const ASK_TOKEN = process.env.LAKELORE_ASK_TOKEN || '';
+const ASK_PUBLIC = process.env.LAKELORE_ASK_PUBLIC === '1';
+const ASK_OPEN = ASK_PUBLIC || !!ASK_TOKEN || process.env.NODE_ENV !== 'production';
+if (ASK_ENABLED && !ASK_OPEN) {
+  console.warn('[ask] enabled but CLOSED: set LAKELORE_ASK_TOKEN (or LAKELORE_ASK_PUBLIC=1) to open it');
+}
+// A non-numeric value must not disable the ceiling (NaN compares false).
+const ASK_DAILY_MAX = Number.isFinite(Number(process.env.LAKELORE_ASK_DAILY_MAX)) && process.env.LAKELORE_ASK_DAILY_MAX !== ''
+  ? Number(process.env.LAKELORE_ASK_DAILY_MAX) : 500;
+let _askDay = '';
+let _askCount = 0;
+function askBudgetExhausted() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== _askDay) { _askDay = today; _askCount = 0; }
+  if (_askCount >= ASK_DAILY_MAX) {
+    console.warn(`[ask] daily ceiling of ${ASK_DAILY_MAX} reached — refusing until UTC midnight`);
+    return true;
+  }
+  _askCount++;
+  return false;
+}
 const askLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: Number(process.env.LAKELORE_ASK_PER_HOUR || 40),
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.get('x-user-id') || req.ip,
   message: { error: 'ask_quota', message: 'You have used the assistant a lot this hour — try again later.' },
 });
 app.post('/api/:state/ask', askLimiter, async (req, res) => {
-  if (!ASK_ENABLED) return res.status(503).json({ error: 'ask_unavailable' });
+  if (!ASK_ENABLED || !ASK_OPEN) return res.status(503).json({ error: 'ask_unavailable' });
+  if (ASK_TOKEN && !ASK_PUBLIC && !secretEq(req.get('x-ask-token') || '', ASK_TOKEN)) {
+    // 403, not 401: the app reads a 401 as an expired session token and retries.
+    return res.status(403).json({ error: 'ask_forbidden' });
+  }
   if (!validateState(req, res)) return;
   const { state } = req.params;
   if (isPaidState(state)) {
@@ -1098,11 +1135,12 @@ app.post('/api/:state/ask', askLimiter, async (req, res) => {
     try { ent = await checkEntitlement(userId); }
     catch (err) {
       console.warn('[ask] entitlement error:', err);
+      reportError(err, req);
       return res.status(500).json({ error: 'entitlement_check_failed' });
     }
     if (!ent.hasAllStates) return res.status(402).json({ error: 'subscription_required', state, expiresAt: ent.expiresAt });
   }
-  return askAgent.ask(req, res, { ...canonicalCtx, canonical, lakeloreData });
+  return askAgent.ask(req, res, { ...canonicalCtx, canonical, lakeloreData, askBudgetExhausted });
 });
 
 // ── /api/:state/reload ────────────────────────────────────────────────────────
@@ -1126,6 +1164,7 @@ app.post('/api/:state/reload', requireReloadToken, (req, res) => {
   // added lakes, and a stale map 404s /lake/:id for preview users tapping a
   // new lake until a full restart (defeating /reload's whole purpose).
   canonical.clearPreviewLakeIdMap(state);
+  canonical.clearTotalCache(state);
   // Drop the SEO lakes-index cache and the filters/measures response cache
   // for this state (2026-08-25): both are keyed to the artifact contents, and
   // a stale index serves refreshed data's predecessor for up to 6 h —
@@ -1151,6 +1190,7 @@ app.post('/api/:state/reload', requireReloadToken, (req, res) => {
     console.log(`[${state}] reloaded — ${lakes} lakes`);
     res.json({ ok: true, state, lakes });
   } catch (err) {
+    reportError(err, req);
     res.status(500).json({ error: err.message });
   }
 });

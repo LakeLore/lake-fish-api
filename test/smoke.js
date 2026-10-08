@@ -125,6 +125,14 @@ const get = async (p) => {
       }
     }
 
+    // client-config carries the served state list (1.1.2+ clients use it to
+    // hide a pulled state instead of dead-ending on a 400).
+    {
+      const cc = await get('/api/client-config');
+      const served = cc.body?.states?.active;
+      if (!Array.isArray(served) || served.join() !== [...ACTIVE].sort().join()) fail(`client-config states.active mismatch: ${JSON.stringify(served)?.slice(0, 80)}`);
+    }
+
     for (const st of INACTIVE) {
       const r = await get(`/api/${st}/status`);
       if (r.status !== 400) fail(`inactive ${st} /status expected 400, got ${r.status}`);

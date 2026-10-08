@@ -294,14 +294,27 @@ function _setBounded(userId, entry) {
   }
 }
 
-async function checkEntitlement(userId) {
+// How old a cached NEGATIVE must be before a client's "I just purchased" hint
+// (X-Entitlement-Refresh: 1) may re-ask RevenueCat. Bounds the hint to one RC
+// lookup per user per window, so it cannot be used to hammer RC.
+const REFRESH_NEGATIVE_AFTER_MS = 5_000;
+const _inflightLookups = new Map(); // userId -> Promise of the in-progress RC lookup
+
+async function checkEntitlement(userId, opts = {}) {
   if (!userId) return { hasAllStates: false, expiresAt: null, source: 'no-user-id' };
 
   const cached = _cache.get(userId);
   const now = Date.now();
+  // A just-purchased client must not sit behind a cached "not subscribed" for
+  // the rest of the 5-min TTL: the webhook that invalidates it lands on ONE
+  // machine, and may lose the race with the client's first post-purchase
+  // request. The hint only ever re-checks a negative — a cached positive is
+  // served as-is — so it can't be used to bypass anything.
+  const staleNegative = opts.refreshNegative && cached && !cached.hasAllStates
+    && (now - cached.fetchedAt) >= REFRESH_NEGATIVE_AFTER_MS;
   // Honor the per-entry TTL: error results are cached briefly (30 s) so an
   // RC blip doesn't pin `hasAllStates:false` for the full 5 minutes.
-  if (cached && (now - cached.fetchedAt) < (cached._ttl ?? CACHE_TTL_MS)) {
+  if (cached && !staleNegative && (now - cached.fetchedAt) < (cached._ttl ?? CACHE_TTL_MS)) {
     return {
       hasAllStates: cached.hasAllStates,
       expiresAt: cached.expiresAt,
@@ -309,7 +322,15 @@ async function checkEntitlement(userId) {
     };
   }
 
-  const result = await fetchEntitlementFromRevenueCat(userId);
+  // Single-flight per user: a burst of concurrent requests behind an expired
+  // (or hint-refreshed) entry shares ONE RevenueCat lookup instead of making
+  // one each.
+  let pending = _inflightLookups.get(userId);
+  if (!pending) {
+    pending = fetchEntitlementFromRevenueCat(userId).finally(() => _inflightLookups.delete(userId));
+    _inflightLookups.set(userId, pending);
+  }
+  const result = await pending;
   if (result.hasAllStates) {
     _lastGood.set(userId, { expiresAt: result.expiresAt, seenAt: now });
     saveLastGoodSoon();
@@ -382,7 +403,7 @@ function gateByState(req, res, next) {
     });
   }
 
-  checkEntitlement(userId).then(result => {
+  checkEntitlement(userId, { refreshNegative: req.get('x-entitlement-refresh') === '1' }).then(result => {
     if (result.hasAllStates) {
       req.entitlement = result;
       return next();

@@ -483,6 +483,12 @@ app.get('/api/client-config', (req, res) => {
     killedVersions: (process.env.LAKELORE_KILLED_VERSIONS || '')
       .split(',').map(s => s.trim()).filter(Boolean),
     message: process.env.LAKELORE_UPGRADE_MESSAGE || null,
+    // Served state list (2026-10-08): 1.1.2+ clients intersect this with the
+    // states their bundle knows, so a state pulled (or restored) server-side
+    // disappears from (or returns to) the picker without a store release —
+    // instead of a permanent "Server error (400)" on every binary that still
+    // lists it. Additive: older clients ignore the field.
+    states: { active: [...ACTIVE_STATES].sort() },
   });
 });
 
@@ -577,7 +583,7 @@ app.get('/api/me/entitlement', async (req, res) => {
   const userId = req.get('x-user-id');
   if (!userId) return res.status(400).json({ error: 'missing_x_user_id' });
   try {
-    const result = await checkEntitlement(userId);
+    const result = await checkEntitlement(userId, { refreshNegative: req.get('x-entitlement-refresh') === '1' });
     res.json({
       hasAllStates: result.hasAllStates,
       expiresAt: result.expiresAt,

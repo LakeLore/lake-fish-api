@@ -280,7 +280,9 @@ function probeState(state) {
   catch { /* fish_catch absent — fall through (results() tolerates it too) */ }
   lake = lake ?? db.prepare(`SELECT id FROM lakes WHERE length(trim(id)) > 0 LIMIT 1`).get();
   if (!lake) return 'no-lakes';
-  const mkReq = (params, query) => ({ params, query, get: () => undefined, lakeLorePreview: false, ip: 'probe' });
+  // lakeLoreNoCache: the probe has to run the real scan each time; a cached
+  // answer would stay green over a table that has gone bad since startup.
+  const mkReq = (params, query) => ({ params, query, get: () => undefined, lakeLorePreview: false, lakeLoreNoCache: true, ip: 'probe' });
   let r = _mockRes();
   // limit (not pageSize — results() reads `limit`; bug-hunt #4: the old param
   // silently ran the default-100 unindexed scan per state, per machine wake).

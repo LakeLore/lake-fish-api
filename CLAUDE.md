@@ -93,6 +93,8 @@ LAKELORE_FLY_APP=lake-fish-api-staging ~/deploy-data.sh          # data to stagi
 
 The Dockerfile + `.dockerignore` are strict allow-lists: a NEW server file must be added to BOTH or the image silently ships without it (`bin/` is deliberately not shipped). `test/unit.js` walks every relative `require` from `server.js` and fails `npm test` (so `deploy.sh`) when a required file is missing from either list.
 
+**Result caches (`server/canonical.js`):** `/results` remembers each query's COUNT and, when the page query took 40 ms or more, its raw row set, per state until `/reload`. Subscribers and preview users share those entries, which is safe only because the rows are stored before `finishResults` and every caller redacts its own parsed copy — never cache anything downstream of `finishResults`. The deep readiness probe sets `lakeLoreNoCache` so it always runs the real scan. `test/unit.js` drives all three call sites with each entitlement reading the other's entry.
+
 **Failure handling:** a route that catches an error and answers 500 calls `reportError(err, req)` (`server/report.js`) first — Sentry's Express handler only sees errors passed to `next()`. Outbound calls made while a request waits need a deadline (RevenueCat: `REVENUECAT_TIMEOUT_MS`); Node's `fetch` has none by default.
 
 A deliberate wire change fails the parity gate by design — re-record the

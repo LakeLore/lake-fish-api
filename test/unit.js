@@ -68,6 +68,53 @@ function bounded(p, ms = 3000) {
   return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`lookup did not settle in ${ms} ms`)), ms).unref())]);
 }
 
+// The slow-query row cache stores RAW rows that subscribers and preview users
+// share; redaction has to run on each copy handed out. Driven in-process with
+// the threshold at 0 so every page query is cached, across all three call
+// sites, with each entitlement populating an entry the other then reads.
+function rowCache() {
+  process.env.LAKELORE_ROWS_CACHE_MIN_MS = '0';
+  process.env.PREVIEW_ID_SECRET = process.env.PREVIEW_ID_SECRET || 'unit-test-only';
+  const Database = require('better-sqlite3');
+  const canonical = require('../server/canonical.js');
+  const ld = require(path.join(os.homedir(), 'lakelore-data'));
+  const db = new Database(path.join(os.homedir(), 'lakelore-data', 'out', 'tx.db'), { readonly: true });
+  const ctx = { getDb: () => db, isUnhealthy: () => false, getStateEntry: s => ld.getState(s), computeLakeStockingMetrics: () => ({}) };
+  const call = (query, preview, extra = {}) => {
+    const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r);
+    canonical.results({ params: { state: 'tx' }, query, get: () => undefined, lakeLorePreview: preview, ...extra }, r, ctx);
+    ok(r.statusCode === 200, `tx results ${JSON.stringify(query)} -> ${r.statusCode}`);
+    return r.body;
+  };
+  const redacted = b => b.preview === true && b.results.length > 0 && b.results.every(r =>
+    r.lake_name == null && r.county == null && r.latitude == null && r.longitude == null && r.area_acres == null
+    && /^p[0-9a-f]+$/.test(String(r.lake_id)));
+  const named = b => !b.preview && b.results.length > 0 && b.results.some(r => r.lake_name) && b.results.every(r => !/^p[0-9a-f]{15}$/.test(String(r.lake_id)));
+  let n = 0;
+  for (const q of [{}, { stockingFirst: '1' }, { presenceUnion: '1' }, { sortBy: 'lake' }, { stockingFirst: '1', minStocked: '1' }]) {
+    for (const order of [[false, true, false, true], [true, false, true, false]]) {
+      const query = { ...q, limit: String(40 + n++) };   // a fresh key per pass, so each order populates its own entry
+      const before = canonical.rowsCacheStats().hits;
+      const seen = { true: [], false: [] };
+      for (const pv of order) {
+        const b = call(query, pv);
+        ok(pv ? redacted(b) : named(b), `${JSON.stringify(query)} preview=${pv}: ${pv ? 'identity in a preview answer' : 'a subscriber answer lost its lake names'} (order ${order})`);
+        seen[pv].push(JSON.stringify(b));
+      }
+      ok(seen.true[0] === seen.true[1] && seen.false[0] === seen.false[1], `${JSON.stringify(query)}: a cached answer differs from the first one`);
+      ok(canonical.rowsCacheStats().hits > before, `${JSON.stringify(query)}: no cache hit — the cache is not in the path`);
+    }
+  }
+  // The readiness probe's flag must bypass the cache entirely.
+  const h = canonical.rowsCacheStats();
+  call({ limit: '40' }, false, { lakeLoreNoCache: true });
+  const h2 = canonical.rowsCacheStats();
+  ok(h2.hits === h.hits && h2.misses === h.misses, 'lakeLoreNoCache request touched the row cache');
+  canonical.clearTotalCache('tx');
+  ok(canonical.rowsCacheStats().entries === 0 && canonical.rowsCacheStats().bytes === 0, 'clearTotalCache left row-cache entries or bytes behind');
+  db.close();
+}
+
 async function withServer(env, fn) {
   const port = 3198;
   const server = spawn('node', ['server.js'], {
@@ -126,6 +173,7 @@ function imageShipsEveryRequiredFile() {
   await withServer({}, async (ask) => {
     ok(await ask() === '503 ask_unavailable', 'production /ask without a configured token must be closed');
   });
+  rowCache();
   // A well-formed ask against an unroutable model endpoint: it passes
   // validation, spends budget, then fails upstream — no real model call.
   const real = JSON.stringify({ messages: [{ role: 'user', content: 'walleye lakes?' }] });

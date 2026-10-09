@@ -113,7 +113,8 @@ function resolvePreviewLakeId(state, db, pid) {
 // species search 100 ms -> see IMPROVEMENT_PLAN Round 22 for the measurement).
 const _totalCache = new Map(); // state -> Map(key -> n), insertion-ordered
 const TOTAL_CACHE_MAX = 400;   // per state
-function cachedTotal(state, db, sql, args) {
+function cachedTotal(state, db, sql, args, noCache) {
+  if (noCache) return db.prepare(sql).get(...args).n;
   let m = _totalCache.get(state);
   if (!m) { m = new Map(); _totalCache.set(state, m); }
   // JSON turns NaN and Infinity both into null, but SQLite binds them
@@ -128,7 +129,59 @@ function cachedTotal(state, db, sql, args) {
   if (m.size > TOTAL_CACHE_MAX) m.delete(m.keys().next().value);
   return n;
 }
-function clearTotalCache(state) { _totalCache.delete(state); }
+// The page query itself is remembered too, but only when it was slow. A
+// statewide search with no species sorts every lake in the state for one page
+// (MN on a production-size machine, 2026-10-09: ~420 ms of CPU, so one machine
+// served 2.8 of them a second, and every user who picks "All Species" sends
+// the same one). The rows are a function of the artifact, the SQL and the
+// params alone.
+//
+// SUBSCRIBERS AND PREVIEW USERS SHARE ENTRIES: for most requests the SQL is
+// the same for both. That is safe only because what is stored is the RAW row
+// set, serialised before anything touches it, and every caller gets its own
+// parsed copy which finishResults then redacts (or not). Never cache anything
+// downstream of finishResults — that would hand redacted rows to subscribers
+// or identity to preview users. test/unit.js holds this.
+const _rowsCache = new Map();            // key -> { state, json, cost }, insertion-ordered
+let _rowsCacheBytes = 0;
+const _rowsCacheStats = { hits: 0, misses: 0 };
+const ROWS_CACHE_MIN_MS = process.env.LAKELORE_ROWS_CACHE_MIN_MS !== undefined   // cheaper queries are not worth the memory
+  ? Number(process.env.LAKELORE_ROWS_CACHE_MIN_MS) : 40;
+const ROWS_CACHE_MAX_BYTES = 24 * 1024 * 1024;   // all states together
+const ROWS_CACHE_MAX_ENTRY = 512 * 1024;
+const ROWS_CACHE_MAX_ENTRIES = 2000;     // a slow query with an empty answer costs almost no bytes
+const ROWS_CACHE_ENTRY_OVERHEAD = 256;   // key string + Map slot + wrapper
+function _rowsCacheDrop(key, v) { _rowsCache.delete(key); _rowsCacheBytes -= v.cost; }
+// noCache: the deep readiness probe must run the real scan every time — it
+// exists to notice a table that has gone bad since startup.
+function cachedRows(state, db, sql, args, noCache) {
+  const run = () => db.prepare(sql).all(...args);
+  if (noCache || args.some(a => typeof a === 'number' && !Number.isFinite(a))) return run();
+  const key = crypto.createHash('sha1').update(state).update('\u0000').update(sql).update('\u0000').update(JSON.stringify(args)).digest('base64');
+  const hit = _rowsCache.get(key);
+  if (hit) { _rowsCache.delete(key); _rowsCache.set(key, hit); _rowsCacheStats.hits++; return JSON.parse(hit.json); }
+  _rowsCacheStats.misses++;
+  const t0 = process.hrtime.bigint();
+  const rows = run();
+  if (Number(process.hrtime.bigint() - t0) / 1e6 < ROWS_CACHE_MIN_MS) return rows;
+  // JSON cannot carry a non-finite number (it becomes null); never cache one.
+  for (const r of rows) for (const k in r) if (typeof r[k] === 'number' && !Number.isFinite(r[k])) return rows;
+  const json = JSON.stringify(rows);
+  const cost = Buffer.byteLength(json) + ROWS_CACHE_ENTRY_OVERHEAD;
+  if (cost > ROWS_CACHE_MAX_ENTRY) return rows;
+  _rowsCache.set(key, { state, json, cost });
+  _rowsCacheBytes += cost;
+  while (_rowsCacheBytes > ROWS_CACHE_MAX_BYTES || _rowsCache.size > ROWS_CACHE_MAX_ENTRIES) {
+    const [k, v] = _rowsCache.entries().next().value;
+    _rowsCacheDrop(k, v);
+  }
+  return rows;
+}
+function rowsCacheStats() { return { ..._rowsCacheStats, entries: _rowsCache.size, bytes: _rowsCacheBytes }; }
+function clearTotalCache(state) {
+  _totalCache.delete(state);
+  for (const [k, v] of _rowsCache) if (v.state === state) _rowsCacheDrop(k, v);
+}
 
 function clearPreviewLakeIdMap(state) {
   _previewLakeIdMaps.delete(state);
@@ -1008,6 +1061,7 @@ function measures(req, res, ctx) {
 
 function results(req, res, ctx) {
   const { state } = req.params;
+  const noCache = !!req.lakeLoreNoCache;   // deep readiness probe: always run the scan
   const db = openDb(state, res, ctx);
   if (!db) return;
 
@@ -1328,14 +1382,14 @@ function results(req, res, ctx) {
     `;
 
     const allParams = [...cteParams, ...params];
-    const total = cachedTotal(state, db, `${ctePrefix} SELECT COUNT(*) as n ${joinsSql}`, allParams);
+    const total = cachedTotal(state, db, `${ctePrefix} SELECT COUNT(*) as n ${joinsSql}`, allParams, noCache);
 
-    let rows = db.prepare(`
+    let rows = cachedRows(state, db, `
       ${ctePrefix}
       SELECT ${selectCols} ${joinsSql}
       ORDER BY ${sortExpr ?? `${sortCol} ${dir} NULLS LAST`}${orderSuffix}
       LIMIT ? OFFSET ?
-    `).all([...allParams, limitNum, offsetNum]);
+    `, [...allParams, limitNum, offsetNum], noCache);
 
     // stocked range post-filter (identical to legacy semantics).
     if (minStocked !== undefined && minStocked !== '') {
@@ -1394,6 +1448,7 @@ function finishResults(req, res, state, entry, rows, total) {
 // stocked sort. Reuses the wire.results projection so the row shape is identical
 // to the normal path; goes through finishResults for preview redaction.
 function stockingFirstResults(req, res, opts) {
+  const noCache = !!req.lakeLoreNoCache;
   const { db, state, entry, wire, species, county, lakeName, minStocked, maxStocked,
           sortDir, limitNum, offsetNum } = opts;
   try {
@@ -1443,14 +1498,14 @@ function stockingFirstResults(req, res, opts) {
       LEFT JOIN surveys s ON s.id = fc.survey_id
       ${whereClause}`;
 
-    const total = cachedTotal(state, db, `SELECT COUNT(*) AS n ${joins}`, args);
-    let rows = db.prepare(`
+    const total = cachedTotal(state, db, `SELECT COUNT(*) AS n ${joins}`, args, noCache);
+    let rows = cachedRows(state, db, `
       SELECT ${selectCols} ${joins}
       ORDER BY (m.adults_per_100ac IS NULL) ASC,
                COALESCE(m.adults_per_100ac, m.adults_est) ${dir} NULLS LAST,
                l.name ASC
       LIMIT ? OFFSET ?
-    `).all(...args, limitNum, offsetNum);
+    `, [...args, limitNum, offsetNum], noCache);
 
     if (minStocked !== undefined && minStocked !== '') {
       rows = rows.filter(r => r.stocked_per_100ac != null && r.stocked_per_100ac >= parseFloat(minStocked));
@@ -1475,6 +1530,7 @@ function stockingFirstResults(req, res, opts) {
 // Reuses wire.results so the row shape matches the normal path; preview
 // redaction goes through finishResults.
 function presenceUnionResults(req, res, opts) {
+  const noCache = !!req.lakeLoreNoCache;
   const { db, state, entry, wire, species, county, lakeName, limitNum, offsetNum } = opts;
   try {
     const wireResults = wire.results || [];
@@ -1533,15 +1589,15 @@ function presenceUnionResults(req, res, opts) {
       : joins.replace('m.adults_per_100ac', 'NULL').replace('m.adults_est', 'NULL').replace('m.species_name', 'NULL');
 
     const allArgs = [...fcArgs, ...stkArgs, ...outArgs];
-    const total = cachedTotal(state, db, `SELECT COUNT(*) AS n ${joinsFixed}`, allArgs);
+    const total = cachedTotal(state, db, `SELECT COUNT(*) AS n ${joinsFixed}`, allArgs, noCache);
     // Presence has no ranking, so it lists by name — except in preview, where
     // name order would reveal which lake each row is (see ensurePreviewKeyFn).
     if (req.lakeLorePreview) ensurePreviewKeyFn(db, state);
-    const rows = db.prepare(`
+    const rows = cachedRows(state, db, `
       SELECT ${selectCols} ${joinsFixed}
       ORDER BY ${req.lakeLorePreview ? 'll_preview_key(l.id) ASC' : 'l.name ASC'}, k.species_native ASC
       LIMIT ? OFFSET ?
-    `).all(...allArgs, limitNum, offsetNum);
+    `, [...allArgs, limitNum, offsetNum], noCache);
 
     return finishResults(req, res, state, entry, rows, total);
   } catch (err) {
@@ -1709,4 +1765,4 @@ function lakeDetail(req, res, ctx) {
 // previewIdFor: exported for the deep-readyz probe, whose preview leg must
 // address the lake the way a real preview client does (hashed id) now that
 // raw ids 402 in preview mode.
-module.exports = { filters, measures, results, lakeDetail, clearPreviewLakeIdMap, clearTotalCache, previewIdFor: previewId };
+module.exports = { filters, measures, results, lakeDetail, clearPreviewLakeIdMap, clearTotalCache, rowsCacheStats, previewIdFor: previewId };

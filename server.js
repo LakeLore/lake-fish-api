@@ -226,7 +226,10 @@ app.get('/healthz', (req, res) => {
     disk = { freeMb: Math.round(s.bavail * s.bsize / 1048576), totalMb: Math.round(s.blocks * s.bsize / 1048576) };
   } catch { /* local dev without /data */ }
   const jsonl = {};
-  for (const f of ['feedback.jsonl', 'subscribers.jsonl']) {
+  // Ask LakeLore answer reports are daily files; expose today's and
+  // yesterday's so review-poll.js can tell the owner a report arrived.
+  const dayName = (ms) => `ask-reports-${new Date(ms).toISOString().slice(0, 10)}.jsonl`;
+  for (const f of ['feedback.jsonl', 'subscribers.jsonl', dayName(Date.now() - 86400_000), dayName(Date.now())]) {
     try { jsonl[f] = fs.statSync(path.join(process.env.LAKELORE_DB_DIR || '/data', f)).size; } catch { /* absent */ }
   }
   res.json({
@@ -1168,7 +1171,8 @@ function askBudgetExhausted() {
 }
 // An ask that fails (out of credit, upstream error) gives back what it spent,
 // so a subscriber does not lose questions to errors they could not help.
-function askRefund({ userId, budget }) {
+function askRefund({ userId, budget, day }) {
+  if (day !== _askDay) return; // failed after UTC midnight: the new day owes nothing
   if (userId && _askUserCounts.get(userId) > 0) _askUserCounts.set(userId, _askUserCounts.get(userId) - 1);
   if (budget && _askCount > 0) _askCount--;
   saveAskCounts();
@@ -1207,7 +1211,8 @@ app.post('/api/:state/ask', askLimiter, async (req, res) => {
   const askUserQuota = quotaUser
     ? () => askUserQuotaExhausted(quotaUser) && { limit: ASK_USER_DAILY_MAX }
     : null;
-  const askRefundSpent = ({ budget }) => askRefund({ userId: quotaUser, budget });
+  const askDay = new Date().toISOString().slice(0, 10);
+  const askRefundSpent = ({ budget }) => askRefund({ userId: quotaUser, budget, day: askDay });
   return askAgent.ask(req, res, { ...canonicalCtx, canonical, lakeloreData, askBudgetExhausted, askUserQuota, askRefundSpent });
 });
 

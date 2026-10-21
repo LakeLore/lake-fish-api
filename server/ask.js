@@ -414,7 +414,7 @@ let _creditReportedAt = 0;
 // The monthly credit used up ("Your credit balance is too low…") and the
 // Console workspace spend limit reached ("You have reached your specified
 // workspace API usage limits…") both arrive as a plain 400.
-const CREDIT_OUT_RE = /credit balance is too low|usage limits?|spend(ing)? limit/i;
+const CREDIT_OUT_RE = /credit balance is too low|reached your specified (workspace )?API usage limits/i;
 
 // ── Route handler ────────────────────────────────────────────────────────────
 async function ask(req, res, ctx) {
@@ -491,7 +491,9 @@ async function ask(req, res, ctx) {
     final = await runner.done();
   } catch (err) {
     const ms = Date.now() - t0;
-    ctx.askRefundSpent?.({ budget: true });
+    // The user always gets their question back; the machine budget only if
+    // no model call completed (later iterations were billed).
+    ctx.askRefundSpent?.({ budget: tot.iterations === 0 });
     // No credential resolvable at all (no API key, no `ant auth login`
     // profile) — the SDK throws a plain Error before any request is made.
     if (err instanceof Anthropic.AuthenticationError

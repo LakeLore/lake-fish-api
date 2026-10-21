@@ -124,6 +124,7 @@ function rowCache() {
 const mock = { mode: 'ok', calls: 0 };
 const MOCK_ERRORS = {
   credit: 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.',
+  other: 'messages.0.content: text content blocks must be non-empty',
   limit: 'You have reached your specified workspace API usage limits. You will regain access on 2026-11-01 at 00:00 UTC.',
 };
 function mockModel() {
@@ -214,6 +215,13 @@ function imageShipsEveryRequiredFile() {
     ok(await ask() === '403 ask_forbidden', '/ask without the token must 403');
     ok(await ask({ 'X-Ask-Token': 'wrong' }) === '403 ask_forbidden', '/ask with a wrong token must 403');
     for (let i = 0; i < 4; i++) ok(await ask(T) === '400 bad_request', 'an invalid body must be rejected without spending budget');
+    // Failed model calls give the machine budget back, and a 400 that is not
+    // about money stays a plain upstream error.
+    mock.mode = 'credit';
+    for (let i = 0; i < 3; i++) ok(await ask(T, real) === '503 ask_out_of_credit', 'an exhausted credit must 503 ask_out_of_credit');
+    mock.mode = 'other';
+    let o = await ask(T, real); ok(o === '502 ask_upstream', `a non-credit 400 must 502 ask_upstream: ${o}`);
+    mock.mode = 'ok';
     const a1 = await ask(T, real), a2 = await ask({ ...T, 'X-User-Id': 'someone-else' }, real);
     ok(a1 === '200 undefined' && a2 === '200 undefined', `asks inside the ceiling must get an answer: ${a1} / ${a2}`);
     ok(await ask(T, real) === '503 ask_unavailable', '/ask past the daily ceiling must 503 ask_unavailable');
@@ -271,8 +279,11 @@ function imageShipsEveryRequiredFile() {
   const old = path.join(vol, 'ask-2026-01.jsonl');
   fs.writeFileSync(old, '{}\n');
   fs.utimesSync(old, new Date('2026-01-31'), new Date('2026-01-31'));
+  const keep = ['feedback.jsonl', 'subscribers.jsonl', 'ask-counts.json'].map(f => path.join(vol, f));
+  for (const k of keep) { if (!fs.existsSync(k)) fs.writeFileSync(k, '{}\n'); fs.utimesSync(k, new Date('2026-01-31'), new Date('2026-01-31')); }
   await withServer(SUB, async () => {});
   ok(!fs.existsSync(old), 'a chat log older than 90 days must be pruned at start-up');
+  for (const k of keep) ok(fs.existsSync(k), `the prune must leave ${path.basename(k)} alone`);
   fs.rmSync(vol, { recursive: true, force: true });
 
   // Switched off (no LAKELORE_ASK_ENABLED): client-config tells 1.1.2+ apps

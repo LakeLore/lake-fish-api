@@ -573,12 +573,12 @@ function filters(req, res, ctx) {
     }
 
     // Specialist gears (WI 2026-10: age-0/age-1 recruitment indices, population-estimate
-    // densities) must never become the client's default gear — clients that pick the
+    // densities, treaty-creel angler catch rates) must never become the client's default gear — clients that pick the
     // gear with the most CPUE rows (older binaries; the scatter view) would otherwise
     // rank lakes by fingerling counts in counties where those gears lead. Only emitted
     // when such gears are present, so every other state's response is unchanged.
     if (defaultGear === undefined && gearCpueCounts) {
-      const SPECIALIST = /^(Age-[01] |Juvenile \(|Population estimate)/;
+      const SPECIALIST = /^(Age-[01] |Juvenile \(|Population estimate|Treaty creel survey)/;
       const gears = Object.keys(gearCpueCounts);
       if (gears.some(g => SPECIALIST.test(g))) {
         // Same fallback buckets the client's defaultGearFor never defaults to (RESIDUAL_GEARS).
@@ -1060,10 +1060,11 @@ function measures(req, res, ctx) {
         .sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
       // Trophy (single memorable tier since 2026-09-11) prefers a
       // measured/published rate over KS's relative-basis ranking.
-      // Specialist gears (WI 2026-10: young-of-year / age-1 recruitment indices and
-      // population-estimate densities) are offered but never the default: a lake list
-      // ranked by fingerling counts or fish/acre is not what "Abundance" means by default.
-      const SPECIALIST = /^(Age-[01] |Juvenile \(|Population estimate)/;
+      // Specialist gears (WI 2026-10: young-of-year / age-1 recruitment indices,
+      // population-estimate densities, treaty-creel angler catch rates) are offered but
+      // never the default: a lake list ranked by fingerling counts, fish/acre or anglers'
+      // catch per hour is not what "Abundance" means by default.
+      const SPECIALIST = /^(Age-[01] |Juvenile \(|Population estimate|Treaty creel survey)/;
       const general = ranked.filter(s => !SPECIALIST.test(s.gear || ''));
       const pool = general.length ? general : ranked;
       const primary = m.id === 'size' || m.id === 'trophy'

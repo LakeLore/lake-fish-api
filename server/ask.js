@@ -411,6 +411,7 @@ function appendAskReport(record) { return appendJsonl('ask-reports', record); }
 // Sentry once every six hours per machine, not on every ask, so it cannot use
 // up the Sentry quota and bury crash reports.
 let _creditReportedAt = 0;
+let _authReportedAt = 0;
 // The monthly credit used up ("Your credit balance is too low…") and the
 // Console workspace spend limit reached ("You have reached your specified
 // workspace API usage limits…") both arrive as a plain 400.
@@ -499,6 +500,9 @@ async function ask(req, res, ctx) {
     if (err instanceof Anthropic.AuthenticationError
         || /Could not resolve authentication method/.test(err?.message || '')) {
       console.error(`[ask] ${state} auth error after ${ms}ms: ${err.message}`);
+      // An expired or revoked key fails every ask; tell Sentry (throttled
+      // like the credit error) so the owner hears about it.
+      if (Date.now() - _authReportedAt > 6 * 3600_000) { _authReportedAt = Date.now(); reportError(err, req); }
       return res.status(503).json({ error: 'ask_unconfigured', message: 'Assistant credentials are missing or invalid on the server.' });
     }
     // Monthly API credit or workspace spend limit used up (2026-10-20): the

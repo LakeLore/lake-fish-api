@@ -5,6 +5,16 @@ primary_region = 'ord'   # Chicago — central for SD/MN/ND/IA/NE
 
 [env]
   NODE_ENV = 'production'
+  # Ask LakeLore (production launch with app 1.1.2, 2026-10-20). Needs the
+  # ANTHROPIC_API_KEY secret (a key from the Console org linked to the Max
+  # plan's monthly credit) or every ask 503s ask_unconfigured. Subscribers
+  # only in every state (server.js), so the route is public to the app: the
+  # X-Ask-Token gate exists for free-state asks, which production refuses.
+  # Ceilings: 25 asks per subscriber per day; 150 asks per machine per day
+  # (~$7.50 at Opus 5.5 rates), well inside the $200 monthly credit.
+  LAKELORE_ASK_ENABLED = '1'
+  LAKELORE_ASK_PUBLIC = '1'
+  LAKELORE_ASK_DAILY_MAX = '150'
 
 [http_service]
   internal_port = 3100

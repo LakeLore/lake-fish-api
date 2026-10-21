@@ -24,7 +24,7 @@ const { betaZodTool } = require('@anthropic-ai/sdk/helpers/beta/zod');
 const { z } = require('zod');
 const { reportError } = require('./report');
 
-const MODEL = process.env.LAKELORE_ASK_MODEL || 'claude-opus-5';
+const MODEL = process.env.LAKELORE_ASK_MODEL || 'claude-opus-5-5';
 const EFFORT = process.env.LAKELORE_ASK_EFFORT || 'medium';
 const MAX_ITERATIONS = 8;
 const MAX_TOOL_ROWS = 25;
@@ -33,6 +33,9 @@ const MAX_MSG_CHARS = 2000;
 const MAX_TOTAL_CHARS = 12000;
 const REQUEST_TIMEOUT_MS = 90_000;
 const ASK_LOG_MAX_BYTES = 50 * 1024 * 1024;
+// Chat logs are kept 90 days (the privacy policy says so): one file per
+// month, and files more than three months old are deleted on the next write.
+const ASK_LOG_KEEP_MONTHS = 3;
 
 let _client = null;
 function client() {
@@ -360,10 +363,31 @@ function extractLakes(answer, seen) {
 }
 
 // ── Logging ──────────────────────────────────────────────────────────────────
-function appendAskLog(record) {
-  const p = process.env.LAKELORE_ASK_LOG
-    || (process.env.LAKELORE_DB_DIR ? `${process.env.LAKELORE_DB_DIR}/ask.jsonl` : null);
-  if (!p) return;
+// LAKELORE_ASK_LOG names one exact file (dev). On a server with a data volume
+// the log is ask-YYYY-MM.jsonl there, pruned to ASK_LOG_KEEP_MONTHS.
+function monthKey(d) { return d.toISOString().slice(0, 7); }
+function pruneOldLogs(dir, prefix) {
+  const cutoff = new Date();
+  cutoff.setUTCMonth(cutoff.getUTCMonth() - ASK_LOG_KEEP_MONTHS);
+  const keepFrom = monthKey(cutoff);
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      const m = f.match(new RegExp(`^${prefix}-(\\d{4}-\\d{2})\\.jsonl$`));
+      if (m && m[1] < keepFrom) fs.unlinkSync(`${dir}/${f}`);
+    }
+  } catch (e) {
+    console.warn(`[ask] log prune failed: ${e.message}`);
+  }
+}
+function appendJsonl(prefix, record) {
+  let p = prefix === 'ask' ? process.env.LAKELORE_ASK_LOG : null;
+  if (!p) {
+    const dir = process.env.LAKELORE_DB_DIR;
+    if (!dir) return;
+    const month = monthKey(new Date());
+    p = `${dir}/${prefix}-${month}.jsonl`;
+    if (!fs.existsSync(p)) pruneOldLogs(dir, prefix);
+  }
   try {
     const st = fs.existsSync(p) ? fs.statSync(p) : null;
     if (st && st.size > ASK_LOG_MAX_BYTES) return;
@@ -372,6 +396,8 @@ function appendAskLog(record) {
     console.warn(`[ask] log append failed: ${e.message}`);
   }
 }
+function appendAskLog(record) { appendJsonl('ask', record); }
+function appendAskReport(record) { appendJsonl('ask-reports', record); }
 
 // ── Route handler ────────────────────────────────────────────────────────────
 async function ask(req, res, ctx) {
@@ -410,6 +436,10 @@ async function ask(req, res, ctx) {
   // Daily ceiling (server.js): counted HERE, after validation, so only asks
   // that are about to reach the model spend it. Counted earlier, 500 empty
   // bodies shut the assistant off for everyone until midnight.
+  const quota = ctx.askUserQuota?.();
+  if (quota) {
+    return res.status(429).json({ error: 'ask_daily_quota', message: `That’s today’s ${quota.limit} questions. Ask LakeLore resets at midnight UTC — the lake rankings are always open.` });
+  }
   if (ctx.askBudgetExhausted?.()) {
     return res.status(503).json({ error: 'ask_unavailable', message: 'The assistant is resting for today — try again tomorrow.' });
   }
@@ -449,6 +479,15 @@ async function ask(req, res, ctx) {
         || /Could not resolve authentication method/.test(err?.message || '')) {
       console.error(`[ask] ${state} auth error after ${ms}ms: ${err.message}`);
       return res.status(503).json({ error: 'ask_unconfigured', message: 'Assistant credentials are missing or invalid on the server.' });
+    }
+    // Monthly API credit used up (2026-10-20): the API answers 400 with this
+    // message and there is no dedicated error type, so match it narrowly.
+    // The owner chose a hard stop over paid overflow — say so kindly, and
+    // tell Sentry so the owner hears about it the first time.
+    if (err instanceof Anthropic.BadRequestError && /credit balance is too low/i.test(err.message || '')) {
+      console.error(`[ask] ${state} API credit exhausted after ${ms}ms`);
+      reportError(err, req);
+      return res.status(503).json({ error: 'ask_out_of_credit', message: 'Ask LakeLore has answered all the questions it can this month. It will be back when the new month’s answers arrive — the lake rankings are always open.' });
     }
     if (err instanceof Anthropic.RateLimitError) {
       console.warn(`[ask] ${state} upstream rate limit after ${ms}ms`);
@@ -490,4 +529,4 @@ async function ask(req, res, ctx) {
   res.json({ answer, answer_text, lakes, usage });
 }
 
-module.exports = { ask, clearAskCache, validateMessages, extractLakes, MODEL, EFFORT };
+module.exports = { ask, appendAskReport, clearAskCache, validateMessages, extractLakes, MODEL, EFFORT };

@@ -178,7 +178,7 @@ function imageShipsEveryRequiredFile() {
   // validation, spends budget, then fails upstream — no real model call.
   const real = JSON.stringify({ messages: [{ role: 'user', content: 'walleye lakes?' }] });
   const T = { 'X-Ask-Token': 'sesame' };
-  await withServer({ LAKELORE_ASK_TOKEN: 'sesame', LAKELORE_ASK_DAILY_MAX: '2',
+  await withServer({ LAKELORE_ASK_TOKEN: 'sesame', LAKELORE_ASK_DAILY_MAX: '2', LAKELORE_ASK_SUBSCRIBERS_ONLY: '0',
     ANTHROPIC_API_KEY: 'unit-test', ANTHROPIC_BASE_URL: 'http://127.0.0.1:9' }, async (ask) => {
     ok(await ask() === '403 ask_forbidden', '/ask without the token must 403');
     ok(await ask({ 'X-Ask-Token': 'wrong' }) === '403 ask_forbidden', '/ask with a wrong token must 403');
@@ -186,6 +186,28 @@ function imageShipsEveryRequiredFile() {
     const a1 = await ask(T, real), a2 = await ask({ ...T, 'X-User-Id': 'someone-else' }, real);
     ok(!a1.includes('ask_unavailable') && !a2.includes('ask_unavailable'), `asks inside the ceiling must reach the model call: ${a1} / ${a2}`);
     ok(await ask(T, real) === '503 ask_unavailable', '/ask past the daily ceiling must 503 ask_unavailable');
+  });
+
+  // Production launch shape (2026-10-20): public route, subscribers only.
+  // Without RevenueCat keys a production server treats everyone as not
+  // entitled, so the free state's ask must 402 too, and client-config must
+  // advertise the assistant.
+  await withServer({ LAKELORE_ASK_PUBLIC: '1', ANTHROPIC_API_KEY: 'unit-test', ANTHROPIC_BASE_URL: 'http://127.0.0.1:9' }, async (ask) => {
+    ok(await ask({ 'X-User-Id': 'free-user' }, real) === '402 subscription_required', 'subscribers-only /ask must 402 a free-state ask without a subscription');
+    ok(await ask({}, real) === '402 subscription_required', 'subscribers-only /ask must 402 a request with no user id');
+    const cfg = await (await fetch('http://localhost:3198/api/client-config')).json();
+    ok(cfg.ask && cfg.ask.enabled === true, `client-config must advertise ask.enabled: ${JSON.stringify(cfg.ask)}`);
+  });
+  // Per-subscriber daily quota. Outside production a missing RevenueCat key
+  // counts as entitled, which stands in for a subscriber here.
+  await withServer({ NODE_ENV: 'development', REVENUECAT_SECRET_KEY: '', REVENUECAT_PROJECT_ID: '', LAKELORE_ASK_USER_DAILY_MAX: '1', ANTHROPIC_API_KEY: 'unit-test', ANTHROPIC_BASE_URL: 'http://127.0.0.1:9' }, async (ask) => {
+    const U = { 'X-User-Id': 'subscriber-1' };
+    const bad = await ask(U); ok(bad === '400 bad_request', `an invalid body must not spend the user quota: ${bad}`);
+    const first = await ask(U, real);
+    ok(!first.includes('ask_daily_quota'), `the first ask must reach the model call: ${first}`);
+    const second = await ask(U, real); ok(second === '429 ask_daily_quota', `the second ask past a quota of 1 must 429 ask_daily_quota: ${second}`);
+    const other = await ask({ 'X-User-Id': 'subscriber-2' }, real);
+    ok(!other.includes('ask_daily_quota'), `another subscriber keeps their own quota: ${other}`);
   });
 
   if (failures) { console.error(`\nUNIT FAILED — ${failures} failure(s)`); process.exit(1); }

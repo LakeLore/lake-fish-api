@@ -17,6 +17,9 @@ primary_region = 'ord'
   # The Ask route only registers when this is set (server/ask.js). Production
   # does not set it; staging does so the TestFlight build can reach it.
   LAKELORE_ASK_ENABLED = '1'
+  # Staging has no RevenueCat keys, so subscribers-only would refuse every
+  # ask; keep free-state (MN) asks open here behind LAKELORE_ASK_TOKEN.
+  LAKELORE_ASK_SUBSCRIBERS_ONLY = '0'
 
 [http_service]
   internal_port = 3100

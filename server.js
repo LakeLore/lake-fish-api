@@ -492,6 +492,11 @@ app.get('/api/client-config', (req, res) => {
     // instead of a permanent "Server error (400)" on every binary that still
     // lists it. Additive: older clients ignore the field.
     states: { active: [...ACTIVE_STATES].sort() },
+    // Ask LakeLore availability (2026-10-20): 1.1.2+ clients hide the chat's
+    // entry points when this is false, so the assistant can be switched off
+    // (credit gone, a bad answer in the wild) without a release. Read at
+    // request time — the ASK_* constants are declared with the route below.
+    ask: { enabled: ASK_ENABLED && ASK_OPEN },
   });
 });
 
@@ -1094,6 +1099,10 @@ if (ASK_ENABLED) console.log(`[ask] enabled — model=${askAgent.MODEL} effort=$
 //      URL could spend on the model key. LAKELORE_ASK_PUBLIC=1 is the explicit
 //      opt-out for a real public launch.
 //   3. A per-machine daily ceiling on asks, whoever is asking.
+// Since 2026-10-20 the assistant is also SUBSCRIBERS-ONLY in every state,
+// the free state included (owner decision; LAKELORE_ASK_SUBSCRIBERS_ONLY=0
+// restores free-state asks — staging sets it because it has no RevenueCat
+// keys), and each subscriber gets LAKELORE_ASK_USER_DAILY_MAX asks a day.
 const ASK_TOKEN = process.env.LAKELORE_ASK_TOKEN || '';
 const ASK_PUBLIC = process.env.LAKELORE_ASK_PUBLIC === '1';
 const ASK_OPEN = ASK_PUBLIC || !!ASK_TOKEN || process.env.NODE_ENV !== 'production';
@@ -1103,11 +1112,26 @@ if (ASK_ENABLED && !ASK_OPEN) {
 // A non-numeric value must not disable the ceiling (NaN compares false).
 const ASK_DAILY_MAX = Number.isFinite(Number(process.env.LAKELORE_ASK_DAILY_MAX)) && process.env.LAKELORE_ASK_DAILY_MAX !== ''
   ? Number(process.env.LAKELORE_ASK_DAILY_MAX) : 500;
+const ASK_SUBSCRIBERS_ONLY = process.env.LAKELORE_ASK_SUBSCRIBERS_ONLY !== '0';
+const ASK_USER_DAILY_MAX = Number.isFinite(Number(process.env.LAKELORE_ASK_USER_DAILY_MAX)) && process.env.LAKELORE_ASK_USER_DAILY_MAX !== ''
+  ? Number(process.env.LAKELORE_ASK_USER_DAILY_MAX) : 25;
 let _askDay = '';
 let _askCount = 0;
+// Per-subscriber daily counts. Keyed on the X-User-Id that just passed the
+// entitlement check, so rotating the header buys nothing; per machine, so a
+// user split across both machines can reach twice the cap at most.
+const _askUserCounts = new Map();
+function askUserQuotaExhausted(userId) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== _askDay) { _askDay = today; _askCount = 0; _askUserCounts.clear(); }
+  const n = _askUserCounts.get(userId) || 0;
+  if (n >= ASK_USER_DAILY_MAX) return true;
+  _askUserCounts.set(userId, n + 1);
+  return false;
+}
 function askBudgetExhausted() {
   const today = new Date().toISOString().slice(0, 10);
-  if (today !== _askDay) { _askDay = today; _askCount = 0; }
+  if (today !== _askDay) { _askDay = today; _askCount = 0; _askUserCounts.clear(); }
   if (_askCount >= ASK_DAILY_MAX) {
     console.warn(`[ask] daily ceiling of ${ASK_DAILY_MAX} reached — refusing until UTC midnight`);
     return true;
@@ -1130,7 +1154,7 @@ app.post('/api/:state/ask', askLimiter, async (req, res) => {
   }
   if (!validateState(req, res)) return;
   const { state } = req.params;
-  if (isPaidState(state)) {
+  if (ASK_SUBSCRIBERS_ONLY || isPaidState(state)) {
     const userId = req.get('x-user-id');
     if (!userId) return res.status(402).json({ error: 'subscription_required', state });
     let ent;
@@ -1142,7 +1166,38 @@ app.post('/api/:state/ask', askLimiter, async (req, res) => {
     }
     if (!ent.hasAllStates) return res.status(402).json({ error: 'subscription_required', state, expiresAt: ent.expiresAt });
   }
-  return askAgent.ask(req, res, { ...canonicalCtx, canonical, lakeloreData, askBudgetExhausted });
+  // The per-subscriber quota is checked inside ask() after body validation,
+  // like the machine ceiling, so a malformed request never spends it.
+  const userId = req.get('x-user-id');
+  const askUserQuota = ASK_SUBSCRIBERS_ONLY && userId
+    ? () => askUserQuotaExhausted(userId) && { limit: ASK_USER_DAILY_MAX }
+    : null;
+  return askAgent.ask(req, res, { ...canonicalCtx, canonical, lakeloreData, askBudgetExhausted, askUserQuota });
+});
+
+// ── POST /api/:state/ask/report (2026-10-20) ─────────────────────────────────
+// "Report this answer" from the chat. Google Play's AI-generated content
+// policy requires an in-app way to flag an offensive or harmful AI answer;
+// the report lands in ask-reports.jsonl on the volume (and the log) for the
+// owner to review. No model call, so no entitlement or quota — only the
+// general /api limiter and a size bound.
+app.post('/api/:state/ask/report', askLimiter, (req, res) => {
+  if (!ASK_ENABLED) return res.status(503).json({ error: 'ask_unavailable' });
+  if (!validateState(req, res)) return;
+  const b = req.body || {};
+  const clip = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');
+  const record = {
+    ts: new Date().toISOString(),
+    state: req.params.state,
+    user: (req.get('x-user-id') || '').slice(0, 128) || null,
+    reason: clip(b.reason, 500),
+    question: clip(b.question, 2000),
+    answer: clip(b.answer, 8000),
+  };
+  if (!record.answer) return res.status(400).json({ error: 'bad_request', message: 'answer is required' });
+  askAgent.appendAskReport(record);
+  console.warn(`[ask] REPORT ${record.state} user=${record.user ? record.user.slice(0, 8) : 'anon'} reason=${JSON.stringify(record.reason.slice(0, 80))}`);
+  res.json({ ok: true });
 });
 
 // ── /api/:state/reload ────────────────────────────────────────────────────────

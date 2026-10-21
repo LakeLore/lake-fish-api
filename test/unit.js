@@ -6,6 +6,9 @@
 //     subscribers, a plain negative for everyone else)
 //   · POST /ask is closed in production without LAKELORE_ASK_TOKEN, 403s a
 //     wrong token, and stops at the daily ceiling
+//   · /ask against a fake Anthropic API (mockModel): quotas, the out-of-credit
+//     and spend-limit 400s, refunds on failure, counts that survive a restart,
+//     and /ask/report
 const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
@@ -115,6 +118,33 @@ function rowCache() {
   db.close();
 }
 
+// A stand-in for api.anthropic.com. mode 'ok' answers every call with a
+// one-line final answer; the other modes answer with the 400s the real API
+// sends when the money runs out.
+const mock = { mode: 'ok', calls: 0 };
+const MOCK_ERRORS = {
+  credit: 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.',
+  limit: 'You have reached your specified workspace API usage limits. You will regain access on 2026-11-01 at 00:00 UTC.',
+};
+function mockModel() {
+  const http = require('http');
+  const srv = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      mock.calls++;
+      res.setHeader('content-type', 'application/json');
+      if (mock.mode !== 'ok') {
+        res.statusCode = 400;
+        return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: MOCK_ERRORS[mock.mode] } }));
+      }
+      res.end(JSON.stringify({ id: 'msg_test', type: 'message', role: 'assistant', model: 'claude-opus-5-5',
+        content: [{ type: 'text', text: 'Try a deep lake with rock reefs.' }], stop_reason: 'end_turn', stop_sequence: null,
+        usage: { input_tokens: 10, output_tokens: 5 } }));
+    });
+  });
+  return new Promise(r => srv.listen(0, '127.0.0.1', () => r({ url: `http://127.0.0.1:${srv.address().port}`, close: () => srv.close() })));
+}
+
 async function withServer(env, fn) {
   const port = 3198;
   const server = spawn('node', ['server.js'], {
@@ -178,13 +208,14 @@ function imageShipsEveryRequiredFile() {
   // validation, spends budget, then fails upstream — no real model call.
   const real = JSON.stringify({ messages: [{ role: 'user', content: 'walleye lakes?' }] });
   const T = { 'X-Ask-Token': 'sesame' };
-  await withServer({ LAKELORE_ASK_TOKEN: 'sesame', LAKELORE_ASK_DAILY_MAX: '2', LAKELORE_ASK_SUBSCRIBERS_ONLY: '0',
-    ANTHROPIC_API_KEY: 'unit-test', ANTHROPIC_BASE_URL: 'http://127.0.0.1:9' }, async (ask) => {
+  const model = await mockModel();
+  const M = { ANTHROPIC_API_KEY: 'unit-test', ANTHROPIC_BASE_URL: model.url };
+  await withServer({ LAKELORE_ASK_TOKEN: 'sesame', LAKELORE_ASK_DAILY_MAX: '2', LAKELORE_ASK_SUBSCRIBERS_ONLY: '0', ...M }, async (ask) => {
     ok(await ask() === '403 ask_forbidden', '/ask without the token must 403');
     ok(await ask({ 'X-Ask-Token': 'wrong' }) === '403 ask_forbidden', '/ask with a wrong token must 403');
     for (let i = 0; i < 4; i++) ok(await ask(T) === '400 bad_request', 'an invalid body must be rejected without spending budget');
     const a1 = await ask(T, real), a2 = await ask({ ...T, 'X-User-Id': 'someone-else' }, real);
-    ok(!a1.includes('ask_unavailable') && !a2.includes('ask_unavailable'), `asks inside the ceiling must reach the model call: ${a1} / ${a2}`);
+    ok(a1 === '200 undefined' && a2 === '200 undefined', `asks inside the ceiling must get an answer: ${a1} / ${a2}`);
     ok(await ask(T, real) === '503 ask_unavailable', '/ask past the daily ceiling must 503 ask_unavailable');
   });
 
@@ -200,15 +231,57 @@ function imageShipsEveryRequiredFile() {
   });
   // Per-subscriber daily quota. Outside production a missing RevenueCat key
   // counts as entitled, which stands in for a subscriber here.
-  await withServer({ NODE_ENV: 'development', REVENUECAT_SECRET_KEY: '', REVENUECAT_PROJECT_ID: '', LAKELORE_ASK_USER_DAILY_MAX: '1', ANTHROPIC_API_KEY: 'unit-test', ANTHROPIC_BASE_URL: 'http://127.0.0.1:9' }, async (ask) => {
-    const U = { 'X-User-Id': 'subscriber-1' };
+  // The volume is a temp dir (MN_DB_PATH keeps the real MN data), so the
+  // saved counts, chat logs and reports can be checked and survive a restart.
+  const vol = fs.mkdtempSync(path.join(os.tmpdir(), 'ask-unit-'));
+  const SUB = { NODE_ENV: 'development', REVENUECAT_SECRET_KEY: '', REVENUECAT_PROJECT_ID: '', LAKELORE_ASK_USER_DAILY_MAX: '1',
+    LAKELORE_DB_DIR: vol, MN_DB_PATH: path.join(__dirname, '..', '..', 'lakelore-data', 'out', 'mn.db'), ...M };
+  const U = { 'X-User-Id': 'subscriber-1' };
+  await withServer(SUB, async (ask) => {
+    // Out of credit, and past the workspace spend limit: a kind 503, and the
+    // failed asks give back the quota they spent.
+    mock.mode = 'credit';
+    let r = await ask(U, real); ok(r === '503 ask_out_of_credit', `an exhausted credit must 503 ask_out_of_credit: ${r}`);
+    mock.mode = 'limit';
+    r = await ask(U, real); ok(r === '503 ask_out_of_credit', `a reached workspace spend limit must 503 ask_out_of_credit: ${r}`);
+    mock.mode = 'ok';
     const bad = await ask(U); ok(bad === '400 bad_request', `an invalid body must not spend the user quota: ${bad}`);
     const first = await ask(U, real);
-    ok(!first.includes('ask_daily_quota'), `the first ask must reach the model call: ${first}`);
+    ok(first === '200 undefined', `the first answered ask must get through after two failed ones (refunded): ${first}`);
     const second = await ask(U, real); ok(second === '429 ask_daily_quota', `the second ask past a quota of 1 must 429 ask_daily_quota: ${second}`);
     const other = await ask({ 'X-User-Id': 'subscriber-2' }, real);
-    ok(!other.includes('ask_daily_quota'), `another subscriber keeps their own quota: ${other}`);
+    ok(other === '200 undefined', `another subscriber keeps their own quota: ${other}`);
+
+    const report = async (body) => {
+      const res = await fetch('http://localhost:3198/api/mn/ask/report', { method: 'POST', headers: { 'Content-Type': 'application/json', ...U }, body: JSON.stringify(body) });
+      return res.status;
+    };
+    ok(await report({ reason: 'wrong' }) === 400, '/ask/report without an answer must 400');
+    ok(await report({ reason: 'wrong', question: 'q', answer: 'a' }) === 200, '/ask/report with an answer must 200');
   });
+  const files = fs.readdirSync(vol);
+  const day = new Date().toISOString().slice(0, 10);
+  ok(files.includes(`ask-${day}.jsonl`), `answered asks must be logged to ask-${day}.jsonl: ${files}`);
+  ok(files.includes(`ask-reports-${day}.jsonl`), `reports must be saved to ask-reports-${day}.jsonl: ${files}`);
+  // A restart keeps the day's counts: subscriber-1 is still out of questions.
+  await withServer(SUB, async (ask) => {
+    const r = await ask(U, real); ok(r === '429 ask_daily_quota', `the user quota must survive a restart: ${r}`);
+  });
+  // Logs past 90 days are deleted at start-up.
+  const old = path.join(vol, 'ask-2026-01.jsonl');
+  fs.writeFileSync(old, '{}\n');
+  fs.utimesSync(old, new Date('2026-01-31'), new Date('2026-01-31'));
+  await withServer(SUB, async () => {});
+  ok(!fs.existsSync(old), 'a chat log older than 90 days must be pruned at start-up');
+  fs.rmSync(vol, { recursive: true, force: true });
+
+  // Switched off (no LAKELORE_ASK_ENABLED): client-config tells 1.1.2+ apps
+  // to hide the chat.
+  await withServer({ LAKELORE_ASK_ENABLED: '' }, async () => {
+    const cfg = await (await fetch('http://localhost:3198/api/client-config')).json();
+    ok(cfg.ask && cfg.ask.enabled === false, `client-config must report ask.enabled:false when switched off: ${JSON.stringify(cfg.ask)}`);
+  });
+  model.close();
 
   if (failures) { console.error(`\nUNIT FAILED — ${failures} failure(s)`); process.exit(1); }
   console.log('UNIT OK — RevenueCat deadline, /ask gate');

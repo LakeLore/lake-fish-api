@@ -1115,29 +1115,63 @@ const ASK_DAILY_MAX = Number.isFinite(Number(process.env.LAKELORE_ASK_DAILY_MAX)
 const ASK_SUBSCRIBERS_ONLY = process.env.LAKELORE_ASK_SUBSCRIBERS_ONLY !== '0';
 const ASK_USER_DAILY_MAX = Number.isFinite(Number(process.env.LAKELORE_ASK_USER_DAILY_MAX)) && process.env.LAKELORE_ASK_USER_DAILY_MAX !== ''
   ? Number(process.env.LAKELORE_ASK_USER_DAILY_MAX) : 25;
+// Daily counts are saved to the volume after every change, so a restart (a
+// deploy, a secret change, or Fly stopping the idle second machine) does not
+// hand everyone a fresh day. Per machine; local dev without a volume keeps
+// them in memory only.
+const ASK_COUNTS_FILE = process.env.LAKELORE_DB_DIR ? path.join(process.env.LAKELORE_DB_DIR, 'ask-counts.json') : null;
 let _askDay = '';
 let _askCount = 0;
 // Per-subscriber daily counts. Keyed on the X-User-Id that just passed the
 // entitlement check, so rotating the header buys nothing; per machine, so a
 // user split across both machines can reach twice the cap at most.
 const _askUserCounts = new Map();
-function askUserQuotaExhausted(userId) {
+if (ASK_COUNTS_FILE) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(ASK_COUNTS_FILE, 'utf8'));
+    if (saved.day === new Date().toISOString().slice(0, 10)) {
+      _askDay = saved.day;
+      _askCount = Number(saved.count) || 0;
+      for (const [u, n] of Object.entries(saved.users || {})) _askUserCounts.set(u, Number(n) || 0);
+    }
+  } catch { /* no file yet, or unreadable: start the day at zero */ }
+}
+function saveAskCounts() {
+  if (!ASK_COUNTS_FILE) return;
+  try {
+    const tmp = `${ASK_COUNTS_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ day: _askDay, count: _askCount, users: Object.fromEntries(_askUserCounts) }));
+    fs.renameSync(tmp, ASK_COUNTS_FILE);
+  } catch (e) { console.warn(`[ask] could not save daily counts: ${e.message}`); }
+}
+function rollAskDay() {
   const today = new Date().toISOString().slice(0, 10);
   if (today !== _askDay) { _askDay = today; _askCount = 0; _askUserCounts.clear(); }
+}
+function askUserQuotaExhausted(userId) {
+  rollAskDay();
   const n = _askUserCounts.get(userId) || 0;
   if (n >= ASK_USER_DAILY_MAX) return true;
   _askUserCounts.set(userId, n + 1);
+  saveAskCounts();
   return false;
 }
 function askBudgetExhausted() {
-  const today = new Date().toISOString().slice(0, 10);
-  if (today !== _askDay) { _askDay = today; _askCount = 0; _askUserCounts.clear(); }
+  rollAskDay();
   if (_askCount >= ASK_DAILY_MAX) {
     console.warn(`[ask] daily ceiling of ${ASK_DAILY_MAX} reached — refusing until UTC midnight`);
     return true;
   }
   _askCount++;
+  saveAskCounts();
   return false;
+}
+// An ask that fails (out of credit, upstream error) gives back what it spent,
+// so a subscriber does not lose questions to errors they could not help.
+function askRefund({ userId, budget }) {
+  if (userId && _askUserCounts.get(userId) > 0) _askUserCounts.set(userId, _askUserCounts.get(userId) - 1);
+  if (budget && _askCount > 0) _askCount--;
+  saveAskCounts();
 }
 const askLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
@@ -1169,19 +1203,28 @@ app.post('/api/:state/ask', askLimiter, async (req, res) => {
   // The per-subscriber quota is checked inside ask() after body validation,
   // like the machine ceiling, so a malformed request never spends it.
   const userId = req.get('x-user-id');
-  const askUserQuota = ASK_SUBSCRIBERS_ONLY && userId
-    ? () => askUserQuotaExhausted(userId) && { limit: ASK_USER_DAILY_MAX }
+  const quotaUser = ASK_SUBSCRIBERS_ONLY && userId ? userId : null;
+  const askUserQuota = quotaUser
+    ? () => askUserQuotaExhausted(quotaUser) && { limit: ASK_USER_DAILY_MAX }
     : null;
-  return askAgent.ask(req, res, { ...canonicalCtx, canonical, lakeloreData, askBudgetExhausted, askUserQuota });
+  const askRefundSpent = ({ budget }) => askRefund({ userId: quotaUser, budget });
+  return askAgent.ask(req, res, { ...canonicalCtx, canonical, lakeloreData, askBudgetExhausted, askUserQuota, askRefundSpent });
 });
 
 // ── POST /api/:state/ask/report (2026-10-20) ─────────────────────────────────
 // "Report this answer" from the chat. Google Play's AI-generated content
 // policy requires an in-app way to flag an offensive or harmful AI answer;
 // the report lands in ask-reports.jsonl on the volume (and the log) for the
-// owner to review. No model call, so no entitlement or quota — only the
-// general /api limiter and a size bound.
-app.post('/api/:state/ask/report', askLimiter, (req, res) => {
+// owner to review. No model call, so no entitlement or quota — its own
+// per-IP limiter (so reports never use up a user's asks) and a size bound.
+const askReportLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: Number(process.env.LAKELORE_ASK_REPORTS_PER_HOUR || 20),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'ask_report_quota', message: 'Too many reports this hour — try again later.' },
+});
+app.post('/api/:state/ask/report', askReportLimiter, (req, res) => {
   if (!ASK_ENABLED) return res.status(503).json({ error: 'ask_unavailable' });
   if (!validateState(req, res)) return;
   const b = req.body || {};
@@ -1195,8 +1238,9 @@ app.post('/api/:state/ask/report', askLimiter, (req, res) => {
     answer: clip(b.answer, 8000),
   };
   if (!record.answer) return res.status(400).json({ error: 'bad_request', message: 'answer is required' });
-  askAgent.appendAskReport(record);
+  // Log first: a report the volume could not take still reaches Fly's logs.
   console.warn(`[ask] REPORT ${record.state} user=${record.user ? record.user.slice(0, 8) : 'anon'} reason=${JSON.stringify(record.reason.slice(0, 80))}`);
+  if (!askAgent.appendAskReport(record)) return res.status(503).json({ error: 'ask_report_unavailable', message: 'Could not save the report — try again later.' });
   res.json({ ok: true });
 });
 

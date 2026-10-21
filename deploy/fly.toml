@@ -10,11 +10,14 @@ primary_region = 'ord'   # Chicago — central for SD/MN/ND/IA/NE
   # plan's monthly credit) or every ask 503s ask_unconfigured. Subscribers
   # only in every state (server.js), so the route is public to the app: the
   # X-Ask-Token gate exists for free-state asks, which production refuses.
-  # Ceilings: 25 asks per subscriber per day; 150 asks per machine per day
-  # (~$7.50 at Opus 5.5 rates), well inside the $200 monthly credit.
+  # Ceilings: 25 asks per subscriber per day; 100 asks per machine per day,
+  # so at most ~200 a day across both machines (~$10 at ~$0.05 an ask). That
+  # paces spending; it does not cap the month (30 days at the ceiling is more
+  # than the credit). The hard stop is the Console workspace spend limit
+  # (RUNBOOK §20). Counts survive restarts (/data/ask-counts.json).
   LAKELORE_ASK_ENABLED = '1'
   LAKELORE_ASK_PUBLIC = '1'
-  LAKELORE_ASK_DAILY_MAX = '150'
+  LAKELORE_ASK_DAILY_MAX = '100'
 
 [http_service]
   internal_port = 3100

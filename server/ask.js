@@ -33,9 +33,10 @@ const MAX_MSG_CHARS = 2000;
 const MAX_TOTAL_CHARS = 12000;
 const REQUEST_TIMEOUT_MS = 90_000;
 const ASK_LOG_MAX_BYTES = 50 * 1024 * 1024;
-// Chat logs are kept 90 days (the privacy policy says so): one file per
-// month, and files more than three months old are deleted on the next write.
-const ASK_LOG_KEEP_MONTHS = 3;
+// Chat logs are kept 90 days (the privacy policy and the consent card say
+// so): one file per UTC day, and files older than that are deleted at start-up
+// and every day after.
+const ASK_LOG_KEEP_DAYS = 90;
 
 let _client = null;
 function client() {
@@ -364,40 +365,56 @@ function extractLakes(answer, seen) {
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 // LAKELORE_ASK_LOG names one exact file (dev). On a server with a data volume
-// the log is ask-YYYY-MM.jsonl there, pruned to ASK_LOG_KEEP_MONTHS.
-function monthKey(d) { return d.toISOString().slice(0, 7); }
-function pruneOldLogs(dir, prefix) {
-  const cutoff = new Date();
-  cutoff.setUTCMonth(cutoff.getUTCMonth() - ASK_LOG_KEEP_MONTHS);
-  const keepFrom = monthKey(cutoff);
+// the logs are ask-YYYY-MM-DD.jsonl and ask-reports-YYYY-MM-DD.jsonl there.
+const LOG_FILE_RE = /^ask(-reports)?(-[\d-]+)?\.jsonl$/;
+function pruneOldLogs() {
+  const dir = process.env.LAKELORE_DB_DIR;
+  if (!dir) return;
+  // By modification time, so it also catches the monthly files written
+  // before 2026-10-21 and any undated ask.jsonl.
+  const cutoff = Date.now() - ASK_LOG_KEEP_DAYS * 86400_000;
   try {
     for (const f of fs.readdirSync(dir)) {
-      const m = f.match(new RegExp(`^${prefix}-(\\d{4}-\\d{2})\\.jsonl$`));
-      if (m && m[1] < keepFrom) fs.unlinkSync(`${dir}/${f}`);
+      if (!LOG_FILE_RE.test(f)) continue;
+      if (fs.statSync(`${dir}/${f}`).mtimeMs < cutoff) fs.unlinkSync(`${dir}/${f}`);
     }
   } catch (e) {
     console.warn(`[ask] log prune failed: ${e.message}`);
   }
 }
+pruneOldLogs();
+setInterval(pruneOldLogs, 86400_000).unref();
+// True when the record was written, or when there is nowhere to write it (a
+// dev server with no volume). False when the write failed or the day's file
+// is full.
 function appendJsonl(prefix, record) {
   let p = prefix === 'ask' ? process.env.LAKELORE_ASK_LOG : null;
   if (!p) {
     const dir = process.env.LAKELORE_DB_DIR;
-    if (!dir) return;
-    const month = monthKey(new Date());
-    p = `${dir}/${prefix}-${month}.jsonl`;
-    if (!fs.existsSync(p)) pruneOldLogs(dir, prefix);
+    if (!dir) return true;
+    p = `${dir}/${prefix}-${new Date().toISOString().slice(0, 10)}.jsonl`;
   }
   try {
     const st = fs.existsSync(p) ? fs.statSync(p) : null;
-    if (st && st.size > ASK_LOG_MAX_BYTES) return;
+    if (st && st.size > ASK_LOG_MAX_BYTES) { console.warn(`[ask] ${p} is full — record dropped`); return false; }
     fs.appendFileSync(p, JSON.stringify(record) + '\n');
+    return true;
   } catch (e) {
     console.warn(`[ask] log append failed: ${e.message}`);
+    return false;
   }
 }
-function appendAskLog(record) { appendJsonl('ask', record); }
-function appendAskReport(record) { appendJsonl('ask-reports', record); }
+function appendAskLog(record) { return appendJsonl('ask', record); }
+function appendAskReport(record) { return appendJsonl('ask-reports', record); }
+
+// Out of credit, every ask fails the same way until the credit refills. Tell
+// Sentry once every six hours per machine, not on every ask, so it cannot use
+// up the Sentry quota and bury crash reports.
+let _creditReportedAt = 0;
+// The monthly credit used up ("Your credit balance is too low…") and the
+// Console workspace spend limit reached ("You have reached your specified
+// workspace API usage limits…") both arrive as a plain 400.
+const CREDIT_OUT_RE = /credit balance is too low|usage limits?|spend(ing)? limit/i;
 
 // ── Route handler ────────────────────────────────────────────────────────────
 async function ask(req, res, ctx) {
@@ -441,6 +458,7 @@ async function ask(req, res, ctx) {
     return res.status(429).json({ error: 'ask_daily_quota', message: `That’s today’s ${quota.limit} questions. Ask LakeLore resets at midnight UTC — the lake rankings are always open.` });
   }
   if (ctx.askBudgetExhausted?.()) {
+    ctx.askRefundSpent?.({ budget: false });
     return res.status(503).json({ error: 'ask_unavailable', message: 'The assistant is resting for today — try again tomorrow.' });
   }
 
@@ -473,6 +491,7 @@ async function ask(req, res, ctx) {
     final = await runner.done();
   } catch (err) {
     const ms = Date.now() - t0;
+    ctx.askRefundSpent?.({ budget: true });
     // No credential resolvable at all (no API key, no `ant auth login`
     // profile) — the SDK throws a plain Error before any request is made.
     if (err instanceof Anthropic.AuthenticationError
@@ -480,13 +499,13 @@ async function ask(req, res, ctx) {
       console.error(`[ask] ${state} auth error after ${ms}ms: ${err.message}`);
       return res.status(503).json({ error: 'ask_unconfigured', message: 'Assistant credentials are missing or invalid on the server.' });
     }
-    // Monthly API credit used up (2026-10-20): the API answers 400 with this
-    // message and there is no dedicated error type, so match it narrowly.
-    // The owner chose a hard stop over paid overflow — say so kindly, and
-    // tell Sentry so the owner hears about it the first time.
-    if (err instanceof Anthropic.BadRequestError && /credit balance is too low/i.test(err.message || '')) {
-      console.error(`[ask] ${state} API credit exhausted after ${ms}ms`);
-      reportError(err, req);
+    // Monthly API credit or workspace spend limit used up (2026-10-20): the
+    // API answers 400 with no dedicated error type, so match the message
+    // (CREDIT_OUT_RE). The owner chose a hard stop over paid overflow — say
+    // so kindly, and tell Sentry so the owner hears about it.
+    if (err instanceof Anthropic.BadRequestError && CREDIT_OUT_RE.test(err.message || '')) {
+      console.error(`[ask] ${state} API credit exhausted after ${ms}ms: ${err.message}`);
+      if (Date.now() - _creditReportedAt > 6 * 3600_000) { _creditReportedAt = Date.now(); reportError(err, req); }
       return res.status(503).json({ error: 'ask_out_of_credit', message: 'Ask LakeLore has answered all the questions it can this month. It will be back when the new month’s answers arrive — the lake rankings are always open.' });
     }
     if (err instanceof Anthropic.RateLimitError) {
@@ -499,6 +518,9 @@ async function ask(req, res, ctx) {
     }
     if (err instanceof Anthropic.APIError) {
       console.error(`[ask] ${state} API error ${err.status} after ${ms}ms: ${err.message}`);
+      // A 4xx here is our request's fault (a retired model id, a beta or
+      // parameter the model rejects) and fails every ask until fixed.
+      if (err.status >= 400 && err.status < 500) reportError(err, req);
       return res.status(502).json({ error: 'ask_upstream', message: `Assistant error (${err.status}).` });
     }
     console.error(`[ask] ${state} failed after ${ms}ms:`, err);

@@ -572,6 +572,23 @@ function filters(req, res, ctx) {
       }
     }
 
+    // Specialist gears (WI 2026-10: age-0/age-1 recruitment indices, population-estimate
+    // densities) must never become the client's default gear — clients that pick the
+    // gear with the most CPUE rows (older binaries; the scatter view) would otherwise
+    // rank lakes by fingerling counts in counties where those gears lead. Only emitted
+    // when such gears are present, so every other state's response is unchanged.
+    if (defaultGear === undefined && gearCpueCounts) {
+      const SPECIALIST = /^(Age-[01] |Juvenile \(|Population estimate)/;
+      const gears = Object.keys(gearCpueCounts);
+      if (gears.some(g => SPECIALIST.test(g))) {
+        // Same fallback buckets the client's defaultGearFor never defaults to (RESIDUAL_GEARS).
+        const RESIDUAL = new Set(['Presence Only', 'Trajectory', 'CPUE Normalized', 'Comprehensive', 'Mixed Gear', 'Forecast Rating']);
+        const general = gears.filter(g => !SPECIALIST.test(g) && !RESIDUAL.has(g))
+          .sort((a, b) => gearCpueCounts[b] - gearCpueCounts[a]);
+        if (general.length) defaultGear = general[0];
+      }
+    }
+
     const result = { species, gearTypes, gearTypeCounts, counties, yearRange };
     if (gearCpueCounts !== undefined) result.gearCpueCounts = gearCpueCounts;
     if (gearLatestCounts !== undefined) result.gearLatestCounts = gearLatestCounts;
@@ -1043,10 +1060,16 @@ function measures(req, res, ctx) {
         .sort((a, b) => (b.records - a.records) || (b.lakes - a.lakes));
       // Trophy (single memorable tier since 2026-09-11) prefers a
       // measured/published rate over KS's relative-basis ranking.
+      // Specialist gears (WI 2026-10: young-of-year / age-1 recruitment indices and
+      // population-estimate densities) are offered but never the default: a lake list
+      // ranked by fingerling counts or fish/acre is not what "Abundance" means by default.
+      const SPECIALIST = /^(Age-[01] |Juvenile \(|Population estimate)/;
+      const general = ranked.filter(s => !SPECIALIST.test(s.gear || ''));
+      const pool = general.length ? general : ranked;
       const primary = m.id === 'size' || m.id === 'trophy'
-        ? ranked.filter(s => s.expression !== 'ranking')
-        : ranked.filter(s => s.sort === 'cpue');
-      m.defaultSourceId = (primary[0] ?? ranked[0])?.id ?? null;
+        ? pool.filter(s => s.expression !== 'ranking')
+        : pool.filter(s => s.sort === 'cpue');
+      m.defaultSourceId = (primary[0] ?? pool[0])?.id ?? null;
     }
 
     res.json({ species: speciesParam, county: countyList, measures: out });

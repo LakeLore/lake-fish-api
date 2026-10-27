@@ -470,6 +470,33 @@ function imageShipsEveryRequiredFile() {
     db.close();
   }
 
+  // Default gear (2026-10-27): most lakes surveyed in the last 10 years, not
+  // most rows ever; electrofishing first for bass/bluegill when it covers 60%
+  // of the leader; /filters always states the default for older clients.
+  {
+    const Database = require('better-sqlite3');
+    const canonical = require('../server/canonical.js');
+    const ld = require(path.join(os.homedir(), 'lakelore-data'));
+    const check = (st, species, want) => {
+      const db = new Database(path.join(os.homedir(), 'lakelore-data', 'out', `${st}.db`), { readonly: true });
+      const ctx = { getDb: () => db, isUnhealthy: () => false, getStateEntry: s => ld.getState(s), computeLakeStockingMetrics: () => ({}) };
+      const run = (fn) => { const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
+        canonical[fn]({ params: { state: st }, query: { species }, get: () => undefined, lakeLorePreview: false }, r, ctx); return r.body; };
+      const ab = run('measures').measures.find(m => m.id === 'abundance');
+      const def = ab.sources.find(x => x.id === ab.defaultSourceId);
+      ok(def && want.test(def.gear || ''), `${st} ${species}: abundance default ${def && def.gear}, want ${want}`);
+      const f = run('filters');
+      ok(want.test(f.defaultGear || ''), `${st} ${species}: /filters defaultGear ${f.defaultGear}, want ${want}`);
+      db.close();
+    };
+    check('sd', 'Walleye', /^AFS standard gill net/);          // was the series that ended in 2017
+    check('sd', 'Largemouth Bass', /^Night boat electrofishing/); // was a pre-2015 historical trap net
+    check('mn', 'LMB', /^Standard electrofishing$/);            // rule 2 (was trap nets, 0.8 bass/net)
+    check('mn', 'WAE', /^Standard gill nets$/);                 // unchanged
+    check('wi', 'WAE', /^Fyke net/);                            // unchanged
+    check('nd', 'WAE', /^Gill net/);                            // unchanged
+  }
+
   // Switched off (no LAKELORE_ASK_ENABLED): client-config tells 1.1.2+ apps
   // to hide the chat.
   await withServer({ LAKELORE_ASK_ENABLED: '' }, async () => {

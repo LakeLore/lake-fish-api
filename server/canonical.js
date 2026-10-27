@@ -580,13 +580,16 @@ function filters(req, res, ctx) {
     if (defaultGear === undefined && gearCpueCounts) {
       const SPECIALIST = /^(Age-[01] |Juvenile \(|Population estimate|Treaty creel survey)/;
       const gears = Object.keys(gearCpueCounts);
-      if (gears.some(g => SPECIALIST.test(g))) {
-        // Same fallback buckets the client's defaultGearFor never defaults to (RESIDUAL_GEARS).
-        const RESIDUAL = new Set(['Presence Only', 'Trajectory', 'CPUE Normalized', 'Comprehensive', 'Mixed Gear', 'Forecast Rating']);
-        const general = gears.filter(g => !SPECIALIST.test(g) && !RESIDUAL.has(g))
-          .sort((a, b) => gearCpueCounts[b] - gearCpueCounts[a]);
-        if (general.length) defaultGear = general[0];
-      }
+      const general = gears.filter(g => !SPECIALIST.test(g) && !RESIDUAL_BUCKETS.has(g))
+        .sort((a, b) => gearCpueCounts[b] - gearCpueCounts[a]);
+      // Always state the default (2026-10-27): older clients otherwise pick
+      // the gear with the most CPUE rows, which favours long retired series.
+      // Same recent-coverage rule as /measures; most CPUE rows as fallback.
+      const recent = gearMode === 'gear'
+        ? recentDefaultGear(db, { gears: general, col: 'cpue_effective', speciesParam, countyJoin, countyAnd, countyList })
+        : null;
+      if (recent) defaultGear = recent;
+      else if (gearMode === 'gear' && general.length) defaultGear = general[0];
     }
 
     // Hide tiny gear chips (2026-10-27, same rule as /measures): a gear that
@@ -598,7 +601,7 @@ function filters(req, res, ctx) {
         SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS lakes
         FROM fish_catch fc WHERE fc.gear_category IS NOT NULL ${speciesAnd}
         GROUP BY fc.gear_category`).all(...(speciesParam ? [speciesParam] : [])).map(r => [r.gear, r.lakes]));
-      const topCpue = gearCpueCounts ? Object.keys(gearCpueCounts).sort((a, b) => gearCpueCounts[b] - gearCpueCounts[a])[0] : undefined;
+      const topCpue = gearCpueCounts ? Object.keys(gearCpueCounts).filter(g => g !== 'CPUE Normalized').sort((a, b) => gearCpueCounts[b] - gearCpueCounts[a])[0] : undefined;
       const keep = g => g === defaultGear || g === topCpue || (lakesByGear.get(g) ?? 0) >= MIN_SOURCE_LAKES;
       const kept = gearTypes.filter(keep);
       if (kept.length && kept.length < gearTypes.length) {
@@ -680,6 +683,66 @@ const KIND_LABEL = {
   relative: 'Relative abundance', creel: 'Angler catch rate',
   normalized: 'Normalized catch rate',
 };
+
+// ── Default gear rule (owner-approved 2026-10-27; GEAR_CONSOLIDATION.md) ──
+// The default used to be the gear with the MOST ROWS across all years, so long
+// old series won: SD walleye defaulted to a gill net retired in 2017 and SD
+// largemouth to a pre-2015 historical trap-net series, and because results show
+// each lake's LATEST survey with the chosen gear, users saw every lake on its
+// old numbers. Now:
+//  1. among standard catch-rate gears, pick the one with the most lakes
+//     surveyed in the last RECENT_YEARS (same species/county scope);
+//  2. for bass and bluegill, prefer electrofishing when it covers at least
+//     EF_SHARE (60%) of the leader's recent lakes — nets catch too few of these fish
+//     to rank lakes (MN trap nets average 0.8 largemouth per net);
+//  3. if no gear has a recent survey, the old most-rows rule decides.
+// Specialist gears (age-0/1, population estimate, creel) and residual buckets
+// are never defaults (filtered before this is called), nor size-limited rates
+// like MD's 'Electrofishing (>=15in bass/hr)' (a quality-fish index).
+const RECENT_YEARS = 10;
+const RESIDUAL_BUCKETS = new Set(['Presence Only', 'Trajectory', 'CPUE Normalized', 'Comprehensive', 'Mixed Gear', 'Forecast Rating']);
+const EF_SHARE = 0.6;   // MN largemouth: standard EF covers 66% of gill nets' recent lakes
+const EF_FIRST_SPECIES = new Set(['LMB', 'SMB', 'BLG']);
+// Standard boat electrofishing only: backpack (nearshore juveniles/forage),
+// fall (largely an age-0 index) and age-0/juvenile runs don't rank adult
+// bass or bluegill. Coded EF gears: CO 'FE', PA 'BE' (WI/PA SE*/FE codes were
+// consolidated or never lead).
+const EF_GEAR = /electro|shock|\bEF\b|^(FE|BE)$/i;
+const EF_NOT_STANDARD = /backpack|fall|age-[01]|juvenile|young|\*/i;
+// Creel / angler catch rates are not survey gears; the rule never picks them
+// (the most-rows fallback still can when they are the only data).
+const NOT_A_SURVEY_GEAR = /creel|angler|rod and reel|(?:>=|≥)\s*\d/i;
+function recentDefaultGear(db, { gears, col, speciesParam, countyJoin = '', countyAnd = '', countyList = [] }) {
+  gears = gears.filter(g => !NOT_A_SURVEY_GEAR.test(g));
+  if (!gears.length || !col) return null;
+  // Window anchored to the newest survey in this artifact, not the clock, so a
+  // default only changes when the data does: the latest RECENT_YEARS survey years.
+  const newest = db.prepare('SELECT MAX(survey_year) AS y FROM surveys').get()?.y;
+  if (!newest) return null;
+  const since = newest - RECENT_YEARS + 1;
+  const rows = db.prepare(`
+    SELECT fc.gear_category AS gear,
+           COUNT(DISTINCT CASE WHEN s.survey_year >= ? THEN fc.lake_id END) AS recent,
+           COUNT(DISTINCT fc.lake_id) AS lakes, MAX(s.survey_year) AS latest
+    FROM fish_catch fc JOIN surveys s ON s.id = fc.survey_id ${countyJoin}
+    WHERE fc.gear_category IS NOT NULL AND fc.${col} IS NOT NULL
+      ${speciesParam ? 'AND fc.species_native = ?' : ''} ${countyAnd}
+    GROUP BY fc.gear_category`).all(since, ...(speciesParam ? [speciesParam] : []), ...countyList);
+  const stat = new Map(rows.map(r => [r.gear, r]));
+  // Deterministic order — both routes must agree: recent lakes, then all-time
+  // lakes, then the most recent survey, then name.
+  const ranked = gears.map(g => stat.get(g)).filter(r => r && r.recent > 0)
+    .sort((a, b) => (b.recent - a.recent) || (b.lakes - a.lakes) || ((b.latest ?? 0) - (a.latest ?? 0)) || (a.gear < b.gear ? -1 : a.gear > b.gear ? 1 : 0));
+  if (!ranked.length) return null;
+  const code = speciesParam
+    ? db.prepare('SELECT species_code AS c FROM fish_catch WHERE species_native = ? AND species_code IS NOT NULL LIMIT 1').get(speciesParam)?.c
+    : null;
+  if (code && EF_FIRST_SPECIES.has(code)) {
+    const ef = ranked.find(r => EF_GEAR.test(r.gear) && !EF_NOT_STANDARD.test(r.gear));
+    if (ef && ef.recent >= EF_SHARE * ranked[0].recent) return ef.gear;
+  }
+  return ranked[0].gear;
+}
 
 // Minimum statewide lakes for a gear to be offered as a ranking source.
 const MIN_SOURCE_LAKES = Number(process.env.LAKELORE_MIN_SOURCE_LAKES ?? 3);
@@ -1103,6 +1166,13 @@ function measures(req, res, ctx) {
         ? pool.filter(s => s.expression !== 'ranking')
         : pool.filter(s => s.sort === 'cpue');
       m.defaultSourceId = (primary[0] ?? pool[0])?.id ?? null;
+      // Recent-coverage rule (see recentDefaultGear) over the gear-based
+      // primary sources; the most-records pick above stays as the fallback.
+      const col = { abundance: 'cpue_effective', size: sizeField, trophy: 'cpue_memorable' }[m.id];
+      const gearSrc = primary.filter(s => s.gear != null && !s.cpueKind && !RESIDUAL_BUCKETS.has(s.gear));
+      const g = (entry.features || {}).gearFilterMode === 'stations' ? null   // IA: station chips; keep its defaults
+        : recentDefaultGear(db, { gears: gearSrc.map(s => s.gear), col, speciesParam, countyJoin, countyAnd, countyList });
+      if (g) m.defaultSourceId = gearSrc.find(s => s.gear === g).id;
     }
 
     // Hide tiny gear sources (owner decision 2026-10-27; GEAR_CONSOLIDATION.md):

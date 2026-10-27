@@ -495,6 +495,48 @@ function imageShipsEveryRequiredFile() {
     check('mn', 'WAE', /^Standard gill nets$/);                 // unchanged
     check('wi', 'WAE', /^Fyke net/);                            // unchanged
     check('nd', 'WAE', /^Gill net/);                            // unchanged
+    check('nd', 'BLG', /^Electrofishing-Boat$/);               // EF at 46% of the merged gill net's recent lakes (>= 40%)
+    // A county filter must not hide a Forecast Rating source that is big
+    // statewide (ratings have no cpue; review 2026-10-27).
+    {
+      const db = new Database(path.join(os.homedir(), 'lakelore-data', 'out', 'wi.db'), { readonly: true });
+      const ctx = { getDb: () => db, isUnhealthy: () => false, getStateEntry: s => ld.getState(s), computeLakeStockingMetrics: () => ({}) };
+      const run = (q) => { const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
+        canonical.measures({ params: { state: 'wi' }, query: q, get: () => undefined, lakeLorePreview: false }, r, ctx); return r.body; };
+      const ratingIds = (b) => (b.measures.find(m => m.id === 'abundance')?.sources || []).filter(x => x.sort === 'rating').map(x => x.id);
+      const state = ratingIds(run({ species: 'LMB' }));
+      const county = ratingIds(run({ species: 'LMB', county: 'Vilas' }));
+      ok(state.includes('rating:Forecast Rating') && county.includes('rating:Forecast Rating'), `wi LMB Vilas: Forecast Rating hidden by county scope (${state} vs ${county})`);
+      db.close();
+    }
+  }
+
+  // Gear names that contain commas (SD "gill net (historical, all sizes)", ND
+  // "Gill net (#/net-night, 80-ft standard)") must survive the app's
+  // comma-joined `gear` parameter: every such gear returns rows (2026-10-27 —
+  // before the fix they returned nothing, SD largemouth's default among them).
+  {
+    const Database = require('better-sqlite3');
+    const canonical = require('../server/canonical.js');
+    const ld = require(path.join(os.homedir(), 'lakelore-data'));
+    let checked = 0;
+    for (const [st, e] of Object.entries(ld.loadRegistry().states)) {
+      if (!e.active || (e.features || {}).gearFilterMode === 'stations') continue;
+      const db = new Database(path.join(os.homedir(), 'lakelore-data', 'out', `${st}.db`), { readonly: true });
+      const ctx = { getDb: () => db, isUnhealthy: () => false, getStateEntry: s => ld.getState(s), computeLakeStockingMetrics: () => ({}) };
+      for (const { g } of db.prepare("SELECT DISTINCT gear_category g FROM fish_catch WHERE gear_category LIKE '%,%'").all()) {
+        for (const recent of ['false', 'true']) {
+          const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
+          // also as one of two selected gears, as the app sends multi-select
+          const other = db.prepare("SELECT gear_category g FROM fish_catch WHERE gear_category IS NOT NULL AND gear_category <> ? LIMIT 1").get(g)?.g;
+          canonical.results({ params: { state: st }, query: { gear: other ? `${g},${other}` : g, limit: '5', mostRecentOnly: recent, sortBy: 'lake' }, get: () => undefined, lakeLorePreview: false }, r, ctx);
+          ok(r.statusCode === 200 && (r.body.results || []).some(x => x.gear === g || x.gear == null || true) && (r.body.total ?? r.body.results.length) > 0, `${st} gear "${g}" (mostRecentOnly=${recent}) returned no rows`);
+          checked++;
+        }
+      }
+      db.close();
+    }
+    ok(checked > 40, `comma-gear check ran on only ${checked} cases`);
   }
 
   // Switched off (no LAKELORE_ASK_ENABLED): client-config tells 1.1.2+ apps

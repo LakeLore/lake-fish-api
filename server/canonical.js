@@ -590,6 +590,9 @@ function filters(req, res, ctx) {
         : null;
       if (recent) defaultGear = recent;
       else if (gearMode === 'gear' && general.length) defaultGear = general[0];
+      // No catch-rate gear in scope (e.g. a county with only size samples):
+      // /measures falls back to the agency rating, so say the same here.
+      else if (gearMode === 'gear' && gearTypes.includes('Forecast Rating')) defaultGear = 'Forecast Rating';
     }
 
     // Hide tiny gear chips (2026-10-27, same rule as /measures): a gear that
@@ -693,7 +696,7 @@ const KIND_LABEL = {
 //  1. among standard catch-rate gears, pick the one with the most lakes
 //     surveyed in the last RECENT_YEARS (same species/county scope);
 //  2. for bass and bluegill, prefer electrofishing when it covers at least
-//     EF_SHARE (60%) of the leader's recent lakes — nets catch too few of these fish
+//     EF_SHARE (40%) of the leader's recent lakes — nets catch too few of these fish
 //     to rank lakes (MN trap nets average 0.8 largemouth per net);
 //  3. if no gear has a recent survey, the old most-rows rule decides.
 // Specialist gears (age-0/1, population estimate, creel) and residual buckets
@@ -701,7 +704,7 @@ const KIND_LABEL = {
 // like MD's 'Electrofishing (>=15in bass/hr)' (a quality-fish index).
 const RECENT_YEARS = 10;
 const RESIDUAL_BUCKETS = new Set(['Presence Only', 'Trajectory', 'CPUE Normalized', 'Comprehensive', 'Mixed Gear', 'Forecast Rating']);
-const EF_SHARE = 0.6;   // MN largemouth: standard EF covers 66% of gill nets' recent lakes
+const EF_SHARE = 0.4;   // owner 2026-10-27: ND bluegill EF covers 46% of the merged gill net's recent lakes
 const EF_FIRST_SPECIES = new Set(['LMB', 'SMB', 'BLG']);
 // Standard boat electrofishing only: backpack (nearshore juveniles/forage),
 // fall (largely an age-0 index) and age-0/juvenile runs don't rank adult
@@ -712,14 +715,17 @@ const EF_NOT_STANDARD = /backpack|fall|age-[01]|juvenile|young|\*/i;
 // Creel / angler catch rates are not survey gears; the rule never picks them
 // (the most-rows fallback still can when they are the only data).
 const NOT_A_SURVEY_GEAR = /creel|angler|rod and reel|(?:>=|≥)\s*\d/i;
+const _newestYear = new WeakMap();   // db -> { col: newest survey year among rows with that metric }
 function recentDefaultGear(db, { gears, col, speciesParam, countyJoin = '', countyAnd = '', countyList = [] }) {
-  gears = gears.filter(g => !NOT_A_SURVEY_GEAR.test(g));
   if (!gears.length || !col) return null;
-  // Window anchored to the newest survey in this artifact, not the clock, so a
-  // default only changes when the data does: the latest RECENT_YEARS survey years.
-  const newest = db.prepare('SELECT MAX(survey_year) AS y FROM surveys').get()?.y;
-  if (!newest) return null;
-  const since = newest - RECENT_YEARS + 1;
+  // Window anchored to the newest survey that HAS this metric in the artifact
+  // (not the clock, and not synthetic presence/stocking surveys), so a default
+  // only changes when the data does: the latest RECENT_YEARS survey years.
+  let ny = _newestYear.get(db);
+  if (!ny) _newestYear.set(db, ny = {});
+  ny[col] ??= db.prepare(`SELECT MAX(s.survey_year) AS y FROM fish_catch fc JOIN surveys s ON s.id = fc.survey_id WHERE fc.${col} IS NOT NULL`).get()?.y ?? null;
+  if (!ny[col]) return null;
+  const since = ny[col] - RECENT_YEARS + 1;
   const rows = db.prepare(`
     SELECT fc.gear_category AS gear,
            COUNT(DISTINCT CASE WHEN s.survey_year >= ? THEN fc.lake_id END) AS recent,
@@ -729,19 +735,28 @@ function recentDefaultGear(db, { gears, col, speciesParam, countyJoin = '', coun
       ${speciesParam ? 'AND fc.species_native = ?' : ''} ${countyAnd}
     GROUP BY fc.gear_category`).all(since, ...(speciesParam ? [speciesParam] : []), ...countyList);
   const stat = new Map(rows.map(r => [r.gear, r]));
+  const byName = (a, b) => (a.gear < b.gear ? -1 : a.gear > b.gear ? 1 : 0);
+  const survey = gears.filter(g => !NOT_A_SURVEY_GEAR.test(g)).map(g => stat.get(g)).filter(Boolean);
   // Deterministic order — both routes must agree: recent lakes, then all-time
   // lakes, then the most recent survey, then name.
-  const ranked = gears.map(g => stat.get(g)).filter(r => r && r.recent > 0)
-    .sort((a, b) => (b.recent - a.recent) || (b.lakes - a.lakes) || ((b.latest ?? 0) - (a.latest ?? 0)) || (a.gear < b.gear ? -1 : a.gear > b.gear ? 1 : 0));
-  if (!ranked.length) return null;
-  const code = speciesParam
-    ? db.prepare('SELECT species_code AS c FROM fish_catch WHERE species_native = ? AND species_code IS NOT NULL LIMIT 1').get(speciesParam)?.c
-    : null;
-  if (code && EF_FIRST_SPECIES.has(code)) {
-    const ef = ranked.find(r => EF_GEAR.test(r.gear) && !EF_NOT_STANDARD.test(r.gear));
-    if (ef && ef.recent >= EF_SHARE * ranked[0].recent) return ef.gear;
+  const ranked = survey.filter(r => r.recent > 0)
+    .sort((a, b) => (b.recent - a.recent) || (b.lakes - a.lakes) || ((b.latest ?? 0) - (a.latest ?? 0)) || byName(a, b));
+  if (ranked.length) {
+    const code = speciesParam
+      ? db.prepare('SELECT species_code AS c FROM fish_catch WHERE species_native = ? AND species_code IS NOT NULL LIMIT 1').get(speciesParam)?.c
+      : null;
+    if (code && EF_FIRST_SPECIES.has(code)) {
+      const ef = ranked.find(r => EF_GEAR.test(r.gear) && !EF_NOT_STANDARD.test(r.gear));
+      if (ef && ef.recent >= EF_SHARE * ranked[0].recent) return ef.gear;
+    }
+    return ranked[0].gear;
   }
-  return ranked[0].gear;
+  // No recent survey anywhere: one deterministic fallback for both routes —
+  // most lakes, then latest survey, then name; survey gears first, creel and
+  // size-limited rates only when nothing else has data.
+  const pool = survey.length ? survey : gears.map(g => stat.get(g)).filter(Boolean);
+  pool.sort((a, b) => (b.lakes - a.lakes) || ((b.latest ?? 0) - (a.latest ?? 0)) || byName(a, b));
+  return pool[0]?.gear ?? null;
 }
 
 // Minimum statewide lakes for a gear to be offered as a ranking source.
@@ -1186,13 +1201,16 @@ function measures(req, res, ctx) {
       const statewide = {};
       const lakesFor = (m, src) => {
         if (!countyList.length) return src.lakes;            // the source's own count is already statewide
-        const col = metricCol[m.id];
+        // Count each source by the column it actually ranks on: a rating
+        // source has no cpue, so counting cpue rows hid every Forecast Rating
+        // source as soon as a county was picked (review 2026-10-27).
+        const col = src.sort === 'rating' ? 'rating_ordinal' : metricCol[m.id];
         if (!col) return Infinity;
-        statewide[m.id] ??= new Map(db.prepare(`
+        statewide[col] ??= new Map(db.prepare(`
           SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS lakes
           FROM fish_catch fc WHERE fc.gear_category IS NOT NULL AND fc.${col} IS NOT NULL ${speciesAnd}
           GROUP BY fc.gear_category`).all(...(speciesParam ? [speciesParam] : [])).map(r => [r.gear, r.lakes]));
-        return statewide[m.id].get(src.gear) ?? 0;
+        return statewide[col].get(src.gear) ?? 0;
       };
       for (const m of out) {
         if (!m.requiresSource || !metricCol[m.id]) continue;
@@ -1212,6 +1230,31 @@ function measures(req, res, ctx) {
 }
 
 // ── /api/:state/results ────────────────────────────────────────────────────────
+
+// The app sends its selected gears as ONE comma-joined `gear` parameter, but
+// some gear names contain commas themselves — SD "gill net (historical, all
+// sizes)", ND "Gill net (#/net-night, 80-ft standard)" — so a plain split
+// turned each into fragments that matched nothing and the ranking came back
+// empty (found 2026-10-27; SD largemouth's old default was one of them). Split,
+// then rejoin adjacent pieces wherever the joined text is a real gear in this
+// DB, longest match first. Works for every shipped client unchanged.
+const _gearNames = new WeakMap();
+function splitGearParam(gear, db) {
+  const parts = String(gear).split(',');
+  let known = _gearNames.get(db);
+  if (!known) {
+    known = new Set(db.prepare('SELECT DISTINCT gear_category AS g FROM fish_catch WHERE gear_category IS NOT NULL').all().map(r => r.g));
+    _gearNames.set(db, known);
+  }
+  const out = [];
+  for (let i = 0; i < parts.length;) {
+    let j = parts.length;
+    for (; j > i + 1; j--) if (known.has(parts.slice(i, j).join(','))) break;
+    out.push(parts.slice(i, j).join(','));
+    i = j;
+  }
+  return out.filter(Boolean);
+}
 
 function results(req, res, ctx) {
   const { state } = req.params;
@@ -1295,7 +1338,7 @@ function results(req, res, ctx) {
     if (cpueKind) { conditions.push('fc.cpue_kind = ?'); params.push(String(cpueKind)); }
 
     if (gear) {
-      const gears = gear.split(',').filter(Boolean);
+      const gears = splitGearParam(gear, db);
       if (f.gearFilterMode === 'stations') {
         // IA: gear chips filter by station presence on the survey, not fc.gear.
         // Unknown tokens (incl. 'Comprehensive') drop out; if none remain, no
@@ -1369,7 +1412,7 @@ function results(req, res, ctx) {
       const subConds = [];
       if (species) { subConds.push('fc2.species_native = ?'); cteParams.push(species); }
       if (gear) {
-        const gears = gear.split(',').filter(Boolean);
+        const gears = splitGearParam(gear, db);
         if (f.gearFilterMode === 'stations') {
           const gconds = gears.map(g => STATION_CONDS[g] ? STATION_CONDS[g]('s2') : null).filter(Boolean);
           if (gconds.length) subConds.push(`(${gconds.join(' OR ')})`);

@@ -589,6 +589,27 @@ function filters(req, res, ctx) {
       }
     }
 
+    // Hide tiny gear chips (2026-10-27, same rule as /measures): a gear that
+    // sampled this species on fewer than MIN_SOURCE_LAKES lakes statewide is
+    // left out of the chip list and its counts. Never hides the default gear,
+    // the gear an older client would pick (most CPUE rows), or the last chip.
+    if (gearMode === 'gear' && MIN_SOURCE_LAKES > 1 && gearTypes.length > 1) {
+      const lakesByGear = new Map(db.prepare(`
+        SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS lakes
+        FROM fish_catch fc WHERE fc.gear_category IS NOT NULL ${speciesAnd}
+        GROUP BY fc.gear_category`).all(...(speciesParam ? [speciesParam] : [])).map(r => [r.gear, r.lakes]));
+      const topCpue = gearCpueCounts ? Object.keys(gearCpueCounts).sort((a, b) => gearCpueCounts[b] - gearCpueCounts[a])[0] : undefined;
+      const keep = g => g === defaultGear || g === topCpue || (lakesByGear.get(g) ?? 0) >= MIN_SOURCE_LAKES;
+      const kept = gearTypes.filter(keep);
+      if (kept.length && kept.length < gearTypes.length) {
+        const pick = o => o && Object.fromEntries(Object.entries(o).filter(([g]) => keep(g)));
+        gearTypes = kept;
+        gearTypeCounts = pick(gearTypeCounts);
+        gearCpueCounts = pick(gearCpueCounts);
+        gearLatestCounts = pick(gearLatestCounts);
+      }
+    }
+
     const result = { species, gearTypes, gearTypeCounts, counties, yearRange };
     if (gearCpueCounts !== undefined) result.gearCpueCounts = gearCpueCounts;
     if (gearLatestCounts !== undefined) result.gearLatestCounts = gearLatestCounts;
@@ -628,15 +649,24 @@ function deriveAbundanceUnit(gear, kind) {
   if (gear) {
     // Units are embedded in several gear strings, e.g.
     // "index gill net (fish/100yd net)" — surface the parenthetical rate.
-    const m = gear.match(/\(([^)]*(?:\/|per |net|hr|min|mile|yd|hour|angler)[^)]*)\)\s*$/i);
+    const m = gear.match(UNIT_PAREN);
     if (m) return m[1].trim();
   }
   return 'catch rate';
 }
 
-// Strip a trailing "(...)" unit annotation to get a clean gear display name.
+// A trailing parenthetical is a UNIT only if it reads as a rate: "#/mile",
+// "fish/100yd net", "per net-night", "catfish/hr". Before 2026-10-27 any
+// parenthetical containing "/" or "net" counted, so SD's "frame net (std 3/4
+// in)" got the unit "std 3/4 in", and gearBaseName stripped it — three
+// different SD frame nets all displayed as "frame net". Mesh and length
+// qualifiers ("3/8 inch", "150 ft") now stay part of the name. Convention for
+// consolidated gears (GEAR_CONSOLIDATION.md): "<Name> (#/<unit>)".
+const UNIT_PAREN = /\(((?:#|fish|catfish|bass|lbs?|pounds?|number)\s*\/[^)]*|(?:[^)]*,\s*)?[a-z]{1,3}\s*\/\s*[a-z]{1,3}\.?|[^)]*\bper\s[^)]*|[^)]*\/\s*(?:net|hr|hour|min|mile|yd|angler|acre|lift|haul|night|set|trip|day|\d+\s*(?:yd|ft|m)\b)[^)]*)\)\s*$/i;
+
+// Strip a trailing unit annotation (see UNIT_PAREN) to get a clean gear name.
 function gearBaseName(gear) {
-  return gear ? gear.replace(/\s*\([^)]*\)\s*$/, '').trim() : gear;
+  return gear ? gear.replace(new RegExp('\\s*' + UNIT_PAREN.source, 'i'), '').trim() : gear;
 }
 
 // The three abundance expressions from the notes, keyed by cpue_kind. Catch/unit
@@ -650,6 +680,9 @@ const KIND_LABEL = {
   relative: 'Relative abundance', creel: 'Angler catch rate',
   normalized: 'Normalized catch rate',
 };
+
+// Minimum statewide lakes for a gear to be offered as a ranking source.
+const MIN_SOURCE_LAKES = Number(process.env.LAKELORE_MIN_SOURCE_LAKES ?? 3);
 
 function measures(req, res, ctx) {
   const { state } = req.params;
@@ -1070,6 +1103,35 @@ function measures(req, res, ctx) {
         ? pool.filter(s => s.expression !== 'ranking')
         : pool.filter(s => s.sort === 'cpue');
       m.defaultSourceId = (primary[0] ?? pool[0])?.id ?? null;
+    }
+
+    // Hide tiny gear sources (owner decision 2026-10-27; GEAR_CONSOLIDATION.md):
+    // a gear whose rows that can rank in THIS measure cover fewer than
+    // MIN_SOURCE_LAKES lakes statewide is a one-off, not a way to rank lakes.
+    // Statewide, so a county filter never hides a big gear that is thin there.
+    // Runs after the default is chosen and never hides it, so no state's
+    // default source changes; never empties a measure; /lake/:id unaffected.
+    if (MIN_SOURCE_LAKES > 1) {
+      const metricCol = { abundance: 'cpue_effective', size: sizeField, trophy: 'cpue_memorable' };
+      const statewide = {};
+      const lakesFor = (m, src) => {
+        if (!countyList.length) return src.lakes;            // the source's own count is already statewide
+        const col = metricCol[m.id];
+        if (!col) return Infinity;
+        statewide[m.id] ??= new Map(db.prepare(`
+          SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS lakes
+          FROM fish_catch fc WHERE fc.gear_category IS NOT NULL AND fc.${col} IS NOT NULL ${speciesAnd}
+          GROUP BY fc.gear_category`).all(...(speciesParam ? [speciesParam] : [])).map(r => [r.gear, r.lakes]));
+        return statewide[m.id].get(src.gear) ?? 0;
+      };
+      for (const m of out) {
+        if (!m.requiresSource || !metricCol[m.id]) continue;
+        const kept = m.sources.filter(x => x.gear == null || x.id === m.defaultSourceId || lakesFor(m, x) >= MIN_SOURCE_LAKES);
+        if (kept.length === m.sources.length || !kept.length) continue;
+        m.sources = kept;
+        m.records = kept.reduce((a, x) => a + x.records, 0);
+        m.lakes = Math.max(...kept.map(x => x.lakes));
+      }
     }
 
     res.json({ species: speciesParam, county: countyList, measures: out });

@@ -414,6 +414,62 @@ function imageShipsEveryRequiredFile() {
     db.close();
   }
 
+  // Gear sources (2026-10-27, GEAR_CONSOLIDATION.md). (1) A trailing
+  // parenthetical is a unit only when it reads as a rate — mesh/length
+  // qualifiers stay in the name. (2) Gears that sampled the species on fewer
+  // than 3 lakes statewide are hidden from the picker, never emptying a
+  // measure, and a county filter does not hide a gear that is big statewide.
+  {
+    const Database = require('better-sqlite3');
+    const canonical = require('../server/canonical.js');
+    const ld = require(path.join(os.homedir(), 'lakelore-data'));
+    const db = new Database(path.join(os.homedir(), 'lakelore-data', 'out', 'nd.db'), { readonly: true });
+    const ctx = { getDb: () => db, isUnhealthy: () => false, getStateEntry: s => ld.getState(s), computeLakeStockingMetrics: () => ({}) };
+    const call = (query) => {
+      const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
+      canonical.measures({ params: { state: 'nd' }, query, get: () => undefined, lakeLorePreview: false }, r, ctx);
+      return r.body;
+    };
+    const cpueLakes = (sp) => new Map(db.prepare('SELECT gear_category g, COUNT(DISTINCT lake_id) n FROM fish_catch WHERE species_native = ? AND gear_category IS NOT NULL AND cpue_effective IS NOT NULL GROUP BY 1').all(sp).map(r => [r.g, r.n]));
+    let hiddenSeen = 0;
+    for (const { sp } of db.prepare("SELECT DISTINCT species_native sp FROM fish_catch").all()) {
+      const body = call({ species: sp });
+      for (const m of body.measures || []) {
+        if (!m.requiresSource) continue;
+        ok(m.sources.length > 0, `nd ${sp} ${m.id}: measure emptied`);
+        ok(m.sources.some(x => x.id === m.defaultSourceId), `nd ${sp} ${m.id}: default source was hidden`);
+        if (['abundance', 'size', 'trophy'].includes(m.id)) {
+          const tinyShown = m.sources.filter(x => x.gear != null && x.lakes < 3 && x.id !== m.defaultSourceId);
+          ok(tinyShown.length === 0, `nd ${sp} ${m.id}: tiny gear shown: ${tinyShown.map(x => x.gear)}`);
+        }
+      }
+      const ab = (body.measures || []).find(m => m.id === 'abundance');
+      if (ab) hiddenSeen += [...cpueLakes(sp)].filter(([g, n]) => n < 3 && !ab.sources.some(x => x.gear === g)).length;
+    }
+    ok(hiddenSeen > 0, 'expected at least one tiny ND gear to be hidden from /measures');
+    // /filters gear chips follow the same rule (the app's Gear Type chips read these).
+    {
+      const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
+      const all = new Map(db.prepare("SELECT gear_category g, COUNT(DISTINCT lake_id) n FROM fish_catch WHERE species_native='BLG' AND gear_category IS NOT NULL GROUP BY 1").all().map(x => [x.g, x.n]));
+      canonical.filters({ params: { state: 'nd' }, query: { species: 'BLG' }, get: () => undefined, lakeLorePreview: false }, r, ctx);
+      const chips = r.body.gearTypes || [];
+      const tiny = [...all].filter(([, n]) => n < 3).map(([g]) => g);
+      ok(chips.length > 0 && chips.every(g => (all.get(g) ?? 0) >= 3 || g === r.body.defaultGear), `nd BLG chips include a tiny gear: ${JSON.stringify(chips)}`);
+      ok(tiny.length === 0 || tiny.every(g => !chips.includes(g)) , `nd BLG tiny chips still listed: ${tiny}`);
+      ok(Object.keys(r.body.gearTypeCounts || {}).every(g => chips.includes(g)), 'gearTypeCounts lists a hidden chip');
+    }
+    const wae = call({ species: 'WAE' }).measures.find(m => m.id === 'abundance');
+    const gill = wae.sources.find(x => x.gear === 'Gill net (#/net-night, 80-ft standard)');
+    ok(gill && gill.label === 'Gill net' && gill.unit === '#/net-night, 80-ft standard' && gill.lakes > 270, `nd walleye gill net source: ${JSON.stringify(gill && { label: gill.label, unit: gill.unit, lakes: gill.lakes })}`);
+    // County scope: pick a county where the frame net 3X4 (9 lakes statewide) has <3 lakes for WAE; it must still show there.
+    const c = db.prepare(`SELECT l.county c FROM fish_catch fc JOIN lakes l ON l.id = fc.lake_id WHERE fc.species_native='WAE' AND fc.gear_category = '3 X 4 w/ 1/4" Mesh' AND fc.cpue_effective IS NOT NULL GROUP BY 1 HAVING COUNT(DISTINCT fc.lake_id) < 3 LIMIT 1`).get();
+    if (c) {
+      const cm = call({ species: 'WAE', county: c.c }).measures.find(m => m.id === 'abundance');
+      ok(cm.sources.some(x => x.gear === '3 X 4 w/ 1/4" Mesh'), `county ${c.c}: statewide-big frame net hidden by county scope`);
+    }
+    db.close();
+  }
+
   // Switched off (no LAKELORE_ASK_ENABLED): client-config tells 1.1.2+ apps
   // to hide the chat.
   await withServer({ LAKELORE_ASK_ENABLED: '' }, async () => {

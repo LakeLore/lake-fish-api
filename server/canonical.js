@@ -590,9 +590,19 @@ function filters(req, res, ctx) {
         : null;
       if (recent) defaultGear = recent;
       else if (gearMode === 'gear' && general.length) defaultGear = general[0];
-      // No catch-rate gear in scope (e.g. a county with only size samples):
-      // /measures falls back to the agency rating, so say the same here.
-      else if (gearMode === 'gear' && gearTypes.includes('Forecast Rating')) defaultGear = 'Forecast Rating';
+      // No catch-rate gear in scope (e.g. a county with only size samples, or a
+      // rating-only species): pick the rating system /measures defaults to —
+      // most rated rows, then lakes (FL bluegill: Best Bet 50 lakes, not the
+      // 3-lake Forecast Rating; review 2026-10-27).
+      else if (gearMode === 'gear') {
+        const rated = db.prepare(`
+          SELECT fc.gear_category AS gear, COUNT(*) AS n, COUNT(DISTINCT fc.lake_id) AS lakes
+          FROM fish_catch fc ${countyJoin}
+          WHERE fc.rating_ordinal IS NOT NULL AND fc.gear_category IS NOT NULL ${speciesAnd} ${countyAnd}
+          GROUP BY fc.gear_category ORDER BY n DESC, lakes DESC, fc.gear_category`).all(...gearArgs)
+          .filter(r => gearTypes.includes(r.gear));
+        if (rated.length) defaultGear = rated[0].gear;
+      }
     }
 
     // Hide tiny gear chips (2026-10-27, same rule as /measures): a gear that

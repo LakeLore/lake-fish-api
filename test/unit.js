@@ -121,7 +121,7 @@ function rowCache() {
 // A stand-in for api.anthropic.com. mode 'ok' answers every call with a
 // one-line final answer; the other modes answer with the 400s the real API
 // sends when the money runs out.
-const mock = { mode: 'ok', calls: 0 };
+const mock = { mode: 'ok', calls: 0, lastBody: null, delayMs: 0 };
 const MOCK_ERRORS = {
   credit: 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.',
   other: 'messages.0.content: text content blocks must be non-empty',
@@ -130,9 +130,13 @@ const MOCK_ERRORS = {
 function mockModel() {
   const http = require('http');
   const srv = http.createServer((req, res) => {
-    req.resume();
-    req.on('end', () => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', async () => {
       mock.calls++;
+      try { mock.lastBody = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { mock.lastBody = null; }
+      if (mock.delayMs) await new Promise(r => setTimeout(r, mock.delayMs));
+      if (res.destroyed) return;
       res.setHeader('content-type', 'application/json');
       if (mock.mode !== 'ok') {
         res.statusCode = 400;
@@ -231,9 +235,10 @@ function imageShipsEveryRequiredFile() {
   // Without RevenueCat keys a production server treats everyone as not
   // entitled, so the free state's ask must 402 too, and client-config must
   // advertise the assistant.
-  await withServer({ LAKELORE_ASK_PUBLIC: '1', ANTHROPIC_API_KEY: 'unit-test', ANTHROPIC_BASE_URL: 'http://127.0.0.1:9' }, async (ask) => {
+  await withServer({ LAKELORE_ASK_PUBLIC: '1', ANTHROPIC_API_KEY: 'unit-test', ANTHROPIC_BASE_URL: 'http://127.0.0.1:9', LAKELORE_ASK_UNLIMITED_USERS: 'owner-phone' }, async (ask) => {
     ok(await ask({ 'X-User-Id': 'free-user' }, real) === '402 subscription_required', 'subscribers-only /ask must 402 a free-state ask without a subscription');
     ok(await ask({}, real) === '402 subscription_required', 'subscribers-only /ask must 402 a request with no user id');
+    ok(await ask({ 'X-User-Id': 'owner-phone' }, real) === '402 subscription_required', 'an unlimited-list id still needs a subscription');
     const cfg = await (await fetch('http://localhost:3198/api/client-config')).json();
     ok(cfg.ask && cfg.ask.enabled === true, `client-config must advertise ask.enabled: ${JSON.stringify(cfg.ask)}`);
   });
@@ -285,6 +290,129 @@ function imageShipsEveryRequiredFile() {
   ok(!fs.existsSync(old), 'a chat log older than 90 days must be pruned at start-up');
   for (const k of keep) ok(fs.existsSync(k), `the prune must leave ${path.basename(k)} alone`);
   fs.rmSync(vol, { recursive: true, force: true });
+
+  // ── 2026-10-27 move-1 fixes ────────────────────────────────────────────────
+  const post = async (p, body, headers = {}) => {
+    const res = await fetch(`http://localhost:3198${p}`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: typeof body === 'string' ? body : JSON.stringify(body) });
+    const type = res.headers.get('content-type') || '';
+    let json = null; try { json = await res.json(); } catch { /* non-json */ }
+    return { status: res.status, type, json };
+  };
+  const msgs = (...turns) => ({ messages: turns.map((c, i) => ({ role: i % 2 ? 'assistant' : 'user', content: c })) });
+  const vol2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ask-unit2-'));
+  const SUB2 = { ...SUB, LAKELORE_DB_DIR: vol2, LAKELORE_ASK_USER_DAILY_MAX: '', LAKELORE_ASK_DEADLINE_MS: '2500',
+    LAKELORE_ASK_UNLIMITED_USERS: 'owner-phone, owner-tablet' };
+  await withServer(SUB2, async () => {
+    mock.mode = 'ok'; mock.delayMs = 0;
+    // ASK-01: a failed question left in the history (two user turns in a row)
+    // is merged, not rejected.
+    let r = await post('/api/mn/ask', { messages: [{ role: 'user', content: 'walleye?' }, { role: 'user', content: 'walleye near Brainerd?' }] }, U);
+    ok(r.status === 200, `two user turns in a row must be repaired, got ${r.status} ${JSON.stringify(r.json)}`);
+    ok(mock.lastBody?.messages?.length === 1 && /walleye\?\n\nwalleye near Brainerd\?/.test(mock.lastBody.messages[0].content), `merged turn not sent as one: ${JSON.stringify(mock.lastBody?.messages)}`);
+    // A long earlier answer is shortened, not rejected.
+    r = await post('/api/mn/ask', msgs('bass?', 'x'.repeat(2600), 'and pike?'), U);
+    ok(r.status === 200, `a 2,600-char earlier answer must be shortened, got ${r.status}`);
+    ok(mock.lastBody.messages[1].content.length === 2000, `shortened answer length ${mock.lastBody.messages[1].content.length}`);
+    // The 11th question (21 messages) drops the oldest pair instead of failing.
+    const long = []; for (let i = 0; i < 21; i++) long.push(i % 2 ? `answer ${i}` : `question ${i}`);
+    r = await post('/api/mn/ask', msgs(...long), U);
+    ok(r.status === 200 && mock.lastBody.messages.length === 19 && mock.lastBody.messages[0].content === 'question 2', `21-message chat must keep the newest 19: ${r.status} ${mock.lastBody.messages.length}`);
+    // Over 12,000 characters in total: oldest pairs go.
+    const big = []; for (let i = 0; i < 9; i++) big.push(i % 2 ? 'a'.repeat(1900) : `q${i} ${'b'.repeat(1500)}`);
+    r = await post('/api/mn/ask', msgs(...big), U);
+    const sent = mock.lastBody.messages.reduce((n, m) => n + m.content.length, 0);
+    ok(r.status === 200 && sent <= 12000 && mock.lastBody.messages.at(-1).content.startsWith('q8'), `long chat must be trimmed to 12,000 chars: ${r.status} ${sent}`);
+    // What still fails gets a message a person can act on.
+    r = await post('/api/mn/ask', msgs('hi', 'hello'), U);
+    ok(r.status === 400 && /New chat/.test(r.json?.message || ''), `history ending with the assistant: ${r.status} ${JSON.stringify(r.json)}`);
+    r = await post('/api/mn/ask', msgs('q'.repeat(2100)), U);
+    ok(r.status === 400 && /too long/.test(r.json?.message || ''), `over-long question: ${r.status} ${JSON.stringify(r.json)}`);
+    // ASK-06: the request carries automatic caching for the conversation tail
+    // and keeps the 1-hour system breakpoint.
+    ok(mock.lastBody?.cache_control?.type === 'ephemeral' && !mock.lastBody.cache_control.ttl, `top-level cache_control missing: ${JSON.stringify(mock.lastBody?.cache_control)}`);
+    ok(mock.lastBody?.system?.[0]?.cache_control?.ttl === '1h', 'system prompt lost its 1-hour cache breakpoint');
+    // ASK-04: at the deadline the user gets a normal answer telling them to
+    // narrow the question, and the question is not counted.
+    mock.delayMs = 6000;
+    const t0 = Date.now();
+    r = await post('/api/mn/ask', msgs('every lake in the state?'), { 'X-User-Id': 'slow-user' });
+    ok(r.status === 200 && /narrower question/.test(r.json?.answer || '') && r.json?.usage?.stop_reason === 'deadline', `deadline answer: ${r.status} ${JSON.stringify(r.json)}`);
+    ok(Date.now() - t0 < 4500, `deadline did not cut the ask short: ${Date.now() - t0} ms`);
+    const counts = JSON.parse(fs.readFileSync(path.join(vol2, 'ask-counts.json'), 'utf8'));
+    ok(counts.users['slow-user'] === 1, `a deadline answer is an answer and must count once: ${JSON.stringify(counts.users)}`);
+    // A client that hangs up before any model call finished gets the question back.
+    mock.delayMs = 3000;
+    const ac = new AbortController();
+    const gone = fetch('http://localhost:3198/api/mn/ask', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-User-Id': 'leaver' }, body: JSON.stringify(msgs('pike?')), signal: ac.signal }).catch(() => 'aborted');
+    await new Promise(r => setTimeout(r, 300)); ac.abort(); await gone;
+    await new Promise(r => setTimeout(r, 300));
+    const c2 = JSON.parse(fs.readFileSync(path.join(vol2, 'ask-counts.json'), 'utf8'));
+    ok(!c2.users['leaver'], `a client that left before any model call finished must get the question back: ${JSON.stringify(c2.users)}`);
+    mock.delayMs = 0;
+    // Empty turns and a leading assistant turn are dropped, not rejected.
+    r = await post('/api/mn/ask', { messages: [{ role: 'assistant', content: 'Welcome!' }, { role: 'user', content: '  ' }, { role: 'user', content: 'crappie?' }] }, U);
+    ok(r.status === 200 && mock.lastBody.messages.length === 1 && mock.lastBody.messages[0].content === 'crappie?', `leading assistant / empty turn repair: ${r.status} ${JSON.stringify(mock.lastBody?.messages)}`);
+    mock.delayMs = 0;
+    // Default per-subscriber cap is 15; unlimited users are exempt.
+    let last = '';
+    for (let i = 0; i < 16; i++) last = (await post('/api/mn/ask', msgs('perch?'), { 'X-User-Id': 'capped' })).status;
+    ok(last === 429, `16th ask under the default cap of 15 must 429, got ${last}`);
+    for (let i = 0; i < 16; i++) last = (await post('/api/mn/ask', msgs('perch?'), { 'X-User-Id': 'owner-tablet' })).status;
+    ok(last === 200, `an unlimited user must never hit the daily cap, got ${last}`);
+  });
+  fs.rmSync(vol2, { recursive: true, force: true });
+  // The per-IP hourly limit is off unless set; when set it still works.
+  await withServer({ ...SUB, LAKELORE_DB_DIR: '', LAKELORE_ASK_PER_HOUR: '2', LAKELORE_ASK_USER_DAILY_MAX: '' }, async (ask) => {
+    const a = [await ask(U, real), await ask(U, real), await ask(U, real)];
+    ok(a[0] === '200 undefined' && a[2] === '429 ask_quota', `LAKELORE_ASK_PER_HOUR=2 lever: ${a}`);
+  });
+
+  // SRV-02 / SRV-03 / SRV-04 / SEC-02 on a production-mode server.
+  await withServer({}, async () => {
+    const get = async (p) => { const res = await fetch(`http://localhost:3198${p}`); return { status: res.status, type: res.headers.get('content-type') || '', json: await res.json().catch(() => null) }; };
+    let r = await get('/api/mn/nonexistent');
+    ok(r.status === 404 && /json/.test(r.type) && r.json?.error === 'not_found', `unknown path must be a JSON 404: ${r.status} ${r.type}`);
+    r = await post('/api/feedback', '{bad');
+    ok(r.status === 400 && /json/.test(r.type) && r.json?.error === 'invalid_json', `malformed JSON body must be a JSON 400: ${r.status} ${r.type} ${JSON.stringify(r.json)}`);
+    r = await post('/api/feedback', { message: 'x'.repeat(17000) });
+    ok(r.status === 413 && /json/.test(r.type), `oversized body must be a JSON 413: ${r.status} ${r.type}`);
+    r = await post('/api/subscribe', { email: 'a@b.co' });
+    ok(r.status === 404 && /json/.test(r.type), `/api/subscribe must be gone: ${r.status}`);
+    r = await get('/api/mn/results?offset=9999999999999999999999');
+    ok(r.status === 400 && r.json?.error === 'bad_request', `huge offset must 400, got ${r.status} ${JSON.stringify(r.json)}`);
+    r = await get('/api/mn/results?offset=100&limit=5');
+    ok(r.status === 200, `a normal offset must still work: ${r.status}`);
+  });
+  const fbVol = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-unit-'));
+  await withServer({ FEEDBACK_LOG_PATH: path.join(fbVol, 'feedback.jsonl'), LAKELORE_FEEDBACK_PER_DAY: '3' }, async () => {
+    let r = await post('/api/feedback', { message: 'wrong depth', state: 'mn', lakeName: 'L'.repeat(500), species: { $gt: 1 }, build: 35 });
+    ok(r.status === 200, `feedback must save: ${r.status}`);
+    const saved = JSON.parse(fs.readFileSync(path.join(fbVol, 'feedback.jsonl'), 'utf8').trim());
+    ok(saved.lakeName.length === 128 && saved.species === null && saved.build === 35, `feedback fields must be clipped/typed: ${JSON.stringify(saved).slice(0, 200)}`);
+    await post('/api/feedback', { message: 'two' }); await post('/api/feedback', { message: 'three' });
+    r = await post('/api/feedback', { message: 'four' });
+    ok(r.status === 429 && /json/.test(r.type), `feedback past the per-IP daily cap must 429 JSON: ${r.status}`);
+  });
+  fs.rmSync(fbVol, { recursive: true, force: true });
+
+  // SRV-01: lakes whose stocking rows have no life stage must still send a
+  // string, because every shipped app lowercases it.
+  {
+    const Database = require('better-sqlite3');
+    const canonical = require('../server/canonical.js');
+    const ld = require(path.join(os.homedir(), 'lakelore-data'));
+    const db = new Database(path.join(os.homedir(), 'lakelore-data', 'out', 'tx.db'), { readonly: true });
+    const row = db.prepare('SELECT lake_id FROM stocking WHERE life_stage IS NULL LIMIT 1').get();
+    ok(!!row, 'tx.db has no NULL life_stage row to test with');
+    if (row) {
+      const ctx = { getDb: () => db, isUnhealthy: () => false, getStateEntry: s => ld.getState(s), computeLakeStockingMetrics: () => ({}) };
+      const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
+      canonical.lakeDetail({ params: { state: 'tx', id: String(row.lake_id) }, query: {}, get: () => undefined, lakeLorePreview: false }, r, ctx);
+      const st = r.body?.stocking || [];
+      ok(r.statusCode === 200 && st.length > 0 && st.every(s => typeof s.life_stage === 'string'), `tx lake ${row.lake_id}: ${r.statusCode}, life_stage values ${JSON.stringify([...new Set(st.map(s => s.life_stage))])}`);
+    }
+    db.close();
+  }
 
   // Switched off (no LAKELORE_ASK_ENABLED): client-config tells 1.1.2+ apps
   // to hide the chat.

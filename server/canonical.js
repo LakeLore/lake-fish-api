@@ -61,7 +61,7 @@ function redactPreviewFields(row, fields) {
 // references stay consistent between /results and /lake payloads. /lake/:id
 // resolves hashed ids back through a lazily-built per-state reverse map.
 const crypto = require('crypto');
-const { reportError } = require('./report');
+const { reportError, serverError } = require('./report');
 // Key precedence: explicit PREVIEW_ID_SECRET → derived from the server-only
 // JWT secret (HMAC, so the JWT key itself is never reused directly) → the dev
 // literal. The middle tier matters: without it, production quietly ran on the
@@ -602,8 +602,7 @@ function filters(req, res, ctx) {
 
     res.json(result);
   } catch (err) {
-    reportError(err, req);
-    res.status(500).json({ error: err.message });
+    serverError(res, err, req);
   }
 }
 
@@ -1076,8 +1075,7 @@ function measures(req, res, ctx) {
     res.json({ species: speciesParam, county: countyList, measures: out });
   } catch (err) {
     console.error(`[${state}] /measures error:`, err);
-    reportError(err, req);
-    res.status(500).json({ error: err.message });
+    serverError(res, err, req);
   }
 }
 
@@ -1122,6 +1120,12 @@ function results(req, res, ctx) {
     // Validate and clamp numeric query params (identical to legacy).
     const limitNum = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
     const offsetNum = Math.max(parseInt(offset, 10) || 0, 0);
+    // Past ~2^53 an offset binds as a REAL and SQLite answers 500 "datatype
+    // mismatch" for every state (2026-10-27, SRV-03). No real page is that
+    // deep (500 rows a page), so anything over a million is a bad request.
+    if (offsetNum > 1_000_000) {
+      return res.status(400).json({ error: 'bad_request', message: 'offset must be between 0 and 1000000' });
+    }
 
     // Presence measure (DATA_MODEL §1): the DERIVED UNION of every lake+species
     // across all measures — fish_catch ∪ lake_stocking_metrics — so it's the
@@ -1426,8 +1430,7 @@ function results(req, res, ctx) {
     return finishResults(req, res, state, entry, rows, total);
   } catch (err) {
     console.error(`[${state}] /results (canonical) error:`, err);
-    reportError(err, req);
-    res.status(500).json({ error: err.message });
+    serverError(res, err, req);
   }
 }
 
@@ -1541,8 +1544,7 @@ function stockingFirstResults(req, res, opts) {
     return finishResults(req, res, state, entry, rows, total);
   } catch (err) {
     console.error(`[${state}] /results stockingFirst error:`, err);
-    reportError(err, req);
-    res.status(500).json({ error: err.message });
+    serverError(res, err, req);
   }
 }
 
@@ -1626,8 +1628,7 @@ function presenceUnionResults(req, res, opts) {
     return finishResults(req, res, state, entry, rows, total);
   } catch (err) {
     console.error(`[${state}] /results presenceUnion error:`, err);
-    reportError(err, req);
-    res.status(500).json({ error: err.message });
+    serverError(res, err, req);
   }
 }
 
@@ -1719,8 +1720,15 @@ function lakeDetail(req, res, ctx) {
     // (legacy: SELECT stock_year, species, life_stage, SUM(quantity) ...).
     let stocking = [];
     try {
+      // life_stage may be NULL in the canonical schema (~1,830 lakes in 12
+      // states). Every shipped app calls .toLowerCase() on it and the lake
+      // page crashes, so the wire always carries a string (2026-10-27,
+      // SRV-01). NULLs already group together; 'Unknown' just names them.
+      // (GROUP BY uses the raw column, so a literal 'Unknown' stage would be a
+      // second row — none of the 56 DBs has one, 2026-10-27; keeping the raw
+      // column keeps row order identical to the recorded goldens.)
       stocking = db.prepare(`
-        SELECT stock_year, species_native AS species, life_stage, SUM(quantity) as quantity
+        SELECT stock_year, species_native AS species, COALESCE(life_stage, 'Unknown') AS life_stage, SUM(quantity) as quantity
         FROM stocking WHERE lake_id = ?
         GROUP BY stock_year, species, life_stage ORDER BY stock_year DESC, species
       `).all(id);
@@ -1781,8 +1789,7 @@ function lakeDetail(req, res, ctx) {
     res.json({ lake, surveys, catches, stocking, metrics, metrics_by_year, latest_stocking_report_id });
   } catch (err) {
     console.error(`[${state}] /lake/${id} (canonical) error:`, err);
-    reportError(err, req);
-    res.status(500).json({ error: err.message });
+    serverError(res, err, req);
   }
 }
 

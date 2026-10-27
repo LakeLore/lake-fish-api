@@ -20,6 +20,10 @@ primary_region = 'ord'
   # Staging has no RevenueCat keys, so subscribers-only would refuse every
   # ask; keep free-state (MN) asks open here behind LAKELORE_ASK_TOKEN.
   LAKELORE_ASK_SUBSCRIBERS_ONLY = '0'
+  # With no subscription check there is no per-user cap here, so keep a
+  # per-machine daily ceiling on staging (production has none since
+  # 2026-10-27). Bounds spend if the staging token leaks.
+  LAKELORE_ASK_DAILY_MAX = '200'
 
 [http_service]
   internal_port = 3100

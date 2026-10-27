@@ -18,7 +18,7 @@
     "appattest-checker-node": "^1.0.3",
     "better-sqlite3": "^11.0.0",
     "cors": "^2.8.5",
-    "express": "^4.18.2",
+    "express": "^4.22.3",
     "express-rate-limit": "^7.4.1",
     "zod": "^4.6.2"
   }

@@ -20,6 +20,7 @@ if (process.env.SENTRY_DSN) {
     dsn: process.env.SENTRY_DSN,
     environment: process.env.NODE_ENV || 'development',
     tracesSampleRate: 0.1,
+    beforeSend: require('./server/report').sentryBeforeSend,
   });
 } else if (process.env.NODE_ENV === 'production') {
   console.warn('[sentry] SENTRY_DSN not set in production — error reporting disabled');
@@ -31,7 +32,7 @@ const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
 const rateLimit = require('express-rate-limit');
-const { reportError } = require('./server/report');
+const { reportError, serverError } = require('./server/report');
 const { gateByState, checkEntitlement, invalidateCache, stats: entitlementStats, noteWebhook, isPaidState } = require('./entitlement');
 
 // ── Canonical data layer (lakelore-data) — REQUIRED ────────────────────────────
@@ -601,8 +602,7 @@ app.get('/api/me/entitlement', async (req, res) => {
       source: result.source,
     });
   } catch (err) {
-    reportError(err, req);
-    res.status(500).json({ error: err.message });
+    serverError(res, err, req);
   }
 });
 
@@ -612,10 +612,9 @@ app.get('/api/me/entitlement', async (req, res) => {
 // submission to /data/feedback.jsonl on the Fly volume. Triage by reading
 // the file (cat / grep / jq).
 //
-// No auth: anyone with the app can submit. Rate limit is the global 600/
-// 15-min from express-rate-limit, applied to /api; bodies are capped at 16 KB
-// by the express.json limit, and the file itself is capped below so a
-// sustained distributed writer can't fill the volume.
+// No auth: anyone with the app can submit. Bounded by a per-IP daily cap
+// (below), the 16 KB express.json body limit, short context fields, and a
+// file-size cap so a sustained distributed writer can't fill the volume.
 //
 // Future upgrade path: pipe submissions to email via Resend or Postmark, or
 // surface them inside a dashboard. For v1 we just collect.
@@ -639,8 +638,26 @@ async function appendJsonlCapped(p, entry) {
   await fs.promises.appendFile(p, JSON.stringify(entry) + '\n');
 }
 
-app.post('/api/feedback', (req, res) => {
-  const userId = req.get('x-user-id') || null;
+// Per-IP daily cap and field limits (2026-10-27, SRV-04): before them one
+// client could fill the 50 MB file in ~80 minutes with 16 KB entries, after
+// which every user's feedback failed with storage_full. A person reporting
+// data issues sends a handful a day; 20 leaves room for a shared network.
+const feedbackLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  max: Number(process.env.LAKELORE_FEEDBACK_PER_DAY || 20),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'feedback_quota', message: 'Thanks — that’s a lot of reports for one day. Please try again tomorrow.' },
+});
+// Context fields are short labels (a state code, a lake id, a version). Keep
+// strings and numbers up to 128 characters; anything else is dropped.
+const fbField = (v) => {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string') return v.slice(0, 128);
+  return null;
+};
+app.post('/api/feedback', feedbackLimiter, (req, res) => {
+  const userId = (req.get('x-user-id') || '').slice(0, 128) || null;
   const { message, lakeId, lakeName, state, species, tab, version, build, updateId } = req.body || {};
   if (typeof message !== 'string' || message.trim().length === 0) {
     return res.status(400).json({ error: 'message_required' });
@@ -651,13 +668,13 @@ app.post('/api/feedback', (req, res) => {
   const entry = {
     ts: new Date().toISOString(),
     userId,
-    state: state ?? null,
-    lakeId: lakeId ?? null,
-    lakeName: lakeName ?? null,
-    species: species ?? null,
-    tab: tab ?? null,
-    version: version ?? null,
-    build: build ?? null,
+    state: fbField(state),
+    lakeId: fbField(lakeId),
+    lakeName: fbField(lakeName),
+    species: fbField(species),
+    tab: fbField(tab),
+    version: fbField(version),
+    build: fbField(build),
     message: message.trim(),
     updateId: typeof updateId === 'string' ? updateId.slice(0, 64) : null, // OTA bundle id (round-2 B7b — destructure landed without this)
   };
@@ -669,30 +686,13 @@ app.post('/api/feedback', (req, res) => {
     });
 });
 
-// ── POST /api/subscribe ─────────────────────────────────────────────────────
-// Marketing-site email capture (IMPROVEMENT_PLAN P3.2): appends to a JSONL on
-// the volume — export with `fly ssh console -C "cat /data/subscribers.jsonl"`.
-const SUBSCRIBERS_PATH = process.env.SUBSCRIBERS_PATH
-  || (process.env.LAKELORE_DB_DIR ? path.join(process.env.LAKELORE_DB_DIR, 'subscribers.jsonl')
-    : path.join(__dirname, 'data', 'subscribers.jsonl'));
-app.post('/api/subscribe', (req, res) => {
-  const { email, state, source } = req.body || {};
-  if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || email.length > 320) {
-    return res.status(400).json({ error: 'invalid_email' });
-  }
-  const entry = {
-    ts: new Date().toISOString(),
-    email: email.trim().toLowerCase(),
-    state: typeof state === 'string' ? state.slice(0, 8) : null,
-    source: typeof source === 'string' ? source.slice(0, 64) : null,
-  };
-  appendJsonlCapped(SUBSCRIBERS_PATH, entry)
-    .then(() => res.json({ ok: true }))
-    .catch(err => {
-      console.warn('[subscribe] write failed:', err.message);
-      res.status(err.capped ? 503 : 500).json({ error: err.capped ? 'storage_full' : 'write_failed' });
-    });
-});
+// ── POST /api/subscribe — REMOVED (2026-10-27, SEC-02) ───────────────────────
+// Stored any POSTed email in /data/subscribers.jsonl. The marketing-site form
+// that used it was removed (web a6a09f0) and the privacy policy says there is
+// no signup, yet the route still accepted addresses, and its email regex ran
+// before the length check (a crafted body blocked the event loop). Callers now
+// get the JSON 404. The existing file stays on the volume: backup-userdata.sh
+// still sweeps it and deep healthz still reports its size.
 
 // ── GET /api/:state/lakes-index — public SEO index (IMPROVEMENT_PLAN P3.1) ──
 // Lake NAMES + counts only, no metrics: powers the marketing site's
@@ -729,8 +729,7 @@ app.get('/api/:state/lakes-index', (req, res) => {
     res.json(body);
   } catch (err) {
     console.error(`[${state}] /lakes-index error:`, err.message);
-    reportError(err, req);
-    res.status(500).json({ error: err.message });
+    serverError(res, err, req);
   }
 });
 
@@ -981,8 +980,7 @@ app.get('/api/:state/status', (req, res) => {
     const catches = hasCatch   ? db.prepare('SELECT COUNT(*) as n FROM fish_catch').get().n : 0;
     res.json({ ready: true, lakes, surveys, catches });
   } catch (err) {
-    reportError(err, req);
-    res.status(500).json({ error: err.message });
+    serverError(res, err, req);
   }
 });
 
@@ -1088,36 +1086,55 @@ app.get('/api/:state/lake/:id', (req, res) => {
 // handlers (server/ask.js). OFF unless LAKELORE_ASK_ENABLED=1 so a deploy
 // without credentials can't expose it. Paid states require the entitlement
 // outright (no preview mode — a redacted-identity answer is useless), and
-// every ask counts against a per-user hourly cap on top of the global
-// per-IP limiter, because each call costs real money upstream.
+// every ask counts against the subscriber's daily cap, because each call
+// costs real money upstream.
 const ASK_ENABLED = process.env.LAKELORE_ASK_ENABLED === '1';
 const askAgent = ASK_ENABLED ? require('./server/ask') : null;
 if (ASK_ENABLED) console.log(`[ask] enabled — model=${askAgent.MODEL} effort=${askAgent.EFFORT}`);
-// Three bounds on spend, because X-User-Id is whatever the caller sends:
-//   1. Per-IP hourly limit. (Keyed on X-User-Id until 2026-10-08 — rotating
-//      the header reset the quota, so the limit bounded nothing.)
-//   2. LAKELORE_ASK_TOKEN: in production the route is CLOSED unless this
-//      secret is set and the caller presents it as X-Ask-Token. Free-state
-//      asks need no subscription, so without it anyone who found the staging
-//      URL could spend on the model key. LAKELORE_ASK_PUBLIC=1 is the explicit
-//      opt-out for a real public launch.
-//   3. A per-machine daily ceiling on asks, whoever is asking.
-// Since 2026-10-20 the assistant is also SUBSCRIBERS-ONLY in every state,
-// the free state included (owner decision; LAKELORE_ASK_SUBSCRIBERS_ONLY=0
-// restores free-state asks — staging sets it because it has no RevenueCat
-// keys), and each subscriber gets LAKELORE_ASK_USER_DAILY_MAX asks a day.
+// Bounds on spend. Owner decision 2026-10-27: the per-subscriber daily cap
+// is the bound; the whole-app daily ceiling and the per-IP hourly limit are
+// OFF by default and remain only as emergency levers (set the env var to
+// turn one back on — no code change).
+//   1. Subscribers only in every state, the free state included (2026-10-20;
+//      LAKELORE_ASK_SUBSCRIBERS_ONLY=0 restores free-state asks — staging
+//      sets it because it has no RevenueCat keys).
+//   2. LAKELORE_ASK_USER_DAILY_MAX asks per subscriber per day (default 15).
+//      Users listed in LAKELORE_ASK_UNLIMITED_USERS (a secret: comma-separated
+//      user ids, e.g. the owner's test devices) skip this cap only — they
+//      still need a subscription.
+//   3. LAKELORE_ASK_TOKEN: in production the route is CLOSED unless this
+//      secret is set and the caller presents it as X-Ask-Token, or
+//      LAKELORE_ASK_PUBLIC=1 (production — safe because every ask needs a
+//      subscription).
+//   Levers, unset = off: LAKELORE_ASK_DAILY_MAX (asks per machine per day,
+//   whoever is asking) and LAKELORE_ASK_PER_HOUR (asks per IP per hour).
+//   The general /api limiter (600 requests / 15 min / IP) still applies.
 const ASK_TOKEN = process.env.LAKELORE_ASK_TOKEN || '';
 const ASK_PUBLIC = process.env.LAKELORE_ASK_PUBLIC === '1';
 const ASK_OPEN = ASK_PUBLIC || !!ASK_TOKEN || process.env.NODE_ENV !== 'production';
 if (ASK_ENABLED && !ASK_OPEN) {
   console.warn('[ask] enabled but CLOSED: set LAKELORE_ASK_TOKEN (or LAKELORE_ASK_PUBLIC=1) to open it');
 }
-// A non-numeric value must not disable the ceiling (NaN compares false).
-const ASK_DAILY_MAX = Number.isFinite(Number(process.env.LAKELORE_ASK_DAILY_MAX)) && process.env.LAKELORE_ASK_DAILY_MAX !== ''
-  ? Number(process.env.LAKELORE_ASK_DAILY_MAX) : 500;
+// A number, or `dflt` when unset. A set but non-numeric value is a typo, so
+// it falls back to the default rather than switching a limit off silently.
+function envLimit(name, dflt) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return dflt;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n >= 0) return n;
+  console.warn(`[ask] ${name}=${JSON.stringify(raw)} is not a number — using ${dflt}`);
+  return dflt;
+}
+const ASK_DAILY_MAX = envLimit('LAKELORE_ASK_DAILY_MAX', Infinity);
+const ASK_PER_HOUR = envLimit('LAKELORE_ASK_PER_HOUR', Infinity);
 const ASK_SUBSCRIBERS_ONLY = process.env.LAKELORE_ASK_SUBSCRIBERS_ONLY !== '0';
-const ASK_USER_DAILY_MAX = Number.isFinite(Number(process.env.LAKELORE_ASK_USER_DAILY_MAX)) && process.env.LAKELORE_ASK_USER_DAILY_MAX !== ''
-  ? Number(process.env.LAKELORE_ASK_USER_DAILY_MAX) : 25;
+const ASK_USER_DAILY_MAX = envLimit('LAKELORE_ASK_USER_DAILY_MAX', 15);
+const ASK_UNLIMITED_USERS = new Set((process.env.LAKELORE_ASK_UNLIMITED_USERS || '')
+  .split(',').map(s => s.trim()).filter(Boolean));
+if (ASK_ENABLED) {
+  const show = n => (Number.isFinite(n) ? n : 'off');
+  console.log(`[ask] limits — per subscriber/day ${show(ASK_USER_DAILY_MAX)}, per machine/day ${show(ASK_DAILY_MAX)}, per IP/hour ${show(ASK_PER_HOUR)}, unlimited users ${ASK_UNLIMITED_USERS.size}`);
+}
 // Daily counts are saved to the volume after every change, so a restart (a
 // deploy, a secret change, or Fly stopping the idle second machine) does not
 // hand everyone a fresh day. Per machine; local dev without a volume keeps
@@ -1177,14 +1194,14 @@ function askRefund({ userId, budget, day }) {
   if (budget && _askCount > 0) _askCount--;
   saveAskCounts();
 }
-const askLimiter = rateLimit({
+const askLimiter = Number.isFinite(ASK_PER_HOUR) ? rateLimit({
   windowMs: 60 * 60 * 1000,
-  max: Number(process.env.LAKELORE_ASK_PER_HOUR || 40),
+  max: ASK_PER_HOUR,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'ask_quota', message: 'You have used the assistant a lot this hour — try again later.' },
-});
-app.post('/api/:state/ask', askLimiter, async (req, res) => {
+}) : (req, res, next) => next();
+app.post('/api/:state/ask', (req, res, next) => { req.askStart = Date.now(); next(); }, askLimiter, async (req, res) => {
   if (!ASK_ENABLED || !ASK_OPEN) return res.status(503).json({ error: 'ask_unavailable' });
   if (ASK_TOKEN && !ASK_PUBLIC && !secretEq(req.get('x-ask-token') || '', ASK_TOKEN)) {
     // 403, not 401: the app reads a 401 as an expired session token and retries.
@@ -1196,7 +1213,11 @@ app.post('/api/:state/ask', askLimiter, async (req, res) => {
     const userId = req.get('x-user-id');
     if (!userId) return res.status(402).json({ error: 'subscription_required', state });
     let ent;
-    try { ent = await checkEntitlement(userId); }
+    // A just-purchased app sends X-Entitlement-Refresh so a cached "not
+    // subscribed" from before the purchase is re-checked, exactly as
+    // /results and /me/entitlement do (2026-10-27, ASK-02 — without it a new
+    // subscriber, or a store reviewer, was re-paywalled for up to 5 minutes).
+    try { ent = await checkEntitlement(userId, { refreshNegative: req.get('x-entitlement-refresh') === '1' }); }
     catch (err) {
       console.warn('[ask] entitlement error:', err);
       reportError(err, req);
@@ -1207,7 +1228,7 @@ app.post('/api/:state/ask', askLimiter, async (req, res) => {
   // The per-subscriber quota is checked inside ask() after body validation,
   // like the machine ceiling, so a malformed request never spends it.
   const userId = req.get('x-user-id');
-  const quotaUser = ASK_SUBSCRIBERS_ONLY && userId ? userId : null;
+  const quotaUser = ASK_SUBSCRIBERS_ONLY && userId && !ASK_UNLIMITED_USERS.has(userId) ? userId : null;
   const askUserQuota = quotaUser
     ? () => askUserQuotaExhausted(quotaUser) && { limit: ASK_USER_DAILY_MAX }
     : null;
@@ -1296,8 +1317,7 @@ app.post('/api/:state/reload', requireReloadToken, (req, res) => {
     console.log(`[${state}] reloaded — ${lakes} lakes`);
     res.json({ ok: true, state, lakes });
   } catch (err) {
-    reportError(err, req);
-    res.status(500).json({ error: err.message });
+    serverError(res, err, req);
   }
 });
 
@@ -1315,6 +1335,29 @@ app.post('/api/:state/reload', requireReloadToken, (req, res) => {
 if (process.env.SENTRY_DSN) {
   Sentry.setupExpressErrorHandler(app);
 }
+
+// ── Every answer is JSON (2026-10-27, SRV-02) ─────────────────────────────────
+// Express's built-in 404 and error pages are HTML. App 1.1.2+ reads a non-JSON
+// answer as "this host is not the API" and fails over to the other hostname,
+// so an unknown path, a malformed body (400) or an oversized one (413) moved
+// working apps off a healthy server. Registered last: an unmatched request
+// reaches the 404, and any error passed to next() reaches the handler.
+app.use((req, res) => {
+  res.status(404).json({ error: 'not_found' });
+});
+// eslint-disable-next-line no-unused-vars -- Express needs the 4-arg signature
+app.use((err, req, res, next) => {
+  const status = Number(err?.status || err?.statusCode);
+  if (status >= 400 && status < 500 && !res.headersSent) {
+    // Body-parser's own errors: bad JSON, too large, bad encoding.
+    const code = err.type === 'entity.too.large' ? 'payload_too_large'
+      : err.type === 'entity.parse.failed' ? 'invalid_json' : 'bad_request';
+    return res.status(status).json({ error: code });
+  }
+  console.error('[error]', err);
+  if (res.headersSent) return;
+  res.status(500).json({ error: 'internal_error' });
+});
 
 // ── Startup ────────────────────────────────────────────────────────────────────
 

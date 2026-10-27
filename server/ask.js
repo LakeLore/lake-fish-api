@@ -32,6 +32,15 @@ const MAX_TURNS = 20;
 const MAX_MSG_CHARS = 2000;
 const MAX_TOTAL_CHARS = 12000;
 const REQUEST_TIMEOUT_MS = 90_000;
+// Whole-ask deadline (2026-10-27, ASK-04). The app stops waiting at 60 s, so
+// work past that is spent on an answer nobody reads. At the deadline the loop
+// is cancelled (no further model calls are made) and the user gets a short
+// "try a narrower question" answer.
+// Measured from when the request arrived (server.js stamps req.askStart before
+// the entitlement check, which can take seconds), with room left for the
+// answer to travel back over a slow phone connection.
+const ASK_DEADLINE_MS = Number(process.env.LAKELORE_ASK_DEADLINE_MS) > 0
+  ? Number(process.env.LAKELORE_ASK_DEADLINE_MS) : 45_000;
 const ASK_LOG_MAX_BYTES = 50 * 1024 * 1024;
 // Chat logs are kept 90 days (the privacy policy and the consent card say
 // so): one file per UTC day, and files older than that are deleted at start-up
@@ -336,26 +345,65 @@ function makeTools(ctx, m, seen, trace) {
 }
 
 // ── Request validation ───────────────────────────────────────────────────────
+// The app keeps the conversation and resends it every turn. Until 2026-10-27
+// any irregular history was a 400 the user could only clear with New chat:
+// a failed ask left two user turns in a row, and a long answer (>2,000 chars),
+// the 11th question or a long chat broke every later send (ASK-01). Shipped
+// binaries can't be changed, so the server now repairs the history instead:
+//   · back-to-back turns from the same side are merged (a failed question and
+//     its retry become one question; if that is too long, the retry wins)
+//   · empty turns and a leading assistant turn are dropped
+//   · an over-long earlier turn is shortened, not rejected
+//   · the oldest question/answer pairs are dropped to fit MAX_TURNS and
+//     MAX_TOTAL_CHARS
+// What still fails: a body that is not a list of {role, content} strings, a
+// history that does not end with the user, and a new question over
+// MAX_MSG_CHARS — those are the caller's to fix, with a message saying how.
+const MAX_RAW_MESSAGES = 200; // bounded anyway by the 16 KB body limit
 function validateMessages(raw) {
   if (!Array.isArray(raw) || raw.length === 0) return { error: 'messages must be a non-empty array' };
-  if (raw.length > MAX_TURNS) return { error: `at most ${MAX_TURNS} messages` };
-  let total = 0;
+  if (raw.length > MAX_RAW_MESSAGES) return { error: `at most ${MAX_RAW_MESSAGES} messages` };
+  const repairs = [];
   const msgs = [];
   for (let i = 0; i < raw.length; i++) {
     const mm = raw[i];
     const role = mm?.role;
-    const content = typeof mm?.content === 'string' ? mm.content.trim() : '';
     if (role !== 'user' && role !== 'assistant') return { error: `messages[${i}].role must be user or assistant` };
-    if (!content) return { error: `messages[${i}].content must be a non-empty string` };
-    if (content.length > MAX_MSG_CHARS) return { error: `messages[${i}].content exceeds ${MAX_MSG_CHARS} chars` };
-    const expected = i % 2 === 0 ? 'user' : 'assistant';
-    if (role !== expected) return { error: 'messages must alternate user/assistant starting with user' };
-    total += content.length;
+    if (typeof mm?.content !== 'string') return { error: `messages[${i}].content must be a string` };
+    const content = mm.content.trim();
+    if (!content) { repairs.push('empty'); continue; }
+    const prev = msgs[msgs.length - 1];
+    if (prev && prev.role === role) {
+      const merged = `${prev.content}\n\n${content}`;
+      prev.content = merged.length <= MAX_MSG_CHARS || role === 'assistant' ? merged : content;
+      repairs.push('merged');
+      continue;
+    }
+    if (!prev && role === 'assistant') { repairs.push('leading-assistant'); continue; }
     msgs.push({ role, content });
   }
-  if (total > MAX_TOTAL_CHARS) return { error: `conversation exceeds ${MAX_TOTAL_CHARS} chars — start a new chat` };
-  if (msgs[msgs.length - 1].role !== 'user') return { error: 'last message must be from the user' };
-  return { messages: msgs };
+  if (msgs.length === 0 || msgs[msgs.length - 1].role !== 'user') {
+    return { error: 'last message must be from the user', friendly: 'Something went wrong with this chat. Tap New chat to start fresh.' };
+  }
+  const last = msgs[msgs.length - 1];
+  if (last.content.length > MAX_MSG_CHARS) {
+    return { error: `question exceeds ${MAX_MSG_CHARS} chars`, friendly: `That question is too long — keep it under ${MAX_MSG_CHARS.toLocaleString('en-US')} characters.` };
+  }
+  for (let i = 0; i < msgs.length - 1; i++) {
+    if (msgs[i].content.length > MAX_MSG_CHARS) {
+      msgs[i].content = `${msgs[i].content.slice(0, MAX_MSG_CHARS - 1)}…`;
+      repairs.push('shortened');
+    }
+  }
+  // msgs alternates user/assistant and starts with user, so dropping two
+  // from the front keeps that shape.
+  let total = msgs.reduce((n, x) => n + x.content.length, 0);
+  while (msgs.length > 1 && (msgs.length > MAX_TURNS || total > MAX_TOTAL_CHARS)) {
+    const [a, b] = msgs.splice(0, 2);
+    total -= a.content.length + b.content.length;
+    repairs.push('dropped-oldest');
+  }
+  return { messages: msgs, repairs };
 }
 
 // ── Answer post-processing ───────────────────────────────────────────────────
@@ -462,7 +510,13 @@ async function ask(req, res, ctx) {
   }
 
   const v = validateMessages(req.body?.messages);
-  if (v.error) return res.status(400).json({ error: 'bad_request', message: v.error });
+  if (v.error) {
+    // Shipped apps show `message` to the user as-is, so it must read as advice,
+    // not as a validator's complaint; the detail goes to the log.
+    console.warn(`[ask] ${state} bad request: ${v.error}`);
+    return res.status(400).json({ error: 'bad_request', message: v.friendly || 'Something went wrong with this chat. Tap New chat to start fresh.' });
+  }
+  if (v.repairs.length) console.log(`[ask] ${state} history repaired: ${[...new Set(v.repairs)].join(',')} (${v.repairs.length})`);
 
   // Daily ceiling (server.js): counted HERE, after validation, so only asks
   // that are about to reach the model spend it. Counted earlier, 500 empty
@@ -480,6 +534,20 @@ async function ask(req, res, ctx) {
   // Usage is per API call; sum every iteration of the loop so the log line
   // reflects what the whole ask cost, not just the final answer call.
   const tot = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, iterations: 0 };
+  // One cancel switch per ask (2026-10-27, ASK-04): it fires when the app
+  // hangs up (iOS suspends mid-ask, the user leaves the screen) or at the
+  // whole-ask deadline. The SDK passes the signal to every model call in the
+  // loop, so no further model call is made after it fires. `res` closes
+  // without finishing only when the client went away (req 'close' also fires
+  // after a normally-read body, so it would cancel every ask).
+  const ac = new AbortController();
+  let cancelled = null;
+  const msLeft = Math.max(1, ASK_DEADLINE_MS - (Date.now() - (req.askStart || t0)));
+  const deadline = setTimeout(() => { cancelled = cancelled || 'deadline'; ac.abort(); }, msLeft);
+  const onClose = () => { if (!res.writableEnded) { cancelled = cancelled || 'client'; ac.abort(); } };
+  res.on('close', onClose);
+  if (res.destroyed) onClose(); // hung up during the entitlement check
+  let lastText = '';
   try {
     const runner = client().beta.messages.toolRunner({
       model: MODEL,
@@ -490,10 +558,18 @@ async function ask(req, res, ctx) {
       // fallback model inside the same call instead of ending the turn.
       betas: ['server-side-fallback-2026-07-01'],
       fallbacks: 'default',
+      // Two cache breakpoints: the 1-hour one on the system prompt (shared by
+      // every ask in the state), and an automatic 5-minute one on the last
+      // block of each request (2026-10-27, ASK-06), so the conversation and
+      // the tool results it has already read are re-read from cache by the
+      // next call of the loop and by the user's next question, instead of
+      // being paid for in full every time. The longer TTL comes first, as
+      // the API requires.
+      cache_control: { type: 'ephemeral' },
       system: [{ type: 'text', text: systemPrompt(m), cache_control: { type: 'ephemeral', ttl: '1h' } }],
       tools,
       messages: v.messages,
-    });
+    }, { signal: ac.signal });
     for await (const message of runner) {
       const u = message.usage || {};
       tot.iterations++;
@@ -501,10 +577,38 @@ async function ask(req, res, ctx) {
       tot.output_tokens += u.output_tokens || 0;
       tot.cache_read_input_tokens += u.cache_read_input_tokens || 0;
       tot.cache_creation_input_tokens += u.cache_creation_input_tokens || 0;
+      // Keep text only from a turn that was an answer, not a "let me search…"
+      // preamble before a tool call.
+      const blocks = message.content || [];
+      const t = blocks.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+      if (t && !blocks.some(b => b.type === 'tool_use')) lastText = t;
     }
     final = await runner.done();
+    clearTimeout(deadline); res.off('close', onClose);
   } catch (err) {
+    clearTimeout(deadline); res.off('close', onClose);
     const ms = Date.now() - t0;
+    if (cancelled || err instanceof Anthropic.APIUserAbortError) {
+      const why = cancelled || 'abort';
+      // A question counts once the model has worked on it. A client that hangs
+      // up before any model call finished gets it back; one that hangs up later
+      // does not (otherwise disconnecting at 40 s would be unlimited free
+      // questions — the per-subscriber cap is the only spend bound since
+      // 2026-10-27). A deadline answer is an answer, so it counts too.
+      if (why !== 'deadline' && tot.iterations === 0) ctx.askRefundSpent?.({ budget: true });
+      console.warn(`[ask] ${state} cancelled (${why}) after ${ms}ms, ${tot.iterations} model call(s), ${trace.length} tool call(s)`);
+      if (why === 'client' || res.writableEnded || res.destroyed) return;
+      // Deadline: answer 200 so the app records a normal assistant turn
+      // (an error here would leave the question dangling in its history).
+      // Keep any lakes the model had already named.
+      const note = 'That one needed more digging than I could finish in time. Try a narrower question — one species, or one county.';
+      const { lakes, answer_text } = extractLakes(lastText ? `${lastText}\n\n${note}` : note, seen);
+      appendAskLog({ ts: new Date().toISOString(), state, user: userId, question: v.messages[v.messages.length - 1].content,
+        turns: v.messages.length, answer: answer_text, lakes: lakes.map(l => l.lake_id), trace,
+        usage: { model: MODEL, ...tot, tool_calls: trace.length, stop_reason: 'deadline', ms } });
+      return res.json({ answer: lastText ? `${lastText}\n\n${note}` : note, answer_text, lakes,
+        usage: { model: MODEL, ...tot, tool_calls: trace.length, stop_reason: 'deadline', ms } });
+    }
     // The user always gets their question back; the machine budget only if
     // no model call completed (later iterations were billed).
     ctx.askRefundSpent?.({ budget: tot.iterations === 0 });

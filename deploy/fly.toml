@@ -10,14 +10,18 @@ primary_region = 'ord'   # Chicago — central for SD/MN/ND/IA/NE
   # plan's monthly credit) or every ask 503s ask_unconfigured. Subscribers
   # only in every state (server.js), so the route is public to the app: the
   # X-Ask-Token gate exists for free-state asks, which production refuses.
-  # Ceilings: 25 asks per subscriber per day; 100 asks per machine per day,
-  # so at most ~200 a day across both machines (~$10 at ~$0.05 an ask). That
-  # paces spending; it does not cap the month (30 days at the ceiling is more
-  # than the credit). The hard stop is the Console workspace spend limit
-  # (RUNBOOK §20). Counts survive restarts (/data/ask-counts.json).
+  # Limits (owner decision 2026-10-27): 15 asks per subscriber per UTC day
+  # (counted per machine, so up to 30 when both machines serve one user —
+  # ASK-07). No whole-app daily ceiling and no per-IP hourly limit; both are
+  # still available as levers (LAKELORE_ASK_DAILY_MAX / LAKELORE_ASK_PER_HOUR,
+  # RUNBOOK §20). The owner's test devices are exempt from the daily cap via
+  # the LAKELORE_ASK_UNLIMITED_USERS secret (user ids — never put them here,
+  # this repo is public). The hard stop on spend is the Console workspace
+  # spend limit and the monthly credit (RUNBOOK §20). Counts survive restarts
+  # (/data/ask-counts.json).
   LAKELORE_ASK_ENABLED = '1'
   LAKELORE_ASK_PUBLIC = '1'
-  LAKELORE_ASK_DAILY_MAX = '100'
+  LAKELORE_ASK_USER_DAILY_MAX = '15'
 
 [http_service]
   internal_port = 3100

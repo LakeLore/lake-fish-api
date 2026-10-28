@@ -573,6 +573,22 @@ function imageShipsEveryRequiredFile() {
       db.close();
     }
     ok(checked > 40, `comma-gear check ran on only ${checked} cases`);
+    // A crafted county value must not plant a default for a real scope, and
+    // made-up scopes are never memoized (final review 2026-10-28).
+    {
+      const open = () => new Database(path.join(os.homedir(), 'lakelore-data', 'out', 'sd.db'), { readonly: true });
+      const call = (db, q) => { const ctx = { getDb: () => db, isUnhealthy: () => false, getStateEntry: s => ld.getState(s), computeLakeStockingMetrics: () => ({}) };
+        const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
+        canonical.measures({ params: { state: 'sd' }, query: q, get: () => undefined, lakeLorePreview: false }, r, ctx); return r.body; };
+      const clean = open(), dirty = open();
+      const counties = clean.prepare('SELECT DISTINCT county FROM lakes WHERE county IS NOT NULL ORDER BY county LIMIT 3').all().map(r => r.county);
+      const q = { species: 'Yellow Perch', county: counties.join(',') };
+      call(dirty, { species: 'Yellow Perch', county: `${counties[0]},${counties[1]}\u0001${counties[2]}` });
+      const want = call(clean, q).measures.map(m => `${m.id}:${m.defaultSourceId}`).join(' ');
+      const got = call(dirty, q).measures.map(m => `${m.id}:${m.defaultSourceId}`).join(' ');
+      ok(want === got, `sd county poisoning changed defaults: ${want} vs ${got}`);
+      clean.close(); dirty.close();
+    }
     // A long run of commas must not stall the server (review 2026-10-27: the
     // first rejoin tried every span — 2,000 commas blocked for ~12 s).
     {

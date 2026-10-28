@@ -620,7 +620,7 @@ function filters(req, res, ctx) {
     // left out of the chip list and its counts. Never hides the default gear,
     // the gear an older client would pick (most CPUE rows), or the last chip.
     if (gearMode === 'gear' && MIN_SOURCE_LAKES > 1 && gearTypes.length > 1) {
-      const lakesByGear = gearMemo(db, `chips\0${speciesParam ?? ''}`, () => new Map(db.prepare(`
+      const lakesByGear = gearMemo(db, { species: speciesParam }, 'chips', () => new Map(db.prepare(`
         SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS lakes
         FROM fish_catch fc WHERE fc.gear_category IS NOT NULL ${speciesAnd}
         GROUP BY fc.gear_category`).all(...(speciesParam ? [speciesParam] : [])).map(r => [r.gear, r.lakes])));
@@ -740,20 +740,40 @@ const NOT_A_SURVEY_GEAR = /creel|angler|rod and reel|\bvisual\b|(?:>=|≥)\s*\d/
 // hiding (final review 2026-10-27: they doubled MN's uncached /measures to
 // ~1 s, ~1.9 s with every county). Keyed on the db handle, which /reload
 // replaces, so a data deploy starts fresh; bounded per db.
+// Only REAL scopes are memoized (final review 2026-10-28): a species or
+// county the DB doesn't have is computed but never stored, so made-up query
+// values can't grow the memo (a flood of junk county lists pushed RSS past
+// the 512 MB VM) and keys are JSON, so no crafted value can collide with a
+// real multi-county key and plant a wrong default for other users.
 const _gearMemo = new WeakMap();
+const _scopeVocab = new WeakMap();
 const GEAR_MEMO_MAX = 2000;
-function gearMemo(db, key, fn) {
+function realScope(db, speciesParam, countyList) {
+  let v = _scopeVocab.get(db);
+  if (!v) {
+    v = {
+      species: new Set(db.prepare('SELECT DISTINCT species_native AS s FROM fish_catch WHERE species_native IS NOT NULL').all().map(r => r.s)),
+      counties: new Set(db.prepare('SELECT DISTINCT county AS c FROM lakes WHERE county IS NOT NULL').all().map(r => r.c)),
+    };
+    _scopeVocab.set(db, v);
+  }
+  return (speciesParam == null || v.species.has(speciesParam))
+    && countyList.length <= 200 && countyList.every(c => v.counties.has(c));
+}
+function gearMemo(db, scope, key, fn) {
+  if (!realScope(db, scope.species ?? null, scope.counties || [])) return fn();
   let m = _gearMemo.get(db);
   if (!m) _gearMemo.set(db, m = new Map());
-  if (m.has(key)) return m.get(key);
+  const k = JSON.stringify([key, scope.species ?? null, scope.counties || []]);
+  if (m.has(k)) return m.get(k);
   const v = fn();
   if (m.size >= GEAR_MEMO_MAX) m.delete(m.keys().next().value);
-  m.set(key, v);
+  m.set(k, v);
   return v;
 }
 // Statewide lakes per gear with a value in `col` (optionally one species).
 function statewideGearLakes(db, col, speciesParam) {
-  return gearMemo(db, `sw\0${col}\0${speciesParam ?? ''}`, () => new Map(db.prepare(`
+  return gearMemo(db, { species: speciesParam }, `sw:${col}`, () => new Map(db.prepare(`
     SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS lakes
     FROM fish_catch fc
     WHERE fc.gear_category IS NOT NULL AND fc.${col} IS NOT NULL
@@ -771,7 +791,7 @@ function recentDefaultGear(db, { gears, col, speciesParam, countyJoin = '', coun
   if (!(col in ny)) ny[col] = db.prepare(`SELECT MAX(s.survey_year) AS y FROM fish_catch fc JOIN surveys s ON s.id = fc.survey_id WHERE fc.${col} IS NOT NULL`).get()?.y ?? null;
   if (!ny[col]) return null;
   const since = ny[col] - RECENT_YEARS + 1;
-  const rows = gearMemo(db, `rc\0${col}\0${speciesParam ?? ''}\0${since}\0${countyList.join('\u0001')}`, () => db.prepare(`
+  const rows = gearMemo(db, { species: speciesParam, counties: countyList }, `rc:${col}:${since}`, () => db.prepare(`
     SELECT fc.gear_category AS gear,
            COUNT(DISTINCT CASE WHEN s.survey_year >= ? THEN fc.lake_id END) AS recent,
            COUNT(DISTINCT fc.lake_id) AS lakes, MAX(s.survey_year) AS latest

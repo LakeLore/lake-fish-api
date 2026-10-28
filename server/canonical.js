@@ -589,7 +589,17 @@ function filters(req, res, ctx) {
         ? recentDefaultGear(db, { gears: general, col: 'cpue_effective', speciesParam, countyJoin, countyAnd, countyList })
         : null;
       if (recent) defaultGear = recent;
-      else if (gearMode === 'gear' && general.length) defaultGear = general[0];
+      // No gear big enough for the rule: survey gears before creel / visual /
+      // size-limited ones, then most CPUE rows, then most lakes, then name —
+      // the order /measures uses (final review 2026-10-27: an alphabetical tie made UT
+      // largemouth's chips default to angler creel while /measures ranked by
+      // electrofishing).
+      else if (gearMode === 'gear' && general.length) {
+        const cpueLakes = statewideGearLakes(db, 'cpue_effective', speciesParam);
+        const lakes = g => cpueLakes.get(g)?.lakes ?? 0;
+        defaultGear = [...general].sort((a, b) => (NOT_A_SURVEY_GEAR.test(a) - NOT_A_SURVEY_GEAR.test(b))
+          || (gearCpueCounts[b] - gearCpueCounts[a]) || (lakes(b) - lakes(a)) || (a < b ? -1 : a > b ? 1 : 0))[0];
+      }
       // No catch-rate gear in scope (e.g. a county with only size samples, or a
       // rating-only species): pick the rating system /measures defaults to —
       // most rated rows, then lakes (FL bluegill: Best Bet 50 lakes, not the
@@ -610,10 +620,10 @@ function filters(req, res, ctx) {
     // left out of the chip list and its counts. Never hides the default gear,
     // the gear an older client would pick (most CPUE rows), or the last chip.
     if (gearMode === 'gear' && MIN_SOURCE_LAKES > 1 && gearTypes.length > 1) {
-      const lakesByGear = new Map(db.prepare(`
+      const lakesByGear = gearMemo(db, `chips\0${speciesParam ?? ''}`, () => new Map(db.prepare(`
         SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS lakes
         FROM fish_catch fc WHERE fc.gear_category IS NOT NULL ${speciesAnd}
-        GROUP BY fc.gear_category`).all(...(speciesParam ? [speciesParam] : [])).map(r => [r.gear, r.lakes]));
+        GROUP BY fc.gear_category`).all(...(speciesParam ? [speciesParam] : [])).map(r => [r.gear, r.lakes])));
       const topCpue = gearCpueCounts ? Object.keys(gearCpueCounts).filter(g => g !== 'CPUE Normalized').sort((a, b) => gearCpueCounts[b] - gearCpueCounts[a])[0] : undefined;
       const keep = g => g === defaultGear || g === topCpue || (lakesByGear.get(g) ?? 0) >= MIN_SOURCE_LAKES;
       const kept = gearTypes.filter(keep);
@@ -726,6 +736,30 @@ const EF_NOT_STANDARD = /backpack|fall|age-[01]|juvenile|young|\*/i;
 // Creel / angler catch rates and visual estimates are not survey gears; the
 // rule picks them only when no survey gear is big enough.
 const NOT_A_SURVEY_GEAR = /creel|angler|rod and reel|\bvisual\b|(?:>=|≥)\s*\d/i;   // visual length estimates: CA golden-rainbow hybrid (2026-10-27)
+// Per-database memo for the gear-coverage lookups behind defaults and tiny-gear
+// hiding (final review 2026-10-27: they doubled MN's uncached /measures to
+// ~1 s, ~1.9 s with every county). Keyed on the db handle, which /reload
+// replaces, so a data deploy starts fresh; bounded per db.
+const _gearMemo = new WeakMap();
+const GEAR_MEMO_MAX = 2000;
+function gearMemo(db, key, fn) {
+  let m = _gearMemo.get(db);
+  if (!m) _gearMemo.set(db, m = new Map());
+  if (m.has(key)) return m.get(key);
+  const v = fn();
+  if (m.size >= GEAR_MEMO_MAX) m.delete(m.keys().next().value);
+  m.set(key, v);
+  return v;
+}
+// Statewide lakes per gear with a value in `col` (optionally one species).
+function statewideGearLakes(db, col, speciesParam) {
+  return gearMemo(db, `sw\0${col}\0${speciesParam ?? ''}`, () => new Map(db.prepare(`
+    SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS lakes
+    FROM fish_catch fc
+    WHERE fc.gear_category IS NOT NULL AND fc.${col} IS NOT NULL
+      ${speciesParam ? 'AND fc.species_native = ?' : ''}
+    GROUP BY fc.gear_category`).all(...(speciesParam ? [speciesParam] : [])).map(r => [r.gear, { gear: r.gear, lakes: r.lakes }])));
+}
 const _newestYear = new WeakMap();   // db -> { col: newest survey year among rows with that metric }
 function recentDefaultGear(db, { gears, col, speciesParam, countyJoin = '', countyAnd = '', countyList = [] }) {
   if (!gears.length || !col) return null;
@@ -737,14 +771,14 @@ function recentDefaultGear(db, { gears, col, speciesParam, countyJoin = '', coun
   if (!(col in ny)) ny[col] = db.prepare(`SELECT MAX(s.survey_year) AS y FROM fish_catch fc JOIN surveys s ON s.id = fc.survey_id WHERE fc.${col} IS NOT NULL`).get()?.y ?? null;
   if (!ny[col]) return null;
   const since = ny[col] - RECENT_YEARS + 1;
-  const rows = db.prepare(`
+  const rows = gearMemo(db, `rc\0${col}\0${speciesParam ?? ''}\0${since}\0${countyList.join('\u0001')}`, () => db.prepare(`
     SELECT fc.gear_category AS gear,
            COUNT(DISTINCT CASE WHEN s.survey_year >= ? THEN fc.lake_id END) AS recent,
            COUNT(DISTINCT fc.lake_id) AS lakes, MAX(s.survey_year) AS latest
     FROM fish_catch fc JOIN surveys s ON s.id = fc.survey_id ${countyJoin}
     WHERE fc.gear_category IS NOT NULL AND fc.${col} IS NOT NULL
       ${speciesParam ? 'AND fc.species_native = ?' : ''} ${countyAnd}
-    GROUP BY fc.gear_category`).all(since, ...(speciesParam ? [speciesParam] : []), ...countyList);
+    GROUP BY fc.gear_category`).all(since, ...(speciesParam ? [speciesParam] : []), ...countyList));
   const stat = new Map(rows.map(r => [r.gear, r]));
   const byName = (a, b) => (a.gear < b.gear ? -1 : a.gear > b.gear ? 1 : 0);
   const surveyAll = gears.filter(g => !NOT_A_SURVEY_GEAR.test(g)).map(g => stat.get(g)).filter(Boolean);
@@ -753,15 +787,7 @@ function recentDefaultGear(db, { gears, col, speciesParam, countyJoin = '', coun
   // on 254 lakes, 3 recent lakes to 2). Eligible: >= MIN_SOURCE_LAKES lakes
   // statewide (the picker's own bar) AND >= DEFAULT_MIN_SHARE of the biggest
   // gear's lakes in this scope. If nothing qualifies, every survey gear does.
-  let statewide = stat;
-  if (countyList.length) {
-    statewide = new Map(db.prepare(`
-      SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS lakes
-      FROM fish_catch fc
-      WHERE fc.gear_category IS NOT NULL AND fc.${col} IS NOT NULL
-        ${speciesParam ? 'AND fc.species_native = ?' : ''}
-      GROUP BY fc.gear_category`).all(...(speciesParam ? [speciesParam] : [])).map(r => [r.gear, r]));
-  }
+  const statewide = countyList.length ? statewideGearLakes(db, col, speciesParam) : stat;
   const bigEnough = (pool) => {
     const max = Math.max(0, ...pool.map(r => r.lakes));
     return pool.filter(r => (statewide.get(r.gear)?.lakes ?? 0) >= MIN_SOURCE_LAKES && r.lakes >= DEFAULT_MIN_SHARE * max);
@@ -1239,7 +1265,6 @@ function measures(req, res, ctx) {
     // default source changes; never empties a measure; /lake/:id unaffected.
     if (MIN_SOURCE_LAKES > 1) {
       const metricCol = { abundance: 'cpue_effective', size: sizeField, trophy: 'cpue_memorable' };
-      const statewide = {};
       const lakesFor = (m, src) => {
         if (!countyList.length) return src.lakes;            // the source's own count is already statewide
         // Count each source by the column it actually ranks on: a rating
@@ -1247,11 +1272,7 @@ function measures(req, res, ctx) {
         // source as soon as a county was picked (review 2026-10-27).
         const col = src.sort === 'rating' ? 'rating_ordinal' : metricCol[m.id];
         if (!col) return Infinity;
-        statewide[col] ??= new Map(db.prepare(`
-          SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS lakes
-          FROM fish_catch fc WHERE fc.gear_category IS NOT NULL AND fc.${col} IS NOT NULL ${speciesAnd}
-          GROUP BY fc.gear_category`).all(...(speciesParam ? [speciesParam] : [])).map(r => [r.gear, r.lakes]));
-        return statewide[col].get(src.gear) ?? 0;
+        return statewideGearLakes(db, col, speciesParam).get(src.gear)?.lakes ?? 0;
       };
       for (const m of out) {
         if (!m.requiresSource || !metricCol[m.id]) continue;

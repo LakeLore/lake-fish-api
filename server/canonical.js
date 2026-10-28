@@ -723,9 +723,9 @@ const EF_FIRST_SPECIES = new Set(['LMB', 'SMB', 'BLG']);
 // consolidated or never lead).
 const EF_GEAR = /electro|shock|\bEF\b|^(FE|BE)$/i;
 const EF_NOT_STANDARD = /backpack|fall|age-[01]|juvenile|young|\*/i;
-// Creel / angler catch rates are not survey gears; the rule never picks them
-// (the most-rows fallback still can when they are the only data).
-const NOT_A_SURVEY_GEAR = /creel|angler|rod and reel|(?:>=|≥)\s*\d/i;
+// Creel / angler catch rates and visual estimates are not survey gears; the
+// rule picks them only when no survey gear is big enough.
+const NOT_A_SURVEY_GEAR = /creel|angler|rod and reel|\bvisual\b|(?:>=|≥)\s*\d/i;   // visual length estimates: CA golden-rainbow hybrid (2026-10-27)
 const _newestYear = new WeakMap();   // db -> { col: newest survey year among rows with that metric }
 function recentDefaultGear(db, { gears, col, speciesParam, countyJoin = '', countyAnd = '', countyList = [] }) {
   if (!gears.length || !col) return null;
@@ -772,7 +772,12 @@ function recentDefaultGear(db, { gears, col, speciesParam, countyJoin = '', coun
   const allStats = gears.map(g => stat.get(g)).filter(Boolean);
   const eligible = bigEnough(surveyAll);
   const anyBig = eligible.length ? eligible : bigEnough(allStats);
-  const survey = anyBig.length ? anyBig : surveyAll;
+  // Nothing big enough to rank lakes: no opinion, so each route keeps its
+  // most-records default (verification 2026-10-27: falling back to every
+  // survey gear let a 2-lake 'Best Bet' size source beat MO largemouth's
+  // 12-lake Forecast Rating, which this function never sees).
+  if (!anyBig.length) return null;
+  const survey = anyBig;
   // Deterministic order — both routes must agree: recent lakes, then all-time
   // lakes, then the most recent survey, then name.
   const ranked = survey.filter(r => r.recent > 0)

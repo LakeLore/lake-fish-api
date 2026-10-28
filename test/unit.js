@@ -497,6 +497,17 @@ function imageShipsEveryRequiredFile() {
     check('nd', 'WAE', /^Gill net/);                            // unchanged
     check('nd', 'BLG', /^Electrofishing-Boat$/);               // EF at 46% of the merged gill net's recent lakes (>= 40%)
     check('me', 'Brook Trout', /^Angler creel/);                // a 3+-lake creel beats a 1-lake index (review 2026-10-27)
+    // Nothing big enough: the most-records default stands (MO largemouth size
+    // keeps the 12-lake Forecast Rating, not a 2-lake Best Bet).
+    {
+      const db = new Database(path.join(os.homedir(), 'lakelore-data', 'out', 'mo.db'), { readonly: true });
+      const ctx = { getDb: () => db, isUnhealthy: () => false, getStateEntry: s => ld.getState(s), computeLakeStockingMetrics: () => ({}) };
+      const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
+      canonical.measures({ params: { state: 'mo' }, query: { species: 'Largemouth Bass' }, get: () => undefined, lakeLorePreview: false }, r, ctx);
+      const size = r.body.measures.find(m => m.id === 'size');
+      ok(size && size.defaultSourceId === 'gear:Forecast Rating', `mo Largemouth Bass size default ${size && size.defaultSourceId}`);
+      db.close();
+    }
     // A tiny gear can't win on recency: CA golden trout's size default stays on
     // gill nets (251 lakes), not visual estimates on 7 meadow waters.
     {
@@ -585,6 +596,6 @@ function imageShipsEveryRequiredFile() {
   model.close();
 
   if (failures) { console.error(`\nUNIT FAILED — ${failures} failure(s)`); process.exit(1); }
-  console.log('UNIT OK — RevenueCat deadline, /ask gate');
+  console.log('UNIT OK — RevenueCat deadline, /ask gate, gear defaults, comma gears');
   process.exit(0);
 })().catch(err => { console.error('unit test crashed:', err); process.exit(1); });

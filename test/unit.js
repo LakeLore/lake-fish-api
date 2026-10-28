@@ -459,8 +459,8 @@ function imageShipsEveryRequiredFile() {
       ok(Object.keys(r.body.gearTypeCounts || {}).every(g => chips.includes(g)), 'gearTypeCounts lists a hidden chip');
     }
     const wae = call({ species: 'WAE' }).measures.find(m => m.id === 'abundance');
-    const gill = wae.sources.find(x => x.gear === 'Gill net (#/net-night, 80-ft standard)');
-    ok(gill && gill.label === 'Gill net' && gill.unit === '#/net-night, 80-ft standard' && gill.lakes > 270, `nd walleye gill net source: ${JSON.stringify(gill && { label: gill.label, unit: gill.unit, lakes: gill.lakes })}`);
+    const gill = wae.sources.find(x => x.gear === 'Gill net (#/net-night, 80-ft equivalent)');
+    ok(gill && gill.label === 'Gill net' && gill.unit === '#/net-night, 80-ft equivalent' && gill.lakes > 270, `nd walleye gill net source: ${JSON.stringify(gill && { label: gill.label, unit: gill.unit, lakes: gill.lakes })}`);
     // County scope: pick a county where the frame net 3X4 (9 lakes statewide) has <3 lakes for WAE; it must still show there.
     const c = db.prepare(`SELECT l.county c FROM fish_catch fc JOIN lakes l ON l.id = fc.lake_id WHERE fc.species_native='WAE' AND fc.gear_category = '3 X 4 w/ 1/4" Mesh' AND fc.cpue_effective IS NOT NULL GROUP BY 1 HAVING COUNT(DISTINCT fc.lake_id) < 3 LIMIT 1`).get();
     if (c) {
@@ -471,7 +471,7 @@ function imageShipsEveryRequiredFile() {
   }
 
   // Default gear (2026-10-27): most lakes surveyed in the last 10 years, not
-  // most rows ever; electrofishing first for bass/bluegill when it covers 60%
+  // most rows ever; electrofishing first for bass/bluegill when it covers 40%
   // of the leader; /filters always states the default for older clients.
   {
     const Database = require('better-sqlite3');
@@ -496,6 +496,19 @@ function imageShipsEveryRequiredFile() {
     check('wi', 'WAE', /^Fyke net/);                            // unchanged
     check('nd', 'WAE', /^Gill net/);                            // unchanged
     check('nd', 'BLG', /^Electrofishing-Boat$/);               // EF at 46% of the merged gill net's recent lakes (>= 40%)
+    check('me', 'Brook Trout', /^Angler creel/);                // a 3+-lake creel beats a 1-lake index (review 2026-10-27)
+    // A tiny gear can't win on recency: CA golden trout's size default stays on
+    // gill nets (251 lakes), not visual estimates on 7 meadow waters.
+    {
+      const db = new Database(path.join(os.homedir(), 'lakelore-data', 'out', 'ca.db'), { readonly: true });
+      const ctx = { getDb: () => db, isUnhealthy: () => false, getStateEntry: s => ld.getState(s), computeLakeStockingMetrics: () => ({}) };
+      const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
+      canonical.measures({ params: { state: 'ca' }, query: { species: 'Golden trout' }, get: () => undefined, lakeLorePreview: false }, r, ctx);
+      const size = r.body.measures.find(m => m.id === 'size');
+      const def = size && size.sources.find(x => x.id === size.defaultSourceId);
+      ok(def && /gill net/i.test(def.gear || '') && def.lakes > 100, `ca Golden trout size default ${def && def.gear} (${def && def.lakes} lakes)`);
+      db.close();
+    }
     // A county filter must not hide a Forecast Rating source that is big
     // statewide (ratings have no cpue; review 2026-10-27).
     {
@@ -512,7 +525,7 @@ function imageShipsEveryRequiredFile() {
   }
 
   // Gear names that contain commas (SD "gill net (historical, all sizes)", ND
-  // "Gill net (#/net-night, 80-ft standard)") must survive the app's
+  // "Gill net (#/net-night, 80-ft equivalent)") must survive the app's
   // comma-joined `gear` parameter: every such gear returns rows (2026-10-27 —
   // before the fix they returned nothing, SD largemouth's default among them).
   {
@@ -525,18 +538,42 @@ function imageShipsEveryRequiredFile() {
       const db = new Database(path.join(os.homedir(), 'lakelore-data', 'out', `${st}.db`), { readonly: true });
       const ctx = { getDb: () => db, isUnhealthy: () => false, getStateEntry: s => ld.getState(s), computeLakeStockingMetrics: () => ({}) };
       for (const { g } of db.prepare("SELECT DISTINCT gear_category g FROM fish_catch WHERE gear_category LIKE '%,%'").all()) {
+        // Alone, and as one of two selected gears (the app's multi-select).
+        // The partner is a comma-free gear, so the pair's total can't come
+        // from a second comma name (review 2026-10-27: the old check could
+        // pass on the partner alone).
+        const other = db.prepare("SELECT gear_category g FROM fish_catch WHERE gear_category IS NOT NULL AND gear_category NOT LIKE '%,%' LIMIT 1").get()?.g;
         for (const recent of ['false', 'true']) {
-          const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
-          // also as one of two selected gears, as the app sends multi-select
-          const other = db.prepare("SELECT gear_category g FROM fish_catch WHERE gear_category IS NOT NULL AND gear_category <> ? LIMIT 1").get(g)?.g;
-          canonical.results({ params: { state: st }, query: { gear: other ? `${g},${other}` : g, limit: '5', mostRecentOnly: recent, sortBy: 'lake' }, get: () => undefined, lakeLorePreview: false }, r, ctx);
-          ok(r.statusCode === 200 && (r.body.results || []).some(x => x.gear === g || x.gear == null || true) && (r.body.total ?? r.body.results.length) > 0, `${st} gear "${g}" (mostRecentOnly=${recent}) returned no rows`);
+          const ask = (gear) => { const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
+            canonical.results({ params: { state: st }, query: { gear, limit: '500', mostRecentOnly: recent, sortBy: 'lake' }, get: () => undefined, lakeLorePreview: false }, r, ctx); return r; };
+          const alone = ask(g);
+          const rows = alone.body.results || [];
+          ok(alone.statusCode === 200 && (alone.body.total ?? rows.length) > 0, `${st} gear "${g}" (mostRecentOnly=${recent}) returned no rows`);
+          ok(rows.every(x => x.gear == null || x.gear === g), `${st} gear "${g}": rows from another gear (${[...new Set(rows.map(x => x.gear))].slice(0, 3)})`);
+          // (Latest-only keeps each lake's newest row across the selected
+          // gears, so a pair can be smaller there; only all-years must grow.)
+          if (other && recent === 'false') {
+            const both = ask(`${g},${other}`);
+            ok((both.body.total ?? 0) >= (alone.body.total ?? 0), `${st} "${g}" + "${other}" returned fewer rows than "${g}" alone`);
+          }
           checked++;
         }
       }
       db.close();
     }
     ok(checked > 40, `comma-gear check ran on only ${checked} cases`);
+    // A long run of commas must not stall the server (review 2026-10-27: the
+    // first rejoin tried every span — 2,000 commas blocked for ~12 s).
+    {
+      const db = new Database(path.join(os.homedir(), 'lakelore-data', 'out', 'sd.db'), { readonly: true });
+      const ctx = { getDb: () => db, isUnhealthy: () => false, getStateEntry: s => ld.getState(s), computeLakeStockingMetrics: () => ({}) };
+      const r = { statusCode: 200 }; r.status = c => (r.statusCode = c, r); r.json = b => (r.body = b, r); r.set = () => r;
+      const t0 = Date.now();
+      canonical.results({ params: { state: 'sd' }, query: { gear: 'ab,'.repeat(5000), limit: '1', mostRecentOnly: 'true' }, get: () => undefined, lakeLorePreview: false }, r, ctx);
+      const ms = Date.now() - t0;
+      ok(ms < 1000, `5,000-comma gear param took ${ms} ms`);
+      db.close();
+    }
   }
 
   // Switched off (no LAKELORE_ASK_ENABLED): client-config tells 1.1.2+ apps

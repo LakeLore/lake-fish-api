@@ -714,6 +714,7 @@ const KIND_LABEL = {
 // like MD's 'Electrofishing (>=15in bass/hr)' (a quality-fish index).
 const RECENT_YEARS = 10;
 const RESIDUAL_BUCKETS = new Set(['Presence Only', 'Trajectory', 'CPUE Normalized', 'Comprehensive', 'Mixed Gear', 'Forecast Rating']);
+const DEFAULT_MIN_SHARE = 0.1;   // review 2026-10-27; see recentDefaultGear
 const EF_SHARE = 0.4;   // owner 2026-10-27: ND bluegill EF covers 46% of the merged gill net's recent lakes
 const EF_FIRST_SPECIES = new Set(['LMB', 'SMB', 'BLG']);
 // Standard boat electrofishing only: backpack (nearshore juveniles/forage),
@@ -733,7 +734,7 @@ function recentDefaultGear(db, { gears, col, speciesParam, countyJoin = '', coun
   // only changes when the data does: the latest RECENT_YEARS survey years.
   let ny = _newestYear.get(db);
   if (!ny) _newestYear.set(db, ny = {});
-  ny[col] ??= db.prepare(`SELECT MAX(s.survey_year) AS y FROM fish_catch fc JOIN surveys s ON s.id = fc.survey_id WHERE fc.${col} IS NOT NULL`).get()?.y ?? null;
+  if (!(col in ny)) ny[col] = db.prepare(`SELECT MAX(s.survey_year) AS y FROM fish_catch fc JOIN surveys s ON s.id = fc.survey_id WHERE fc.${col} IS NOT NULL`).get()?.y ?? null;
   if (!ny[col]) return null;
   const since = ny[col] - RECENT_YEARS + 1;
   const rows = db.prepare(`
@@ -746,7 +747,32 @@ function recentDefaultGear(db, { gears, col, speciesParam, countyJoin = '', coun
     GROUP BY fc.gear_category`).all(since, ...(speciesParam ? [speciesParam] : []), ...countyList);
   const stat = new Map(rows.map(r => [r.gear, r]));
   const byName = (a, b) => (a.gear < b.gear ? -1 : a.gear > b.gear ? 1 : 0);
-  const survey = gears.filter(g => !NOT_A_SURVEY_GEAR.test(g)).map(g => stat.get(g)).filter(Boolean);
+  const surveyAll = gears.filter(g => !NOT_A_SURVEY_GEAR.test(g)).map(g => stat.get(g)).filter(Boolean);
+  // A gear too small to rank lakes can't win on recency (review 2026-10-27:
+  // CA golden trout went to visual estimates on 7 meadow waters over gill nets
+  // on 254 lakes, 3 recent lakes to 2). Eligible: >= MIN_SOURCE_LAKES lakes
+  // statewide (the picker's own bar) AND >= DEFAULT_MIN_SHARE of the biggest
+  // gear's lakes in this scope. If nothing qualifies, every survey gear does.
+  let statewide = stat;
+  if (countyList.length) {
+    statewide = new Map(db.prepare(`
+      SELECT fc.gear_category AS gear, COUNT(DISTINCT fc.lake_id) AS lakes
+      FROM fish_catch fc
+      WHERE fc.gear_category IS NOT NULL AND fc.${col} IS NOT NULL
+        ${speciesParam ? 'AND fc.species_native = ?' : ''}
+      GROUP BY fc.gear_category`).all(...(speciesParam ? [speciesParam] : [])).map(r => [r.gear, r]));
+  }
+  const bigEnough = (pool) => {
+    const max = Math.max(0, ...pool.map(r => r.lakes));
+    return pool.filter(r => (statewide.get(r.gear)?.lakes ?? 0) >= MIN_SOURCE_LAKES && r.lakes >= DEFAULT_MIN_SHARE * max);
+  };
+  // Fallback order: survey gears big enough; else any gear big enough (a
+  // 3-lake angler creel beats a 1-lake index — ME brook trout); else every
+  // survey gear.
+  const allStats = gears.map(g => stat.get(g)).filter(Boolean);
+  const eligible = bigEnough(surveyAll);
+  const anyBig = eligible.length ? eligible : bigEnough(allStats);
+  const survey = anyBig.length ? anyBig : surveyAll;
   // Deterministic order — both routes must agree: recent lakes, then all-time
   // lakes, then the most recent survey, then name.
   const ranked = survey.filter(r => r.recent > 0)
@@ -1243,23 +1269,31 @@ function measures(req, res, ctx) {
 
 // The app sends its selected gears as ONE comma-joined `gear` parameter, but
 // some gear names contain commas themselves — SD "gill net (historical, all
-// sizes)", ND "Gill net (#/net-night, 80-ft standard)" — so a plain split
+// sizes)", ND "Gill net (#/net-night, 80-ft equivalent)" — so a plain split
 // turned each into fragments that matched nothing and the ranking came back
 // empty (found 2026-10-27; SD largemouth's old default was one of them). Split,
 // then rejoin adjacent pieces wherever the joined text is a real gear in this
 // DB, longest match first. Works for every shipped client unchanged.
+// Bounded (review 2026-10-27): a rejoin never spans more pieces than the
+// longest real gear name has commas, and at most MAX_GEAR_PIECES pieces are
+// read, so the cost is linear in the input. The first version tried every
+// span and a 2,000-comma URL blocked the event loop for ~12 s.
+const MAX_GEAR_PIECES = 200;
 const _gearNames = new WeakMap();
 function splitGearParam(gear, db) {
-  const parts = String(gear).split(',');
+  const parts = String(gear).split(',', MAX_GEAR_PIECES);
   let known = _gearNames.get(db);
   if (!known) {
-    known = new Set(db.prepare('SELECT DISTINCT gear_category AS g FROM fish_catch WHERE gear_category IS NOT NULL').all().map(r => r.g));
+    const names = new Set(db.prepare('SELECT DISTINCT gear_category AS g FROM fish_catch WHERE gear_category IS NOT NULL').all().map(r => r.g));
+    let maxCommas = 0;
+    for (const n of names) maxCommas = Math.max(maxCommas, n.split(',').length - 1);
+    known = { names, maxCommas };
     _gearNames.set(db, known);
   }
   const out = [];
   for (let i = 0; i < parts.length;) {
-    let j = parts.length;
-    for (; j > i + 1; j--) if (known.has(parts.slice(i, j).join(','))) break;
+    let j = Math.min(parts.length, i + known.maxCommas + 1);
+    for (; j > i + 1; j--) if (known.names.has(parts.slice(i, j).join(','))) break;
     out.push(parts.slice(i, j).join(','));
     i = j;
   }
